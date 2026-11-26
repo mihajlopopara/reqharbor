@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "ReqHarbor",
   "version": "0.1.0",
-  "identifier": "dev.reqharbor.app",
+  "identifier": "dev.reqharbor.desktop",
   "build": {
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:5173",
@@ -32,6 +32,12 @@
     "targets": "all",
     "category": "DeveloperTool",
     "shortDescription": "Postman's job, a tenth of the weight.",
+    "publisher": "ReqHarbor",
+    "copyright": "Copyright (c) 2026 ReqHarbor contributors. MIT License.",
+    "macOS": {
+      "signingIdentity": "-",
+      "minimumSystemVersion": "11.0"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
