@@ -109,8 +109,13 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Write checksums
-        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      # Artifacts keep their bundle/<kind>/ subfolders; flatten them so the
+      # release gets the installer files themselves.
+      - name: Collect installers and write checksums
+        run: |
+          mkdir release
+          find dist -type f -exec mv -n {} release/ \;
+          cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
           name: ReqHarbor ${{ github.ref_name }}
@@ -134,4 +139,5 @@ jobs:
             - **Linux AppImage:** `chmod +x ReqHarbor_*.AppImage` then run it.
 
             Verify downloads against `SHA256SUMS.txt`.
-          files: dist/*
+          fail_on_unmatched_files: true
+          files: release/*
