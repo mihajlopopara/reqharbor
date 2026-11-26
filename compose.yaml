@@ -1,0 +1,29 @@
+# Run every build/test/tool inside this container:
+#   docker compose run --rm dev <command>
+# e.g. docker compose run --rm dev cargo test --workspace
+#      docker compose run --rm -w /app/worker dev npm test
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/dev.Dockerfile
+    image: reqharbor-dev:latest
+    working_dir: /app
+    volumes:
+      - .:/app
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - target:/cache/target
+      - worker-node-modules:/app/worker/node_modules
+      - ui-node-modules:/app/ui/node_modules
+      - playwright-browsers:/ms-playwright
+    ports:
+      - "5173:5173"   # ui vite dev server
+      - "8787:8787"   # wrangler dev
+volumes:
+  cargo-registry:
+  cargo-git:
+  target:
+  worker-node-modules:
+  ui-node-modules:
+  playwright-browsers:

@@ -1,0 +1,115 @@
+// Prevents an additional console window on Windows in release.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod commands;
+mod error;
+mod registry;
+mod state;
+mod sync_policy;
+mod sync_rt;
+
+use reqharbor_core::storage::Store;
+use state::AppState;
+use tauri::{Manager, WindowEvent};
+
+fn main() {
+    tauri::Builder::default()
+        // One process per data dir: a second launch focuses the first window
+        // instead of racing it for the same files (QA-R1-023).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .setup(|app| {
+            let dir = app.path().app_data_dir()?;
+            let store = Store::open(&dir)
+                .map_err(|e| format!("Cannot open data dir {}: {e}", dir.display()))?;
+            let connected = store.workspace.sync.is_some();
+            let state = AppState::new(store).map_err(|e| e.message)?;
+            app.manage(state);
+            if connected {
+                // AC-SYNC-2: pull on startup.
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = sync_rt::run_sync(&handle).await;
+                });
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // AC-SYNC-2: pull on focus, at most once per minute.
+            if let WindowEvent::Focused(true) = event {
+                sync_rt::pull_if_stale(window.app_handle());
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::bootstrap,
+            commands::get_settings,
+            commands::save_settings,
+            commands::list_projects,
+            commands::get_project_tree,
+            commands::create_project,
+            commands::rename_project,
+            commands::duplicate_project,
+            commands::delete_project,
+            commands::move_project,
+            commands::set_active_environment,
+            commands::child_counts,
+            commands::create_collection,
+            commands::update_collection,
+            commands::duplicate_collection,
+            commands::delete_collection,
+            commands::create_folder,
+            commands::rename_folder,
+            commands::duplicate_folder,
+            commands::delete_folder,
+            commands::create_request,
+            commands::save_request,
+            commands::rename_request,
+            commands::duplicate_request,
+            commands::delete_request,
+            commands::move_node,
+            commands::list_environments,
+            commands::create_environment,
+            commands::update_environment,
+            commands::duplicate_environment,
+            commands::delete_environment,
+            commands::get_variables,
+            commands::list_history,
+            commands::open_history_entry,
+            commands::delete_history_entry,
+            commands::clear_history,
+            commands::send_request,
+            commands::cancel_request,
+            commands::get_response_body,
+            commands::save_response_body,
+            commands::format_body,
+            commands::url_to_params,
+            commands::params_to_url,
+            commands::import_curl,
+            commands::looks_like_curl,
+            commands::export_curl,
+            commands::preview_openapi,
+            commands::import_openapi,
+            commands::get_sync_status,
+            commands::sync_create_workspace,
+            commands::sync_connect,
+            commands::sync_disconnect,
+            commands::sync_rotate_token,
+            commands::sync_now,
+            commands::sync_workspace_info,
+            commands::share_preview,
+            commands::share_create,
+            commands::share_update,
+            commands::share_revoke,
+            commands::share_list,
+            commands::import_share,
+            commands::preview_share,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running ReqHarbor");
+}

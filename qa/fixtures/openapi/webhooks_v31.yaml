@@ -1,0 +1,54 @@
+# Modelled on OAI learn.openapis.org examples/v3.1/webhook-example.yaml + 3.1 JSON Schema features
+openapi: 3.1.0
+info:
+  title: Webhook Example
+  version: 1.0.0
+  license: { name: MIT, identifier: MIT }
+jsonSchemaDialect: https://spec.openapis.org/oas/3.1/dialect/base
+servers:
+  - url: https://{region}.api.example.com/{basePath}
+    variables:
+      region: { default: eu-west-1, enum: [eu-west-1, us-east-1] }
+      basePath: { default: v2 }
+webhooks:
+  newPet:
+    post:
+      requestBody:
+        description: Information about a new pet in the system
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/Pet' } }
+      responses:
+        '200': { description: Return a 200 status to indicate that the data was received successfully }
+paths:
+  /pets/{petId}/files/{name}.{ext}:
+    get:
+      summary: "Fetch a pet file 🐶"
+      parameters:
+        - { name: petId, in: path, required: true, schema: { type: [integer, 'null'] } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: ext, in: path, required: true, schema: { type: string, const: png } }
+        - name: since
+          in: query
+          required: true
+          schema: { type: string, format: date-time, examples: ['2024-01-01T00:00:00Z'] }
+  /pets:
+    post:
+      operationId: createPet
+      requestBody:
+        content:
+          application/json: { schema: { $ref: '#/components/schemas/Pet' } }
+components:
+  schemas:
+    Pet:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: integer, format: int64, examples: [42] }
+        name: { type: string, examples: [Rex] }
+        tag: { type: [string, 'null'] }
+        owner: { $ref: '#/components/schemas/Owner', description: ref with sibling keywords (3.1) }
+    Owner:
+      type: object
+      properties:
+        pets: { type: array, items: { $ref: '#/components/schemas/Pet' } }
+        nickname: { const: boss }

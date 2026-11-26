@@ -1,0 +1,227 @@
+openapi: 3.0.3
+info:
+  title: Bookshop API
+  description: Manage books and authors.
+  version: 2.1.0
+servers:
+  - url: "{protocol}://{environment}.bookshop.example.com/v1/"
+    description: Production and staging
+    variables:
+      protocol:
+        enum: [https, http]
+        default: https
+      environment:
+        enum: [api, staging]
+        default: api
+  - url: http://localhost:8080/v1
+tags:
+  - name: books
+    description: Book catalogue
+  - name: authors
+  - name: unused
+security:
+  - bearerAuth: []
+paths:
+  /authors:
+    post:
+      tags: [authors]
+      summary: Create an author
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  example: Ursula K. Le Guin
+                born:
+                  type: integer
+                  example: 1929
+      responses:
+        "201":
+          description: Created
+  /authors/{authorId}:
+    get:
+      tags: [authors]
+      operationId: getAuthor
+      parameters:
+        - name: authorId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: OK
+  /books:
+    get:
+      tags: [books]
+      summary: List books
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - name: genre
+          in: query
+          description: Filter by genre
+          schema:
+            type: string
+            enum: [fantasy, scifi, poetry]
+        - name: X-Request-Id
+          in: header
+          required: true
+          example: 7f9c-req
+          schema:
+            type: string
+        - name: Accept
+          in: header
+          schema:
+            type: string
+            default: application/json
+      responses:
+        200:
+          description: A page of books
+    post:
+      tags: [books, featured]
+      summary: Add a book
+      requestBody:
+        required: true
+        content:
+          application/xml:
+            schema:
+              $ref: "#/components/schemas/Book"
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Book"
+            example:
+              title: The Dispossessed
+              authorId: au_1
+              tags: [scifi]
+      responses:
+        201:
+          description: Created
+  /books/{bookId}:
+    parameters:
+      - name: bookId
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: X-Tenant
+        in: header
+        schema:
+          type: string
+          default: public
+    get:
+      tags: [books]
+      summary: Get a book
+      responses:
+        200:
+          description: OK
+    put:
+      tags: [books]
+      summary: Replace a book
+      parameters:
+        - name: X-Tenant
+          in: header
+          required: true
+          schema:
+            type: string
+            example: acme
+      requestBody:
+        $ref: "#/components/requestBodies/BookBody"
+      responses:
+        200:
+          description: OK
+    delete:
+      tags: [books]
+      operationId: deleteBook
+      responses:
+        204:
+          description: Deleted
+  /books/{bookId}/cover:
+    post:
+      tags: [books]
+      summary: Upload a cover
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                caption:
+                  type: string
+                  default: Front cover
+                image:
+                  type: string
+                  format: binary
+      responses:
+        204:
+          description: Uploaded
+  /books/import:
+    post:
+      tags: [books]
+      summary: Bulk import CSV
+      requestBody:
+        content:
+          text/csv:
+            example: "title,author\nDune,Herbert\n"
+      responses:
+        202:
+          description: Accepted
+  /status:
+    get:
+      summary: Service status
+      security: []
+      responses:
+        200:
+          description: OK
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 20
+        minimum: 1
+  requestBodies:
+    BookBody:
+      content:
+        application/vnd.bookshop.book+json:
+          schema:
+            $ref: "#/components/schemas/Book"
+  schemas:
+    Book:
+      type: object
+      required: [title]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        title:
+          type: string
+        authorId:
+          type: string
+        published:
+          type: string
+          format: date
+        price:
+          type: number
+          example: 9.99
+        inStock:
+          type: boolean
+        tags:
+          type: array
+          items:
+            type: string
+        format:
+          $ref: "#/components/schemas/Format"
+    Format:
+      type: string
+      enum: [hardcover, paperback, ebook]

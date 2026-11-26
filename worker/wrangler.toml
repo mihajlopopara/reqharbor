@@ -1,0 +1,17 @@
+# ReqHarbor Worker — sync + share links (PRODUCT.md §8)
+name = "reqharbor-worker"
+main = "src/index.ts"
+compatibility_date = "2026-11-20"
+
+# Optional variable: PUBLIC_BASE_URL — absolute origin used to build share URLs
+# (e.g. "https://share.example.com"). When unset, the incoming request's origin is used.
+# Set it in a [vars] block or the dashboard when you deploy behind a custom domain.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "reqharbor"
+# >>> PLACEHOLDER — NOT A REAL DATABASE <<<
+# Replace with the id printed by `npx wrangler d1 create reqharbor` before the first real deploy.
+# Local dev (`npm run dev`) and tests (`npm test`) work with this placeholder as-is.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

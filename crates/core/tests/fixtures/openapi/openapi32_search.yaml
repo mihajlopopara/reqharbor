@@ -1,0 +1,91 @@
+openapi: 3.2.0
+info:
+  title: Product Search API
+  version: 1.0.0
+servers:
+  - url: https://search.example.com/v1
+security:
+  - basicAuth: []
+paths:
+  /products:
+    get:
+      tags: [products]
+      summary: List products
+      parameters:
+        - name: page
+          in: query
+          required: true
+          schema:
+            type: integer
+            default: 1
+      responses:
+        "200":
+          description: OK
+    query:
+      tags: [products]
+      summary: Search products
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchQuery"
+      responses:
+        "200":
+          description: Matching products
+    additionalOperations:
+      purge:
+        tags: [admin]
+        summary: Purge product cache
+        responses:
+          "204":
+            description: Purged
+      LINK:
+        tags: [admin]
+        operationId: linkProducts
+        responses:
+          "204":
+            description: Linked
+      bad method:
+        summary: Not a valid method token
+        responses:
+          "204":
+            description: Never imported
+  /products/{sku}:
+    query:
+      tags: [products]
+      operationId: queryProductBySku
+      requestBody:
+        content:
+          application/json:
+            examples:
+              bySku:
+                summary: Select fields
+                value:
+                  fields: [name, price]
+      responses:
+        "200":
+          description: OK
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+  schemas:
+    SearchQuery:
+      type: object
+      properties:
+        text:
+          type: string
+          example: running shoes
+        filters:
+          type: object
+          properties:
+            maxPrice:
+              type: number
+            brands:
+              type: array
+              items:
+                type: string
+        limit:
+          type: integer
+          default: 25

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 456ad421e84bb3cd13969e856f1eef9321c896f317675394c1cfd7cfe41f8061 # shrinks to r = Request { id: "01M8AGP95M1XFEWZ6B4ANG25SQ", collection_id: "", folder_id: None, name: "", method: "GET", url: "https://a.com", params: [], headers: [], auth: Auth { auth_type: Apikey, username: None, password: None, token: None, api_key: Some(ApiKeyAuth { key: "a", value: "", location: Query }) }, body: Body { body_type: None, text: None, form: None, form_encoded: None, graphql: None, binary_path: None }, settings: RequestSettings { follow_redirects: true, timeout_ms: 30000, verify_tls: false }, sort_order: 0, created_at: 0, updated_at: 0 }
+cc bfea339b12ed669a39cf0cb696ac8b4e5e26f95b2db8ebf18a2c6b920f37a05e # shrinks to r = Request { id: "01M8AM13MFKBK337KE95VJ22A2", collection_id: "", folder_id: None, name: "", method: "GET", url: "https://a.com", params: [], headers: [], auth: Auth { auth_type: None, username: None, password: None, token: None, api_key: None }, body: Body { body_type: Json, text: Some("^"), form: None, form_encoded: None, graphql: None, binary_path: None }, settings: RequestSettings { follow_redirects: true, timeout_ms: 30000, verify_tls: false }, sort_order: 0, created_at: 0, updated_at: 0 }

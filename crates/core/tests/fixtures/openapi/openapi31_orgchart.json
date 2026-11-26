@@ -1,0 +1,141 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "Org Chart API", "version": "0.3.0" },
+  "servers": [{ "url": "/api/v2/" }],
+  "security": [{ "oidc": ["read"] }],
+  "paths": {
+    "/employees": {
+      "post": {
+        "tags": ["employees"],
+        "operationId": "createEmployee",
+        "requestBody": {
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/Employee" } }
+          }
+        },
+        "responses": { "201": { "description": "Created" } }
+      },
+      "get": {
+        "tags": ["employees"],
+        "summary": "List employees",
+        "parameters": [
+          { "$ref": "#/components/parameters/TraceId" },
+          {
+            "name": "dept",
+            "in": "query",
+            "required": true,
+            "schema": { "$ref": "#/components/schemas/Department/properties/code" }
+          }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/employees/{employeeId}/contact": {
+      "put": {
+        "tags": ["employees"],
+        "summary": "Set contact",
+        "requestBody": {
+          "content": {
+            "application/merge-patch+json": { "schema": { "$ref": "#/components/schemas/Contact" } }
+          }
+        },
+        "responses": { "204": { "description": "Updated" } }
+      }
+    },
+    "/teams": {
+      "post": {
+        "tags": ["teams"],
+        "summary": "Create team",
+        "requestBody": {
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/Team" } }
+          }
+        },
+        "responses": { "201": { "description": "Created" } }
+      }
+    },
+    "/teams/{teamId}": {
+      "patch": {
+        "tags": ["teams"],
+        "summary": "Patch team",
+        "requestBody": { "$ref": "https://schemas.example.com/team-patch.json" },
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/teams/{teamId}/missing": {
+      "post": {
+        "summary": "Broken ref",
+        "requestBody": {
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/DoesNotExist" } }
+          }
+        },
+        "responses": { "200": { "description": "OK" } }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oidc": {
+        "type": "openIdConnect",
+        "openIdConnectUrl": "https://id.example.com/.well-known/openid-configuration"
+      }
+    },
+    "parameters": {
+      "TraceId": { "$ref": "./shared-params.yaml#/TraceId" }
+    },
+    "schemas": {
+      "Employee": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": ["string", "null"], "examples": ["Ada"] },
+          "manager": { "$ref": "#/components/schemas/Employee" },
+          "reports": { "type": "array", "items": { "$ref": "#/components/schemas/Employee" } },
+          "department": { "$ref": "#/components/schemas/Department" }
+        }
+      },
+      "Department": {
+        "type": "object",
+        "properties": {
+          "code": { "const": "ENG" },
+          "parent": { "$ref": "#/components/schemas/Department" },
+          "head": { "$ref": "#/components/schemas/Employee" }
+        }
+      },
+      "TeamBase": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "size": { "type": "integer" }
+        }
+      },
+      "Team": {
+        "allOf": [
+          { "$ref": "#/components/schemas/TeamBase" },
+          {
+            "type": "object",
+            "properties": {
+              "members": { "type": "array", "items": { "$ref": "#/components/schemas/Employee" } },
+              "address": { "$ref": "./common.json#/Address" }
+            }
+          }
+        ]
+      },
+      "Contact": {
+        "oneOf": [
+          { "$ref": "#/components/schemas/Email" },
+          { "$ref": "#/components/schemas/Phone" }
+        ]
+      },
+      "Email": {
+        "type": "object",
+        "properties": { "email": { "type": "string", "format": "email" } }
+      },
+      "Phone": {
+        "type": "object",
+        "properties": { "phone": { "type": "string" } }
+      }
+    }
+  }
+}

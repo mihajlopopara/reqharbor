@@ -1,0 +1,1 @@
+curl 'https://api.example.com/v1/orders' --compressed -X POST -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0' -H 'Accept: application/json' -H 'Content-Type: application/json' -H 'Origin: https://app.example.com' -H 'Connection: keep-alive' --data-raw '{"item":"widget","qty":2}'

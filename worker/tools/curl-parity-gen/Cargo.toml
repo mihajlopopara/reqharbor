@@ -1,0 +1,16 @@
+# Regenerates worker/test/fixtures/curl_parity.json "expected" values by running the real Rust
+# exporter (reqharbor-core) on each case. Run inside the dev container, from the repo root:
+#   docker compose run --rm -w /app/worker dev npm run parity:gen
+[package]
+name = "curl-parity-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+reqharbor-core = { path = "../../../crates/core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Standalone: not part of the repo's Cargo workspace.
+[workspace]

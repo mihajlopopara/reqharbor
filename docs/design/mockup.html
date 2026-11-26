@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ReqHarbor Mockup</title>
+<link rel="stylesheet" href="tokens.css">
+<style>
+/* Mockup-only component CSS. Values come from tokens.css; see DESIGN.md for the spec. */
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg-sidebar);color:var(--text-1);font:var(--fw-regular) var(--fs-md)/var(--lh-ui) var(--font-ui);-webkit-font-smoothing:antialiased;padding:var(--sp-6)}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+svg.i{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+svg.i.sm{width:14px;height:14px}
+:focus-visible{outline:2px solid var(--focus-ring);outline-offset:1px}
+.page-head{display:flex;align-items:center;justify-content:space-between;max-width:1440px;margin:0 auto var(--sp-5)}
+.page-head h1{font-size:var(--fs-lg);font-weight:var(--fw-semibold);margin:0}
+.page-head p{margin:2px 0 0;color:var(--text-2);font-size:var(--fs-sm)}
+
+/* ---------- App frame ---------- */
+.app{max-width:1440px;min-width:1120px;height:720px;margin:0 auto;display:grid;grid-template-columns:300px 1px minmax(360px,1fr) 1px minmax(360px,1fr);border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--shadow-dialog);background:var(--bg-pane)}
+.split{background:var(--border-subtle);position:relative;cursor:col-resize}
+.split::after{content:"";position:absolute;inset:0 -3px;z-index:var(--z-splitter)}
+.split:hover{background:var(--accent-fg)}
+.pane{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg-pane)}
+.sidebar{background:var(--bg-sidebar)}
+.row1{height:var(--h-pane-header);display:flex;align-items:center;gap:var(--sp-2);padding:0 var(--sp-4) 0 var(--sp-5);flex:none}
+.row2{height:var(--h-pane-bar);display:flex;align-items:center;gap:var(--sp-4);padding:0 var(--sp-5);flex:none}
+.grow{flex:1;min-width:0}
+.muted{color:var(--text-2)}.faint{color:var(--text-3)}
+.mono{font-family:var(--font-mono)}
+
+/* Buttons */
+.btn{height:var(--h-control);display:inline-flex;align-items:center;justify-content:center;gap:var(--sp-3);padding:0 var(--sp-5);border:1px solid transparent;border-radius:var(--r-sm);background:transparent;color:var(--text-1);font-weight:var(--fw-medium);transition:background-color var(--dur-fast) var(--ease-out)}
+.btn-primary{background:var(--accent);color:var(--text-on-accent)}
+.btn-primary:hover{background:var(--accent-hover)}.btn-primary:active{background:var(--accent-active)}
+.btn-secondary{background:var(--bg-input);border-color:var(--border-subtle)}
+.btn-secondary:hover{border-color:var(--border-strong)}
+.btn-ghost{color:var(--text-2)}.btn-ghost:hover{background:var(--bg-hover);color:var(--text-1)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.btn-danger{color:var(--danger)}
+.icon-btn{width:var(--h-control-sm);height:var(--h-control-sm);display:inline-grid;place-items:center;border:0;border-radius:var(--r-sm);background:transparent;color:var(--text-2)}
+.icon-btn:hover{background:var(--bg-hover);color:var(--text-1)}
+.split-btn{display:flex;width:100%}
+.split-btn .btn{border-radius:var(--r-sm) 0 0 var(--r-sm);flex:1}
+.split-btn .btn+.btn{flex:none;width:30px;padding:0;border-radius:0 var(--r-sm) var(--r-sm) 0;border-left:1px solid rgba(0,0,0,.22)}
+.kbd{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 4px;border:1px solid var(--border-strong);border-bottom-width:2px;border-radius:var(--r-xs);background:var(--bg-input);color:var(--text-2);font:var(--fw-medium) var(--fs-xs)/1 var(--font-ui)}
+.kbd-inline{font-size:var(--fs-sm);color:var(--text-3);margin-left:var(--sp-2)}
+
+/* Tabs */
+.tabs{height:var(--h-tabs);display:flex;align-items:stretch;gap:var(--sp-5);padding:0 var(--sp-5);border-bottom:1px solid var(--border-subtle);flex:none}
+.tab{position:relative;display:flex;align-items:center;gap:3px;padding:0 1px;border:0;background:none;color:var(--text-2);font-size:var(--fs-md);white-space:nowrap}
+.tab:hover{color:var(--text-1)}
+.tab[aria-selected="true"]{color:var(--text-1);font-weight:var(--fw-medium)}
+.tab[aria-selected="true"]::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;border-radius:2px 2px 0 0;background:var(--accent-fg)}
+.tab sup{font-size:var(--fs-xs);line-height:1;color:var(--accent-fg);font-weight:var(--fw-semibold);top:-.45em}
+.tab .dot{width:5px;height:5px;border-radius:50%;background:var(--accent-fg);margin-top:-8px}
+.tabs .end{margin-left:auto;display:flex;align-items:center;gap:var(--sp-2)}
+
+/* Segmented / chips */
+.seg{display:inline-flex;gap:2px;padding:2px;border-radius:var(--r-sm);background:var(--bg-input)}
+.seg button{height:20px;padding:0 var(--sp-4);border:0;border-radius:var(--r-xs);background:transparent;color:var(--text-2);font-size:var(--fs-sm)}
+.seg button:hover{color:var(--text-1)}
+.seg button[aria-pressed="true"]{background:var(--bg-raised);color:var(--text-1);box-shadow:0 0 0 1px var(--border-subtle)}
+.chips{display:flex;gap:var(--sp-1);flex-wrap:wrap}
+.chips button{height:22px;padding:0 var(--sp-4);border:0;border-radius:var(--r-sm);background:transparent;color:var(--text-2);font-size:var(--fs-sm)}
+.chips button:hover{background:var(--bg-hover);color:var(--text-1)}
+.chips button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent-fg);font-weight:var(--fw-medium)}
+
+/* Method badges & status */
+.m{font:var(--fw-semibold) var(--fs-xs)/1 var(--font-mono);letter-spacing:.02em;text-transform:uppercase}
+.m-get{color:var(--method-get)}.m-post{color:var(--method-post)}.m-put{color:var(--method-put)}.m-patch{color:var(--method-patch)}.m-delete{color:var(--method-delete)}.m-query{color:var(--method-query)}.m-head{color:var(--method-head)}.m-options{color:var(--method-options)}.m-custom{color:var(--method-custom)}
+.code-chip{display:inline-flex;align-items:center;height:16px;padding:0 5px;border-radius:var(--r-xs);font:var(--fw-semibold) var(--fs-xs)/1 var(--font-mono)}
+.s2{color:var(--status-2xx);background:var(--success-soft)}.s3{color:var(--status-3xx);background:var(--info-soft)}.s4{color:var(--status-4xx);background:var(--warning-soft)}.s5,.serr{color:var(--status-5xx);background:var(--danger-soft)}.s1,.scan{color:var(--status-1xx);background:var(--bg-active)}
+
+/* Sidebar */
+.project{display:flex;align-items:center;gap:var(--sp-3);height:24px;padding:0 var(--sp-3) 0 var(--sp-2);margin-left:calc(var(--sp-2) * -1);border:0;border-radius:var(--r-sm);background:none;font-weight:var(--fw-semibold)}
+.project:hover{background:var(--bg-hover)}
+.filter-row{display:flex;align-items:center;gap:var(--sp-2);padding:var(--sp-4) var(--sp-4) var(--sp-3) var(--sp-5);flex:none}
+.pill{flex:1;display:flex;align-items:center;gap:var(--sp-3);height:26px;padding:0 var(--sp-4);border:1px solid transparent;border-radius:var(--r-pill);background:var(--bg-input);color:var(--text-3)}
+.pill:hover{border-color:var(--border-strong)}
+.pill input{flex:1;min-width:0;border:0;background:none;outline:none;color:var(--text-1);font-size:var(--fs-md)}
+.pill input::placeholder{color:var(--text-3)}
+.list{flex:1;overflow:auto;padding:0 0 var(--sp-4)}
+.group{padding:var(--sp-4) var(--sp-5) var(--sp-2);font-size:var(--fs-xs);font-weight:var(--fw-semibold);letter-spacing:.06em;text-transform:uppercase;color:var(--text-3)}
+.hrow{height:var(--h-row-history);display:grid;grid-template-columns:var(--w-method-col) 1fr;align-content:center;row-gap:2px;padding:0 var(--sp-4) 0 var(--sp-5);cursor:default;position:relative}
+.hrow:hover{background:var(--bg-hover)}
+.hrow[aria-selected="true"]{background:var(--bg-selected)}
+.hrow[aria-selected="true"] .meta{color:var(--text-2)}
+.hrow .hurl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-1)}
+.hrow .meta{grid-column:2;display:flex;align-items:center;gap:var(--sp-3);font-size:var(--fs-sm);line-height:var(--lh-tight);color:var(--text-3)}
+.hrow .m{align-self:center}
+.footer{height:var(--h-sidebar-footer);display:flex;align-items:center;gap:var(--sp-2);padding:0 var(--sp-3) 0 var(--sp-4);border-top:1px solid var(--border-subtle);flex:none;font-size:var(--fs-sm)}
+.env-btn{display:flex;align-items:center;gap:var(--sp-3);height:22px;padding:0 var(--sp-3);border:0;border-radius:var(--r-sm);background:none;color:var(--text-2);font-size:var(--fs-sm)}
+.env-btn:hover{background:var(--bg-hover);color:var(--text-1)}
+.env-btn b{color:var(--text-1);font-weight:var(--fw-medium)}
+.sync{display:flex;align-items:center;gap:var(--sp-2);color:var(--text-3);font-size:var(--fs-sm);padding:0 var(--sp-2)}
+
+/* Request pane */
+.crumbs{display:flex;align-items:center;gap:var(--sp-2);color:var(--text-3);font-size:var(--fs-sm);white-space:nowrap;overflow:hidden}
+.crumbs b{color:var(--text-1);font-weight:var(--fw-medium);font-size:var(--fs-md)}
+.unsaved{width:6px;height:6px;border-radius:50%;background:var(--text-2);margin-left:var(--sp-2)}
+.reqbar{display:flex;flex:1;min-width:0;height:var(--h-control-lg);border-radius:var(--r-sm);background:var(--bg-input);border:1px solid transparent}
+.reqbar:focus-within{border-color:var(--border-focus)}
+.method-trigger{width:var(--w-method-trigger);display:flex;align-items:center;justify-content:space-between;padding:0 var(--sp-3) 0 var(--sp-4);border:0;border-right:1px solid var(--border-subtle);background:none;border-radius:var(--r-sm) 0 0 var(--r-sm)}
+.method-trigger .m{font-size:var(--fs-md)}
+.method-trigger:hover{background:var(--bg-hover)}
+.url{flex:1;min-width:0;display:flex;align-items:center;padding:0 var(--sp-4);font:var(--fs-code)/1 var(--font-mono);white-space:nowrap;overflow:hidden}
+.var{color:var(--var-fg);background:var(--var-bg);border-radius:var(--r-xs);padding:1px 2px}
+.var-bad{color:var(--var-unresolved-fg);background:var(--var-unresolved-bg);border-radius:var(--r-xs);padding:1px 2px;text-decoration:underline wavy;text-underline-offset:3px}
+.send{height:var(--h-control-lg);min-width:76px}
+.body-tools{display:flex;align-items:center;gap:var(--sp-4);padding:var(--sp-4) var(--sp-5) var(--sp-2);flex:none}
+.sublabel{display:flex;align-items:center;justify-content:space-between;padding:var(--sp-2) var(--sp-5) var(--sp-3);font-size:var(--fs-sm);color:var(--text-3);flex:none}
+.link{border:0;background:none;padding:2px 4px;border-radius:var(--r-xs);color:var(--accent-fg);font-size:var(--fs-sm);font-weight:var(--fw-medium)}
+.link:hover{background:var(--accent-soft)}
+
+/* Code view */
+.code{flex:1;overflow:auto;font:var(--fs-code)/var(--lh-code) var(--font-mono);padding:var(--sp-2) 0 var(--sp-6)}
+.ln{display:grid;grid-template-columns:44px 1fr;white-space:pre}
+.ln .no{color:var(--text-3);text-align:right;padding-right:var(--sp-5);user-select:none;opacity:.8}
+.ln.active{background:var(--bg-code-active-line)}
+.ln.active .no{color:var(--text-2);opacity:1}
+.k{color:var(--syn-key)}.str{color:var(--syn-string)}.num{color:var(--syn-number)}.b{color:var(--syn-bool)}.p{color:var(--syn-punct)}
+.caret{display:inline-block;width:1.5px;height:15px;background:var(--text-1);vertical-align:-3px}
+
+/* Response pane */
+.strip{display:flex;align-items:center;gap:var(--sp-6);font-size:var(--fs-md);color:var(--text-2);white-space:nowrap}
+.strip b{font-weight:var(--fw-medium);color:var(--text-1);font-family:var(--font-mono);font-size:var(--fs-md)}
+.strip .ok{color:var(--status-2xx)}
+.status-pill{display:inline-flex;align-items:center;gap:var(--sp-3);height:22px;padding:0 var(--sp-4);border-radius:var(--r-sm);font:var(--fw-semibold) var(--fs-md)/1 var(--font-mono)}
+
+/* ---------- Reference sheet ---------- */
+.sheet{max-width:1440px;margin:var(--sp-9) auto 0;display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:var(--sp-6)}
+.card{background:var(--bg-pane);border-radius:var(--r-lg);box-shadow:var(--shadow-popover);overflow:hidden;display:flex;flex-direction:column}
+.card h2{margin:0;padding:var(--sp-5) var(--sp-6) var(--sp-4);font-size:var(--fs-sm);font-weight:var(--fw-semibold);color:var(--text-2);letter-spacing:.04em;text-transform:uppercase}
+.card .body{padding:0 var(--sp-6) var(--sp-6);display:flex;flex-direction:column;gap:var(--sp-4)}
+.badges{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--sp-3) var(--sp-5)}
+.badges div{display:flex;align-items:center;gap:var(--sp-4);font-size:var(--fs-sm);color:var(--text-3)}
+.badges .m{width:var(--w-method-col)}
+.tree{background:var(--bg-sidebar);border-radius:var(--r-md);padding:var(--sp-2) 0}
+.trow{height:var(--h-row-tree);display:flex;align-items:center;gap:var(--sp-3);padding-right:var(--sp-4);white-space:nowrap}
+.trow:hover{background:var(--bg-hover)}
+.trow[aria-selected="true"]{background:var(--bg-selected)}
+.trow .chev{color:var(--text-3)}
+.trow .m{width:var(--w-method-col);flex:none}
+.trow .name{flex:1;overflow:hidden;text-overflow:ellipsis}
+.trow .cnt{color:var(--text-3);font-size:var(--fs-sm)}
+mark{background:var(--bg-mark);color:inherit;border-radius:2px}
+.kv{width:100%;table-layout:fixed;border-collapse:collapse;font-size:var(--fs-md)}
+.kv th{height:24px;text-align:left;font-weight:var(--fw-medium);font-size:var(--fs-sm);color:var(--text-3);padding:0 var(--sp-3)}
+.kv td{height:var(--h-row-kv);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 var(--sp-3);border-top:1px solid var(--border-subtle);font-family:var(--font-mono);font-size:var(--fs-code)}
+.kv td.ui{font-family:var(--font-ui)}
+.kv tr.off td:not(:first-child){color:var(--text-3);text-decoration:line-through}
+.kv tr.ghost td{color:var(--text-3)}
+.kv .cell-focus{box-shadow:inset 0 0 0 1px var(--border-focus);background:var(--bg-input);border-radius:var(--r-xs)}
+.cb{width:14px;height:14px;border-radius:var(--r-xs);display:inline-grid;place-items:center;border:1px solid var(--border-strong);vertical-align:middle}
+.cb.on{background:var(--accent);border-color:var(--accent);color:var(--text-on-accent)}
+.menu{background:var(--bg-raised);border-radius:var(--r-md);box-shadow:var(--shadow-popover);padding:var(--sp-2);width:236px}
+.mi{height:26px;display:flex;align-items:center;gap:var(--sp-4);padding:0 var(--sp-4);border-radius:var(--r-sm);color:var(--text-1)}
+.mi .sc{margin-left:auto;color:var(--text-3);font-size:var(--fs-sm)}
+.mi.hl{background:var(--accent);color:var(--text-on-accent)}.mi.hl .sc{color:var(--text-on-accent)}
+.mi.danger{color:var(--danger)}
+.mi.dis{color:var(--text-disabled)}
+.sep{height:1px;margin:var(--sp-2) var(--sp-2);background:var(--border-subtle)}
+.toast{display:flex;align-items:center;gap:var(--sp-4);min-height:40px;padding:var(--sp-3) var(--sp-3) var(--sp-3) var(--sp-5);background:var(--bg-raised);border-radius:var(--r-md);box-shadow:var(--shadow-popover);max-width:360px}
+.toast .msg{flex:1}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:var(--sp-5);padding:var(--sp-8) 0;color:var(--text-2)}
+.shortcuts{display:grid;grid-template-columns:auto auto;gap:var(--sp-4) var(--sp-8);align-items:center;font-size:var(--fs-md)}
+.shortcuts span:nth-child(odd){color:var(--text-2);text-align:right}
+.shortcuts span:nth-child(even){display:flex;gap:3px}
+.err{display:flex;flex-direction:column;gap:var(--sp-3);padding:var(--sp-5);border-radius:var(--r-md);background:var(--danger-soft)}
+.err h3{margin:0;font-size:var(--fs-md);font-weight:var(--fw-semibold);color:var(--danger);display:flex;gap:var(--sp-3);align-items:center}
+.err code{font:var(--fs-sm)/1.5 var(--font-mono);color:var(--text-2)}
+.hint{display:flex;gap:var(--sp-3);align-items:center;padding:var(--sp-3) var(--sp-4);border-radius:var(--r-sm);background:var(--info-soft);color:var(--text-1);font-size:var(--fs-sm)}
+.hint svg{color:var(--info)}
+.theme-switch{position:fixed;top:var(--sp-4);right:var(--sp-4);z-index:var(--z-toast)}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-chev-d" viewBox="0 0 16 16"><path d="M4 6l4 4 4-4"/></symbol>
+  <symbol id="i-chev-r" viewBox="0 0 16 16"><path d="M6 4l4 4-4 4"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4"/><path d="M10 10l3 3"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2"/><path d="M8 1.8v1.7M8 12.5v1.7M1.8 8h1.7M12.5 8h1.7M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M3.6 12.4l1.2-1.2M11.2 4.8l1.2-1.2"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 16 16"><path d="M4.5 12.5h7a2.5 2.5 0 0 0 .3-5A3.5 3.5 0 0 0 5 6.6a3 3 0 0 0-.5 5.9z"/><path d="M6.5 9.5l1.2 1.2 2-2.2"/></symbol>
+  <symbol id="i-import" viewBox="0 0 16 16"><path d="M8 2.5v7M5 7l3 3 3-3M3 12.5h10"/></symbol>
+  <symbol id="i-more" viewBox="0 0 16 16"><circle cx="3.5" cy="8" r=".6"/><circle cx="8" cy="8" r=".6"/><circle cx="12.5" cy="8" r=".6"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"/></symbol>
+  <symbol id="i-save" viewBox="0 0 16 16"><path d="M8 2.5v8M5 7.5l3 3 3-3M3 13.5h10"/></symbol>
+  <symbol id="i-cols" viewBox="0 0 16 16"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M8 3v10"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 16 16"><path d="M2.5 4.5a1 1 0 0 1 1-1h3l1.5 1.5h4.5a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"/></symbol>
+  <symbol id="i-stack" viewBox="0 0 16 16"><path d="M8 2.5l5.5 3-5.5 3-5.5-3z"/><path d="M2.5 8.5l5.5 3 5.5-3"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></symbol>
+  <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 7.5v3.5M8 5.2v.1"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 16 16"><path d="M8 2.5l6 10.5H2z"/><path d="M8 6.5v3M8 11.3v.1"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="11" height="11" rx="2"/><path d="M2.5 6.5h11"/></symbol>
+</svg>
+
+<div class="theme-switch seg" role="group" aria-label="Theme">
+  <button type="button" data-t="" aria-pressed="true">System</button>
+  <button type="button" data-t="dark" aria-pressed="false">Dark</button>
+  <button type="button" data-t="light" aria-pressed="false">Light</button>
+</div>
+
+<header class="page-head">
+  <div>
+    <h1>ReqHarbor — main screen</h1>
+    <p>Static reference for DESIGN.md. Sample: saved POST request, JSON body, 200 response, Activity tab.</p>
+  </div>
+</header>
+
+<div class="app" role="application" aria-label="ReqHarbor">
+  <!-- ================= SIDEBAR ================= -->
+  <aside class="pane sidebar" aria-label="Sidebar">
+    <div class="row1">
+      <button class="project" aria-haspopup="menu" title="Switch project"><svg class="i sm faint"><use href="#i-layers"/></svg>Default<svg class="i sm faint"><use href="#i-chev-d"/></svg></button>
+      <span class="grow"></span>
+      <button class="icon-btn" title="Import (cURL, OpenAPI, link)  ⌘U"><svg class="i"><use href="#i-import"/></svg></button>
+    </div>
+    <div class="row2">
+      <div class="split-btn">
+        <button class="btn btn-primary"><svg class="i sm"><use href="#i-plus"/></svg>New Request</button>
+        <button class="btn btn-primary" aria-label="More new options" aria-haspopup="menu"><svg class="i sm"><use href="#i-chev-d"/></svg></button>
+      </div>
+    </div>
+    <div class="tabs" role="tablist" aria-label="Sidebar">
+      <button class="tab" role="tab" aria-selected="true">Activity</button>
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Collections</button>
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Env</button>
+    </div>
+    <div class="filter-row">
+      <label class="pill"><svg class="i sm"><use href="#i-search"/></svg><input placeholder="filter activity" aria-label="Filter activity"></label>
+      <button class="icon-btn" title="Activity options" aria-haspopup="menu"><svg class="i"><use href="#i-menu"/></svg></button>
+    </div>
+    <div class="list" role="listbox" aria-label="History">
+      <div class="group">Today</div>
+      <div class="hrow" role="option" aria-selected="true"><span class="m m-post">POST</span><span class="hurl">api.staging.example.com/v1/users</span><span class="meta">2m <span class="code-chip s2">200</span> 184 ms</span></div>
+      <div class="hrow" role="option"><span class="m m-get">GET</span><span class="hurl">api.staging.example.com/v1/users?limit=20</span><span class="meta">14m <span class="code-chip s2">200</span> 96 ms</span></div>
+      <div class="hrow" role="option"><span class="m m-query">QUERY</span><span class="hurl">api.staging.example.com/v1/users/search</span><span class="meta">1h <span class="code-chip s2">200</span> 212 ms</span></div>
+      <div class="hrow" role="option"><span class="m m-patch">PATCH</span><span class="hurl">api.staging.example.com/v1/users/01JD8ZQK</span><span class="meta">3h <span class="code-chip s2">204</span> 88 ms</span></div>
+      <div class="hrow" role="option"><span class="m m-delete">DELETE</span><span class="hurl">api.staging.example.com/v1/sessions/current</span><span class="meta">5h <span class="code-chip s4">401</span> 41 ms</span></div>
+      <div class="group">Yesterday</div>
+      <div class="hrow" role="option"><span class="m m-put">PUT</span><span class="hurl">api.staging.example.com/v1/teams/platform</span><span class="meta">Yesterday <span class="code-chip s2">200</span> 130 ms</span></div>
+      <div class="hrow" role="option"><span class="m m-get">GET</span><span class="hurl">localhost:8080/health</span><span class="meta">Yesterday <span class="code-chip s5">503</span> 12 ms</span></div>
+      <div class="hrow" role="option"><span class="m m-options">OPTIONS</span><span class="hurl">api.staging.example.com/v1/users</span><span class="meta">Yesterday <span class="code-chip s2">204</span> 35 ms</span></div>
+      <div class="hrow" role="option"><span class="m m-head">HEAD</span><span class="hurl">cdn.example.com/app.js</span><span class="meta">Yesterday <span class="code-chip s3">304</span> 22 ms</span></div>
+      <div class="hrow" role="option"><span class="m m-get">GET</span><span class="hurl">bad-host.invalid/ping</span><span class="meta">Yesterday <span class="code-chip serr">DNS</span></span></div>
+    </div>
+    <div class="footer">
+      <button class="env-btn" title="Change environment  ⌘E"><span class="faint">Env</span><b>Staging</b><svg class="i sm"><use href="#i-chev-d"/></svg></button>
+      <span class="grow"></span>
+      <span class="sync" title="Synced 1 min ago"><svg class="i sm"><use href="#i-cloud"/></svg>Synced</span>
+      <button class="icon-btn" title="Settings  ⌘,"><svg class="i"><use href="#i-gear"/></svg></button>
+    </div>
+  </aside>
+  <div class="split" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" aria-valuenow="300" aria-valuemin="220" aria-valuemax="480" tabindex="0"></div>
+
+  <!-- ================= REQUEST ================= -->
+  <main class="pane" aria-label="Request">
+    <div class="row1">
+      <div class="crumbs grow"><span>Users API</span><svg class="i sm"><use href="#i-chev-r"/></svg><span>Users</span><svg class="i sm"><use href="#i-chev-r"/></svg><b>Create user</b><span class="unsaved" title="Unsaved changes"></span></div>
+      <button class="btn btn-ghost" style="height:24px;padding:0 8px">Save<span class="kbd-inline">⌘S</span></button>
+      <button class="icon-btn" title="More actions" aria-haspopup="menu"><svg class="i"><use href="#i-more"/></svg></button>
+    </div>
+    <div class="row2">
+      <div class="reqbar">
+        <button class="method-trigger" aria-haspopup="listbox" aria-label="Method: POST"><span class="m m-post">POST</span><svg class="i sm faint"><use href="#i-chev-d"/></svg></button>
+        <div class="url" role="textbox" aria-label="URL"><span class="var" title="https://api.staging.example.com · Staging">{{baseUrl}}</span>/v1/users</div>
+      </div>
+      <button class="btn btn-primary send">Send</button>
+    </div>
+    <div class="tabs" role="tablist" aria-label="Request">
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Query</button>
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Headers<sup>3</sup></button>
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Auth<span class="dot" title="Bearer"></span></button>
+      <button class="tab" role="tab" aria-selected="true">Body<span class="dot" title="JSON"></span></button>
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Tests</button>
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Pre Run</button>
+      <span class="end"><button class="icon-btn" title="Request settings: redirects, timeout, TLS"><svg class="i"><use href="#i-gear"/></svg></button></span>
+    </div>
+    <div class="body-tools">
+      <div class="chips" role="radiogroup" aria-label="Body type">
+        <button aria-pressed="false">None</button><button aria-pressed="true">JSON</button><button aria-pressed="false">XML</button><button aria-pressed="false">Text</button><button aria-pressed="false">Form</button><button aria-pressed="false">Form-encode</button><button aria-pressed="false">GraphQL</button><button aria-pressed="false">Binary</button>
+      </div>
+    </div>
+    <div class="sublabel"><span>JSON Content</span><button class="link" title="Format  ⌘⇧F">Format</button></div>
+    <div class="code" role="textbox" aria-label="Request body" aria-multiline="true">
+      <div class="ln"><span class="no">1</span><span><span class="p">{</span></span></div>
+      <div class="ln"><span class="no">2</span><span>  <span class="k">"name"</span><span class="p">:</span> <span class="str">"Ada Lovelace"</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">3</span><span>  <span class="k">"email"</span><span class="p">:</span> <span class="str">"ada@example.com"</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">4</span><span>  <span class="k">"role"</span><span class="p">:</span> <span class="str">"admin"</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">5</span><span>  <span class="k">"teams"</span><span class="p">: [</span><span class="str">"platform"</span><span class="p">,</span> <span class="str">"research"</span><span class="p">],</span></span></div>
+      <div class="ln active"><span class="no">6</span><span>  <span class="k">"notify"</span><span class="p">:</span> <span class="b">true</span><span class="caret"></span></span></div>
+      <div class="ln"><span class="no">7</span><span><span class="p">}</span></span></div>
+    </div>
+  </main>
+  <div class="split" role="separator" aria-orientation="vertical" aria-label="Resize response" tabindex="0"></div>
+
+  <!-- ================= RESPONSE ================= -->
+  <section class="pane" aria-label="Response">
+    <div class="row1">
+      <span class="faint grow" style="font-size:var(--fs-sm)">Sent 2m ago · Staging</span>
+      <button class="icon-btn" title="Copy body"><svg class="i"><use href="#i-copy"/></svg></button>
+      <button class="icon-btn" title="Save body to file"><svg class="i"><use href="#i-save"/></svg></button>
+      <button class="icon-btn" title="Stack response below"><svg class="i"><use href="#i-cols"/></svg></button>
+    </div>
+    <div class="row2">
+      <div class="strip" aria-live="polite">
+        <span>Status <span class="status-pill s2">200 OK</span></span>
+        <span>Size <b title="Wire size 198 B (gzip)">247 B</b></span>
+        <span>Time <b>184 ms</b></span>
+      </div>
+    </div>
+    <div class="tabs" role="tablist" aria-label="Response">
+      <button class="tab" role="tab" aria-selected="true">Response</button>
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Headers<sup>9</sup></button>
+      <button class="tab" role="tab" aria-selected="false" tabindex="-1">Cookies<sup>1</sup></button>
+      <span class="end"><span class="seg" role="group" aria-label="View"><button aria-pressed="true">Pretty</button><button aria-pressed="false">Raw</button></span></span>
+    </div>
+    <div class="code" style="padding-top:var(--sp-4)" role="region" aria-label="Response body">
+      <div class="ln"><span class="no">1</span><span><span class="p">{</span></span></div>
+      <div class="ln"><span class="no">2</span><span>  <span class="k">"id"</span><span class="p">:</span> <span class="str">"01JD8ZQK7Y3M9V2T4R6N8B0C5E"</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">3</span><span>  <span class="k">"name"</span><span class="p">:</span> <span class="str">"Ada Lovelace"</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">4</span><span>  <span class="k">"email"</span><span class="p">:</span> <span class="str">"ada@example.com"</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">5</span><span>  <span class="k">"role"</span><span class="p">:</span> <span class="str">"admin"</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">6</span><span>  <span class="k">"teams"</span><span class="p">: [</span></span></div>
+      <div class="ln"><span class="no">7</span><span>    <span class="str">"platform"</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">8</span><span>    <span class="str">"research"</span></span></div>
+      <div class="ln"><span class="no">9</span><span>  <span class="p">],</span></span></div>
+      <div class="ln"><span class="no">10</span><span>  <span class="k">"notify"</span><span class="p">:</span> <span class="b">true</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">11</span><span>  <span class="k">"seats"</span><span class="p">:</span> <span class="num">12</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">12</span><span>  <span class="k">"manager"</span><span class="p">:</span> <span class="b">null</span><span class="p">,</span></span></div>
+      <div class="ln"><span class="no">13</span><span>  <span class="k">"createdAt"</span><span class="p">:</span> <span class="str">"2026-11-25T09:41:12Z"</span></span></div>
+      <div class="ln"><span class="no">14</span><span><span class="p">}</span></span></div>
+    </div>
+  </section>
+</div>
+
+<!-- ================= REFERENCE SHEET ================= -->
+<div class="sheet">
+  <section class="card">
+    <h2>Method badges</h2>
+    <div class="body">
+      <div class="badges">
+        <div><span class="m m-get">GET</span></div><div><span class="m m-post">POST</span></div><div><span class="m m-put">PUT</span></div>
+        <div><span class="m m-patch">PATCH</span></div><div><span class="m m-delete">DELETE</span></div><div><span class="m m-query">QUERY</span></div>
+        <div><span class="m m-head">HEAD</span></div><div><span class="m m-options">OPTIONS</span></div><div><span class="m m-custom">PURGE</span></div>
+      </div>
+      <div class="hint"><svg class="i"><use href="#i-info"/></svg>QUERY requests normally carry a body.</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Status codes</h2>
+    <div class="body">
+      <div style="display:flex;gap:var(--sp-4);flex-wrap:wrap">
+        <span class="status-pill s1">101 Switching</span><span class="status-pill s2">200 OK</span><span class="status-pill s3">301 Moved</span>
+        <span class="status-pill s4">404 Not Found</span><span class="status-pill s5">500 Server Error</span><span class="status-pill serr">Error</span><span class="status-pill scan">Cancelled</span>
+      </div>
+      <div class="err" role="alert">
+        <h3><svg class="i"><use href="#i-alert"/></svg>Couldn't resolve host</h3>
+        <code>bad-host.invalid: nodename nor servname provided, or not known</code>
+        <div><button class="btn btn-secondary" style="height:24px">Retry</button></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Collections tab (filter “user”)</h2>
+    <div class="body">
+      <div class="tree" role="tree">
+        <div class="trow" style="padding-left:12px"><svg class="i sm chev"><use href="#i-chev-d"/></svg><svg class="i sm faint"><use href="#i-stack"/></svg><span class="name">Users API</span><span class="cnt">12</span></div>
+        <div class="trow" style="padding-left:24px"><svg class="i sm chev"><use href="#i-chev-d"/></svg><svg class="i sm faint"><use href="#i-folder"/></svg><span class="name"><mark>User</mark>s</span></div>
+        <div class="trow" style="padding-left:52px"><span class="m m-get">GET</span><span class="name">List <mark>user</mark>s</span></div>
+        <div class="trow" aria-selected="true" style="padding-left:52px"><span class="m m-post">POST</span><span class="name">Create <mark>user</mark></span><span class="unsaved"></span></div>
+        <div class="trow" style="padding-left:52px"><span class="m m-query">QUERY</span><span class="name">Search <mark>user</mark>s</span></div>
+        <div class="trow" style="padding-left:52px"><span class="m m-delete">DELETE</span><span class="name">Delete <mark>user</mark></span></div>
+        <div class="trow" style="padding-left:12px"><svg class="i sm chev"><use href="#i-chev-r"/></svg><svg class="i sm faint"><use href="#i-stack"/></svg><span class="name">Billing</span><span class="cnt">7</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Key-value editor (Env: Staging)</h2>
+    <div class="body">
+      <div style="display:flex;justify-content:space-between;align-items:center"><span class="faint" style="font-size:var(--fs-sm)">4 variables</span><button class="link">Bulk edit</button></div>
+      <table class="kv">
+        <thead><tr><th style="width:34px"></th><th style="width:34%">Variable</th><th>Value</th><th style="width:34px"></th></tr></thead>
+        <tbody>
+          <tr><td><span class="cb on"><svg class="i sm" style="width:10px;height:10px;stroke-width:2.5"><use href="#i-check"/></svg></span></td><td>baseUrl</td><td>https://api.staging.example.com</td><td></td></tr>
+          <tr><td><span class="cb on"><svg class="i sm" style="width:10px;height:10px;stroke-width:2.5"><use href="#i-check"/></svg></span></td><td>token</td><td><span class="cell-focus" style="padding:2px 4px">••••••••••••</span></td><td><svg class="i sm" style="color:var(--accent-fg)" aria-label="Secret"><use href="#i-lock"/></svg></td></tr>
+          <tr class="off"><td><span class="cb"></span></td><td>debug</td><td>true</td><td></td></tr>
+          <tr class="ghost"><td><span class="cb"></span></td><td>Add variable</td><td>Value</td><td></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Context menu (request)</h2>
+    <div class="body">
+      <div class="menu" role="menu">
+        <div class="mi">Open</div>
+        <div class="mi hl">Copy as cURL<span class="sc">⌘⇧C</span></div>
+        <div class="mi">Share…</div>
+        <div class="sep"></div>
+        <div class="mi">Rename<span class="sc">F2</span></div>
+        <div class="mi">Duplicate</div>
+        <div class="mi dis">Move to…</div>
+        <div class="sep"></div>
+        <div class="mi danger">Delete</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Toasts</h2>
+    <div class="body">
+      <div class="toast" role="status"><svg class="i" style="color:var(--success)"><use href="#i-check"/></svg><span class="msg">cURL copied to clipboard</span><button class="icon-btn" aria-label="Dismiss"><svg class="i sm"><use href="#i-x"/></svg></button></div>
+      <div class="toast" role="status"><svg class="i" style="color:var(--info)"><use href="#i-info"/></svg><span class="msg">Imported from cURL</span><button class="link">Undo</button><button class="icon-btn" aria-label="Dismiss"><svg class="i sm"><use href="#i-x"/></svg></button></div>
+      <div class="toast" role="alert"><svg class="i" style="color:var(--warning)"><use href="#i-alert"/></svg><span class="msg">Sync conflict: kept “Create user (conflict)”</span><button class="icon-btn" aria-label="Dismiss"><svg class="i sm"><use href="#i-x"/></svg></button></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Response empty state</h2>
+    <div class="body">
+      <div class="empty">
+        <div class="shortcuts">
+          <span>Send Request</span><span><span class="kbd">⌘</span><span class="kbd">↵</span></span>
+          <span>Import cURL</span><span><span class="kbd">⌘</span><span class="kbd">U</span></span>
+          <span>Change Environment</span><span><span class="kbd">⌘</span><span class="kbd">E</span></span>
+          <span>New Request</span><span><span class="kbd">⌘</span><span class="kbd">N</span></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Buttons & inputs</h2>
+    <div class="body">
+      <div style="display:flex;gap:var(--sp-4);flex-wrap:wrap">
+        <button class="btn btn-primary">Primary</button><button class="btn btn-secondary">Secondary</button><button class="btn btn-ghost">Ghost</button><button class="btn btn-secondary btn-danger">Delete</button><button class="btn btn-primary" disabled>Disabled</button>
+      </div>
+      <div class="reqbar" style="flex:none"><button class="method-trigger"><span class="m m-query">QUERY</span><svg class="i sm faint"><use href="#i-chev-d"/></svg></button><div class="url"><span class="var-bad" title="Unresolved variable">{{host}}</span>/v1/search</div></div>
+      <label class="pill"><svg class="i sm"><use href="#i-search"/></svg><input placeholder="filter collections" aria-label="Filter collections"></label>
+    </div>
+  </section>
+</div>
+
+<script>
+// Mockup-only theme toggle (mirrors the app's System / Dark / Light setting).
+document.querySelectorAll('.theme-switch button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var t = b.getAttribute('data-t');
+    if (t) document.documentElement.setAttribute('data-theme', t);
+    else document.documentElement.removeAttribute('data-theme');
+    document.querySelectorAll('.theme-switch button').forEach(function (x) { x.setAttribute('aria-pressed', String(x === b)); });
+  });
+});
+</script>
+</body>
+</html>

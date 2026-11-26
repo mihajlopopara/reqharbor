@@ -1,0 +1,20 @@
+# Rust
+/target/
+
+# Node / build output
+node_modules/
+ui/dist/
+worker/dist/
+worker/.wrangler/
+worker/.dev.vars
+ui/test-results/
+ui/playwright-report/
+
+# QA generated artifacts (regenerate with the scripts in qa/ and ui/e2e/design_review/)
+qa/r2/out/
+docs/qa/design/screens/
+
+# Local tooling
+.claude/settings.local.json
+.DS_Store
+*.log

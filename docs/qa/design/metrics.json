@@ -1,0 +1,1542 @@
+{
+  "main-1440-dark": {
+    "rows": [
+      [
+        {
+          "cls": "row1 svelte-129hoe0",
+          "x": 0,
+          "y": 0,
+          "w": 300,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-129hoe0",
+          "x": 0,
+          "y": 32,
+          "w": 300,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-129hoe0",
+          "x": 0,
+          "y": 76,
+          "w": 300,
+          "h": 34
+        },
+        {
+          "cls": "filter-row svelte-129hoe0",
+          "x": 0,
+          "y": 110,
+          "w": 300,
+          "h": 40
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-zccm3j",
+          "x": 301,
+          "y": 0,
+          "w": 569,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-zccm3j",
+          "x": 301,
+          "y": 32,
+          "w": 569,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-zccm3j",
+          "x": 301,
+          "y": 76,
+          "w": 569,
+          "h": 34
+        },
+        {
+          "cls": "panel svelte-zccm3j",
+          "x": 301,
+          "y": 110,
+          "w": 569,
+          "h": 790
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-157dpj3",
+          "x": 871,
+          "y": 0,
+          "w": 569,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-157dpj3",
+          "x": 871,
+          "y": 32,
+          "w": 569,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-157dpj3",
+          "x": 871,
+          "y": 76,
+          "w": 569,
+          "h": 34
+        },
+        {
+          "cls": "content svelte-157dpj3",
+          "x": 871,
+          "y": 110,
+          "w": 569,
+          "h": 790
+        }
+      ]
+    ],
+    "tabs": [
+      {
+        "label": "Sidebar",
+        "x": 0,
+        "y": 76,
+        "w": 300,
+        "h": 34
+      },
+      {
+        "label": "Request",
+        "x": 301,
+        "y": 76,
+        "w": 569,
+        "h": 34
+      },
+      {
+        "label": "Response",
+        "x": 871,
+        "y": 76,
+        "w": 569,
+        "h": 34
+      }
+    ],
+    "send": {
+      "x": 782,
+      "y": 39,
+      "w": 76,
+      "h": 30
+    },
+    "sendCs": {
+      "background-color": "rgb(47, 111, 223)",
+      "color": "rgb(255, 255, 255)",
+      "border-radius": "4px",
+      "font-weight": "500",
+      "height": "30px"
+    },
+    "method": {
+      "x": 314,
+      "y": 40,
+      "w": 91,
+      "h": 28
+    },
+    "methodCs": {
+      "color": "rgb(138, 146, 159)",
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "font-weight": "400"
+    },
+    "methodBadge": {
+      "color": "rgb(233, 176, 79)",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "font-weight": "600"
+    },
+    "url": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "color": "rgba(0, 0, 0, 0)",
+      "background-color": "rgba(0, 0, 0, 0)"
+    },
+    "reqbar": {
+      "height": "30px",
+      "background-color": "rgb(31, 34, 40)",
+      "border": "1px solid rgba(0, 0, 0, 0)",
+      "border-radius": "4px"
+    },
+    "status": {
+      "color": "rgb(92, 201, 138)",
+      "background-color": "rgba(92, 201, 138, 0.14)",
+      "font-size": "12.5px",
+      "height": "22px",
+      "border-radius": "4px",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace"
+    },
+    "statusBox": {
+      "x": 927,
+      "y": 43,
+      "w": 99,
+      "h": 22
+    },
+    "historyRow": {
+      "x": 0,
+      "y": 180,
+      "w": 300,
+      "h": 40
+    },
+    "historyRowCs": {
+      "padding-left": "12px",
+      "padding-right": "8px",
+      "font-size": "12.5px"
+    },
+    "historySel": null,
+    "bodyFont": {
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "background-color": "rgb(21, 23, 27)",
+      "color": "rgb(228, 231, 236)"
+    },
+    "cmContent": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "line-height": "19px"
+    },
+    "cmGutter": {
+      "background-color": "rgb(21, 23, 27)",
+      "color": "rgb(138, 146, 159)",
+      "border-right": "0px none rgb(138, 146, 159)",
+      "width": "41.5312px"
+    },
+    "selectedTab": {
+      "color": "rgb(228, 231, 236)",
+      "font-weight": "500",
+      "font-size": "12.5px"
+    },
+    "themeAttr": null
+  },
+  "contrast-main-dark": {
+    "[data-testid=history-row] .meta": {
+      "ratio": 5.43,
+      "color": "rgb(138, 146, 159)",
+      "opacity": 1,
+      "text": "now 201 143 ms"
+    },
+    "[data-testid=history-row][aria-selected=true] .meta": "missing",
+    "[data-testid=response-info]": {
+      "ratio": 5.72,
+      "color": "rgb(138, 146, 159)",
+      "opacity": 1,
+      "text": "Sent just now · Staging"
+    },
+    "[data-testid=breadcrumb]": {
+      "ratio": 5.72,
+      "color": "rgb(138, 146, 159)",
+      "opacity": 1,
+      "text": "Users API Users Create user"
+    },
+    "[role=tab][aria-selected=false]": {
+      "ratio": 7.9,
+      "color": "rgb(170, 177, 189)",
+      "opacity": 1,
+      "text": "Collections"
+    },
+    "[data-testid=sidebar-filter]": {
+      "ratio": 12.86,
+      "color": "rgb(228, 231, 236)",
+      "opacity": 1,
+      "text": ""
+    },
+    ".cm-gutterElement": {
+      "ratio": 5.72,
+      "color": "rgb(138, 146, 159)",
+      "opacity": 0.8,
+      "text": "9"
+    },
+    "[data-testid=send-button]": {
+      "ratio": 4.71,
+      "color": "rgb(255, 255, 255)",
+      "opacity": 1,
+      "text": "Send"
+    },
+    "[data-testid=response-status]": {
+      "ratio": 6.72,
+      "color": "rgb(92, 201, 138)",
+      "opacity": 1,
+      "text": "201 Created"
+    },
+    "[data-testid=env-selector]": {
+      "ratio": 7.9,
+      "color": "rgb(170, 177, 189)",
+      "opacity": 1,
+      "text": "Env Staging"
+    },
+    ".group": {
+      "ratio": 5.43,
+      "color": "rgb(138, 146, 159)",
+      "opacity": 1,
+      "text": "Today"
+    },
+    ".sublabel": {
+      "ratio": 5.72,
+      "color": "rgb(138, 146, 159)",
+      "opacity": 1,
+      "text": "JSON Content Format"
+    },
+    "[data-testid=history-status]": {
+      "ratio": 6.32,
+      "color": "rgb(92, 201, 138)",
+      "opacity": 1,
+      "text": "201"
+    }
+  },
+  "main-1024-dark": {
+    "rows": [
+      [
+        {
+          "cls": "row1 svelte-129hoe0",
+          "x": 0,
+          "y": 0,
+          "w": 300,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-129hoe0",
+          "x": 0,
+          "y": 32,
+          "w": 300,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-129hoe0",
+          "x": 0,
+          "y": 76,
+          "w": 300,
+          "h": 34
+        },
+        {
+          "cls": "filter-row svelte-129hoe0",
+          "x": 0,
+          "y": 110,
+          "w": 300,
+          "h": 40
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-zccm3j",
+          "x": 301,
+          "y": 0,
+          "w": 723,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-zccm3j",
+          "x": 301,
+          "y": 32,
+          "w": 723,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-zccm3j",
+          "x": 301,
+          "y": 76,
+          "w": 723,
+          "h": 34
+        },
+        {
+          "cls": "panel svelte-zccm3j",
+          "x": 301,
+          "y": 110,
+          "w": 723,
+          "h": 240
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-157dpj3",
+          "x": 301,
+          "y": 351,
+          "w": 723,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-157dpj3",
+          "x": 301,
+          "y": 383,
+          "w": 723,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-157dpj3",
+          "x": 301,
+          "y": 427,
+          "w": 723,
+          "h": 34
+        },
+        {
+          "cls": "content svelte-157dpj3",
+          "x": 301,
+          "y": 461,
+          "w": 723,
+          "h": 239
+        }
+      ]
+    ],
+    "tabs": [
+      {
+        "label": "Sidebar",
+        "x": 0,
+        "y": 76,
+        "w": 300,
+        "h": 34
+      },
+      {
+        "label": "Request",
+        "x": 301,
+        "y": 76,
+        "w": 723,
+        "h": 34
+      },
+      {
+        "label": "Response",
+        "x": 301,
+        "y": 427,
+        "w": 723,
+        "h": 34
+      }
+    ],
+    "send": {
+      "x": 936,
+      "y": 39,
+      "w": 76,
+      "h": 30
+    },
+    "sendCs": {
+      "background-color": "rgb(47, 111, 223)",
+      "color": "rgb(255, 255, 255)",
+      "border-radius": "4px",
+      "font-weight": "500",
+      "height": "30px"
+    },
+    "method": {
+      "x": 314,
+      "y": 40,
+      "w": 91,
+      "h": 28
+    },
+    "methodCs": {
+      "color": "rgb(138, 146, 159)",
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "font-weight": "400"
+    },
+    "methodBadge": {
+      "color": "rgb(233, 176, 79)",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "font-weight": "600"
+    },
+    "url": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "color": "rgba(0, 0, 0, 0)",
+      "background-color": "rgba(0, 0, 0, 0)"
+    },
+    "reqbar": {
+      "height": "30px",
+      "background-color": "rgb(31, 34, 40)",
+      "border": "1px solid rgba(0, 0, 0, 0)",
+      "border-radius": "4px"
+    },
+    "status": {
+      "color": "rgb(92, 201, 138)",
+      "background-color": "rgba(92, 201, 138, 0.14)",
+      "font-size": "12.5px",
+      "height": "22px",
+      "border-radius": "4px",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace"
+    },
+    "statusBox": {
+      "x": 357,
+      "y": 394,
+      "w": 99,
+      "h": 22
+    },
+    "historyRow": {
+      "x": 0,
+      "y": 180,
+      "w": 300,
+      "h": 40
+    },
+    "historyRowCs": {
+      "padding-left": "12px",
+      "padding-right": "8px",
+      "font-size": "12.5px"
+    },
+    "historySel": null,
+    "bodyFont": {
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "background-color": "rgb(21, 23, 27)",
+      "color": "rgb(228, 231, 236)"
+    },
+    "cmContent": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "line-height": "19px"
+    },
+    "cmGutter": {
+      "background-color": "rgb(21, 23, 27)",
+      "color": "rgb(138, 146, 159)",
+      "border-right": "0px none rgb(138, 146, 159)",
+      "width": "41.5312px"
+    },
+    "selectedTab": {
+      "color": "rgb(228, 231, 236)",
+      "font-weight": "500",
+      "font-size": "12.5px"
+    },
+    "themeAttr": null
+  },
+  "main-800-dark": {
+    "rows": [
+      [
+        {
+          "cls": "row1 svelte-129hoe0",
+          "x": 0,
+          "y": 0,
+          "w": 300,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-129hoe0",
+          "x": 0,
+          "y": 32,
+          "w": 300,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-129hoe0",
+          "x": 0,
+          "y": 76,
+          "w": 300,
+          "h": 34
+        },
+        {
+          "cls": "filter-row svelte-129hoe0",
+          "x": 0,
+          "y": 110,
+          "w": 300,
+          "h": 40
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-zccm3j",
+          "x": 301,
+          "y": 0,
+          "w": 659,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-zccm3j",
+          "x": 301,
+          "y": 32,
+          "w": 659,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-zccm3j",
+          "x": 301,
+          "y": 76,
+          "w": 659,
+          "h": 34
+        },
+        {
+          "cls": "panel svelte-zccm3j",
+          "x": 301,
+          "y": 110,
+          "w": 659,
+          "h": 190
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-157dpj3",
+          "x": 301,
+          "y": 301,
+          "w": 659,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-157dpj3",
+          "x": 301,
+          "y": 333,
+          "w": 659,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-157dpj3",
+          "x": 301,
+          "y": 377,
+          "w": 659,
+          "h": 34
+        },
+        {
+          "cls": "content svelte-157dpj3",
+          "x": 301,
+          "y": 411,
+          "w": 659,
+          "h": 189
+        }
+      ]
+    ],
+    "tabs": [
+      {
+        "label": "Sidebar",
+        "x": 0,
+        "y": 76,
+        "w": 300,
+        "h": 34
+      },
+      {
+        "label": "Request",
+        "x": 301,
+        "y": 76,
+        "w": 659,
+        "h": 34
+      },
+      {
+        "label": "Response",
+        "x": 301,
+        "y": 377,
+        "w": 659,
+        "h": 34
+      }
+    ],
+    "send": {
+      "x": 872,
+      "y": 39,
+      "w": 76,
+      "h": 30
+    },
+    "sendCs": {
+      "background-color": "rgb(47, 111, 223)",
+      "color": "rgb(255, 255, 255)",
+      "border-radius": "4px",
+      "font-weight": "500",
+      "height": "30px"
+    },
+    "method": {
+      "x": 314,
+      "y": 40,
+      "w": 91,
+      "h": 28
+    },
+    "methodCs": {
+      "color": "rgb(138, 146, 159)",
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "font-weight": "400"
+    },
+    "methodBadge": {
+      "color": "rgb(233, 176, 79)",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "font-weight": "600"
+    },
+    "url": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "color": "rgba(0, 0, 0, 0)",
+      "background-color": "rgba(0, 0, 0, 0)"
+    },
+    "reqbar": {
+      "height": "30px",
+      "background-color": "rgb(31, 34, 40)",
+      "border": "1px solid rgba(0, 0, 0, 0)",
+      "border-radius": "4px"
+    },
+    "status": {
+      "color": "rgb(92, 201, 138)",
+      "background-color": "rgba(92, 201, 138, 0.14)",
+      "font-size": "12.5px",
+      "height": "22px",
+      "border-radius": "4px",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace"
+    },
+    "statusBox": {
+      "x": 357,
+      "y": 344,
+      "w": 99,
+      "h": 22
+    },
+    "historyRow": {
+      "x": 0,
+      "y": 180,
+      "w": 300,
+      "h": 40
+    },
+    "historyRowCs": {
+      "padding-left": "12px",
+      "padding-right": "8px",
+      "font-size": "12.5px"
+    },
+    "historySel": null,
+    "bodyFont": {
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "background-color": "rgb(21, 23, 27)",
+      "color": "rgb(228, 231, 236)"
+    },
+    "cmContent": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "line-height": "19px"
+    },
+    "cmGutter": {
+      "background-color": "rgb(21, 23, 27)",
+      "color": "rgb(138, 146, 159)",
+      "border-right": "0px none rgb(138, 146, 159)",
+      "width": "41.5312px"
+    },
+    "selectedTab": {
+      "color": "rgb(228, 231, 236)",
+      "font-weight": "500",
+      "font-size": "12.5px"
+    },
+    "themeAttr": null
+  },
+  "main-1440-light": {
+    "rows": [
+      [
+        {
+          "cls": "row1 svelte-129hoe0",
+          "x": 0,
+          "y": 0,
+          "w": 300,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-129hoe0",
+          "x": 0,
+          "y": 32,
+          "w": 300,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-129hoe0",
+          "x": 0,
+          "y": 76,
+          "w": 300,
+          "h": 34
+        },
+        {
+          "cls": "filter-row svelte-129hoe0",
+          "x": 0,
+          "y": 110,
+          "w": 300,
+          "h": 40
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-zccm3j",
+          "x": 301,
+          "y": 0,
+          "w": 569,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-zccm3j",
+          "x": 301,
+          "y": 32,
+          "w": 569,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-zccm3j",
+          "x": 301,
+          "y": 76,
+          "w": 569,
+          "h": 34
+        },
+        {
+          "cls": "panel svelte-zccm3j",
+          "x": 301,
+          "y": 110,
+          "w": 569,
+          "h": 790
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-157dpj3",
+          "x": 871,
+          "y": 0,
+          "w": 569,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-157dpj3",
+          "x": 871,
+          "y": 32,
+          "w": 569,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-157dpj3",
+          "x": 871,
+          "y": 76,
+          "w": 569,
+          "h": 34
+        },
+        {
+          "cls": "content svelte-157dpj3",
+          "x": 871,
+          "y": 110,
+          "w": 569,
+          "h": 790
+        }
+      ]
+    ],
+    "tabs": [
+      {
+        "label": "Sidebar",
+        "x": 0,
+        "y": 76,
+        "w": 300,
+        "h": 34
+      },
+      {
+        "label": "Request",
+        "x": 301,
+        "y": 76,
+        "w": 569,
+        "h": 34
+      },
+      {
+        "label": "Response",
+        "x": 871,
+        "y": 76,
+        "w": 569,
+        "h": 34
+      }
+    ],
+    "send": {
+      "x": 782,
+      "y": 39,
+      "w": 76,
+      "h": 30
+    },
+    "sendCs": {
+      "background-color": "rgb(37, 99, 235)",
+      "color": "rgb(255, 255, 255)",
+      "border-radius": "4px",
+      "font-weight": "500",
+      "height": "30px"
+    },
+    "method": {
+      "x": 314,
+      "y": 40,
+      "w": 91,
+      "h": 28
+    },
+    "methodCs": {
+      "color": "rgb(98, 106, 120)",
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "font-weight": "400"
+    },
+    "methodBadge": {
+      "color": "rgb(154, 88, 0)",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "font-weight": "600"
+    },
+    "url": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "color": "rgba(0, 0, 0, 0)",
+      "background-color": "rgba(0, 0, 0, 0)"
+    },
+    "reqbar": {
+      "height": "30px",
+      "background-color": "rgb(241, 243, 246)",
+      "border": "1px solid rgba(0, 0, 0, 0)",
+      "border-radius": "4px"
+    },
+    "status": {
+      "color": "rgb(22, 114, 70)",
+      "background-color": "rgba(24, 121, 74, 0.1)",
+      "font-size": "12.5px",
+      "height": "22px",
+      "border-radius": "4px",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace"
+    },
+    "statusBox": {
+      "x": 927,
+      "y": 43,
+      "w": 99,
+      "h": 22
+    },
+    "historyRow": {
+      "x": 0,
+      "y": 180,
+      "w": 300,
+      "h": 40
+    },
+    "historyRowCs": {
+      "padding-left": "12px",
+      "padding-right": "8px",
+      "font-size": "12.5px"
+    },
+    "historySel": null,
+    "bodyFont": {
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "background-color": "rgb(255, 255, 255)",
+      "color": "rgb(26, 29, 35)"
+    },
+    "cmContent": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "line-height": "19px"
+    },
+    "cmGutter": {
+      "background-color": "rgb(255, 255, 255)",
+      "color": "rgb(98, 106, 120)",
+      "border-right": "0px none rgb(98, 106, 120)",
+      "width": "41.5312px"
+    },
+    "selectedTab": {
+      "color": "rgb(26, 29, 35)",
+      "font-weight": "500",
+      "font-size": "12.5px"
+    },
+    "themeAttr": null
+  },
+  "contrast-main-light": {
+    "[data-testid=history-row] .meta": {
+      "ratio": 5.09,
+      "color": "rgb(98, 106, 120)",
+      "opacity": 1,
+      "text": "now 201 143 ms"
+    },
+    "[data-testid=history-row][aria-selected=true] .meta": "missing",
+    "[data-testid=response-info]": {
+      "ratio": 5.45,
+      "color": "rgb(98, 106, 120)",
+      "opacity": 1,
+      "text": "Sent just now · Staging"
+    },
+    "[data-testid=breadcrumb]": {
+      "ratio": 5.45,
+      "color": "rgb(98, 106, 120)",
+      "opacity": 1,
+      "text": "Users API Users Create user"
+    },
+    "[role=tab][aria-selected=false]": {
+      "ratio": 7.35,
+      "color": "rgb(74, 82, 96)",
+      "opacity": 1,
+      "text": "Collections"
+    },
+    "[data-testid=sidebar-filter]": {
+      "ratio": 15.19,
+      "color": "rgb(26, 29, 35)",
+      "opacity": 1,
+      "text": ""
+    },
+    ".cm-gutterElement": {
+      "ratio": 5.45,
+      "color": "rgb(98, 106, 120)",
+      "opacity": 0.8,
+      "text": "9"
+    },
+    "[data-testid=send-button]": {
+      "ratio": 5.17,
+      "color": "rgb(255, 255, 255)",
+      "opacity": 1,
+      "text": "Send"
+    },
+    "[data-testid=response-status]": {
+      "ratio": 5.19,
+      "color": "rgb(22, 114, 70)",
+      "opacity": 1,
+      "text": "201 Created"
+    },
+    "[data-testid=env-selector]": {
+      "ratio": 7.35,
+      "color": "rgb(74, 82, 96)",
+      "opacity": 1,
+      "text": "Env Staging"
+    },
+    ".group": {
+      "ratio": 5.09,
+      "color": "rgb(98, 106, 120)",
+      "opacity": 1,
+      "text": "Today"
+    },
+    ".sublabel": {
+      "ratio": 5.45,
+      "color": "rgb(98, 106, 120)",
+      "opacity": 1,
+      "text": "JSON Content Format"
+    },
+    "[data-testid=history-status]": {
+      "ratio": 4.86,
+      "color": "rgb(22, 114, 70)",
+      "opacity": 1,
+      "text": "201"
+    }
+  },
+  "main-1024-light": {
+    "rows": [
+      [
+        {
+          "cls": "row1 svelte-129hoe0",
+          "x": 0,
+          "y": 0,
+          "w": 300,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-129hoe0",
+          "x": 0,
+          "y": 32,
+          "w": 300,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-129hoe0",
+          "x": 0,
+          "y": 76,
+          "w": 300,
+          "h": 34
+        },
+        {
+          "cls": "filter-row svelte-129hoe0",
+          "x": 0,
+          "y": 110,
+          "w": 300,
+          "h": 40
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-zccm3j",
+          "x": 301,
+          "y": 0,
+          "w": 723,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-zccm3j",
+          "x": 301,
+          "y": 32,
+          "w": 723,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-zccm3j",
+          "x": 301,
+          "y": 76,
+          "w": 723,
+          "h": 34
+        },
+        {
+          "cls": "panel svelte-zccm3j",
+          "x": 301,
+          "y": 110,
+          "w": 723,
+          "h": 240
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-157dpj3",
+          "x": 301,
+          "y": 351,
+          "w": 723,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-157dpj3",
+          "x": 301,
+          "y": 383,
+          "w": 723,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-157dpj3",
+          "x": 301,
+          "y": 427,
+          "w": 723,
+          "h": 34
+        },
+        {
+          "cls": "content svelte-157dpj3",
+          "x": 301,
+          "y": 461,
+          "w": 723,
+          "h": 239
+        }
+      ]
+    ],
+    "tabs": [
+      {
+        "label": "Sidebar",
+        "x": 0,
+        "y": 76,
+        "w": 300,
+        "h": 34
+      },
+      {
+        "label": "Request",
+        "x": 301,
+        "y": 76,
+        "w": 723,
+        "h": 34
+      },
+      {
+        "label": "Response",
+        "x": 301,
+        "y": 427,
+        "w": 723,
+        "h": 34
+      }
+    ],
+    "send": {
+      "x": 936,
+      "y": 39,
+      "w": 76,
+      "h": 30
+    },
+    "sendCs": {
+      "background-color": "rgb(37, 99, 235)",
+      "color": "rgb(255, 255, 255)",
+      "border-radius": "4px",
+      "font-weight": "500",
+      "height": "30px"
+    },
+    "method": {
+      "x": 314,
+      "y": 40,
+      "w": 91,
+      "h": 28
+    },
+    "methodCs": {
+      "color": "rgb(98, 106, 120)",
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "font-weight": "400"
+    },
+    "methodBadge": {
+      "color": "rgb(154, 88, 0)",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "font-weight": "600"
+    },
+    "url": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "color": "rgba(0, 0, 0, 0)",
+      "background-color": "rgba(0, 0, 0, 0)"
+    },
+    "reqbar": {
+      "height": "30px",
+      "background-color": "rgb(241, 243, 246)",
+      "border": "1px solid rgba(0, 0, 0, 0)",
+      "border-radius": "4px"
+    },
+    "status": {
+      "color": "rgb(22, 114, 70)",
+      "background-color": "rgba(24, 121, 74, 0.1)",
+      "font-size": "12.5px",
+      "height": "22px",
+      "border-radius": "4px",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace"
+    },
+    "statusBox": {
+      "x": 357,
+      "y": 394,
+      "w": 99,
+      "h": 22
+    },
+    "historyRow": {
+      "x": 0,
+      "y": 180,
+      "w": 300,
+      "h": 40
+    },
+    "historyRowCs": {
+      "padding-left": "12px",
+      "padding-right": "8px",
+      "font-size": "12.5px"
+    },
+    "historySel": null,
+    "bodyFont": {
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "background-color": "rgb(255, 255, 255)",
+      "color": "rgb(26, 29, 35)"
+    },
+    "cmContent": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "line-height": "19px"
+    },
+    "cmGutter": {
+      "background-color": "rgb(255, 255, 255)",
+      "color": "rgb(98, 106, 120)",
+      "border-right": "0px none rgb(98, 106, 120)",
+      "width": "41.5312px"
+    },
+    "selectedTab": {
+      "color": "rgb(26, 29, 35)",
+      "font-weight": "500",
+      "font-size": "12.5px"
+    },
+    "themeAttr": null
+  },
+  "main-800-light": {
+    "rows": [
+      [
+        {
+          "cls": "row1 svelte-129hoe0",
+          "x": 0,
+          "y": 0,
+          "w": 300,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-129hoe0",
+          "x": 0,
+          "y": 32,
+          "w": 300,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-129hoe0",
+          "x": 0,
+          "y": 76,
+          "w": 300,
+          "h": 34
+        },
+        {
+          "cls": "filter-row svelte-129hoe0",
+          "x": 0,
+          "y": 110,
+          "w": 300,
+          "h": 40
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-zccm3j",
+          "x": 301,
+          "y": 0,
+          "w": 659,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-zccm3j",
+          "x": 301,
+          "y": 32,
+          "w": 659,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-zccm3j",
+          "x": 301,
+          "y": 76,
+          "w": 659,
+          "h": 34
+        },
+        {
+          "cls": "panel svelte-zccm3j",
+          "x": 301,
+          "y": 110,
+          "w": 659,
+          "h": 190
+        }
+      ],
+      [
+        {
+          "cls": "row1 svelte-157dpj3",
+          "x": 301,
+          "y": 301,
+          "w": 659,
+          "h": 32
+        },
+        {
+          "cls": "row2 svelte-157dpj3",
+          "x": 301,
+          "y": 333,
+          "w": 659,
+          "h": 44
+        },
+        {
+          "cls": "tabs svelte-157dpj3",
+          "x": 301,
+          "y": 377,
+          "w": 659,
+          "h": 34
+        },
+        {
+          "cls": "content svelte-157dpj3",
+          "x": 301,
+          "y": 411,
+          "w": 659,
+          "h": 189
+        }
+      ]
+    ],
+    "tabs": [
+      {
+        "label": "Sidebar",
+        "x": 0,
+        "y": 76,
+        "w": 300,
+        "h": 34
+      },
+      {
+        "label": "Request",
+        "x": 301,
+        "y": 76,
+        "w": 659,
+        "h": 34
+      },
+      {
+        "label": "Response",
+        "x": 301,
+        "y": 377,
+        "w": 659,
+        "h": 34
+      }
+    ],
+    "send": {
+      "x": 872,
+      "y": 39,
+      "w": 76,
+      "h": 30
+    },
+    "sendCs": {
+      "background-color": "rgb(37, 99, 235)",
+      "color": "rgb(255, 255, 255)",
+      "border-radius": "4px",
+      "font-weight": "500",
+      "height": "30px"
+    },
+    "method": {
+      "x": 314,
+      "y": 40,
+      "w": 91,
+      "h": 28
+    },
+    "methodCs": {
+      "color": "rgb(98, 106, 120)",
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "font-weight": "400"
+    },
+    "methodBadge": {
+      "color": "rgb(154, 88, 0)",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "font-weight": "600"
+    },
+    "url": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "color": "rgba(0, 0, 0, 0)",
+      "background-color": "rgba(0, 0, 0, 0)"
+    },
+    "reqbar": {
+      "height": "30px",
+      "background-color": "rgb(241, 243, 246)",
+      "border": "1px solid rgba(0, 0, 0, 0)",
+      "border-radius": "4px"
+    },
+    "status": {
+      "color": "rgb(22, 114, 70)",
+      "background-color": "rgba(24, 121, 74, 0.1)",
+      "font-size": "12.5px",
+      "height": "22px",
+      "border-radius": "4px",
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace"
+    },
+    "statusBox": {
+      "x": 357,
+      "y": 344,
+      "w": 99,
+      "h": 22
+    },
+    "historyRow": {
+      "x": 0,
+      "y": 180,
+      "w": 300,
+      "h": 40
+    },
+    "historyRowCs": {
+      "padding-left": "12px",
+      "padding-right": "8px",
+      "font-size": "12.5px"
+    },
+    "historySel": null,
+    "bodyFont": {
+      "font-family": "-apple-system, BlinkMacSystemFont, \"Segoe UI Variable Text\", \"Segoe UI\", system-ui, Ubuntu, Cantarell, \"Noto Sans\", \"Helvetica Neue\", Arial, sans-serif",
+      "font-size": "12.5px",
+      "background-color": "rgb(255, 255, 255)",
+      "color": "rgb(26, 29, 35)"
+    },
+    "cmContent": {
+      "font-family": "ui-monospace, \"SF Mono\", SFMono-Regular, Menlo, \"Cascadia Mono\", Consolas, \"Liberation Mono\", \"DejaVu Sans Mono\", monospace",
+      "font-size": "12.5px",
+      "line-height": "19px"
+    },
+    "cmGutter": {
+      "background-color": "rgb(255, 255, 255)",
+      "color": "rgb(98, 106, 120)",
+      "border-right": "0px none rgb(98, 106, 120)",
+      "width": "41.5312px"
+    },
+    "selectedTab": {
+      "color": "rgb(26, 29, 35)",
+      "font-weight": "500",
+      "font-size": "12.5px"
+    },
+    "themeAttr": null
+  },
+  "mockup-dark": [
+    [
+      {
+        "cls": "row1",
+        "y": 66,
+        "h": 32
+      },
+      {
+        "cls": "row2",
+        "y": 98,
+        "h": 44
+      },
+      {
+        "cls": "tabs",
+        "y": 142,
+        "h": 34
+      },
+      {
+        "cls": "filter-row",
+        "y": 176,
+        "h": 40
+      }
+    ],
+    [
+      {
+        "cls": "row1",
+        "y": 66,
+        "h": 32
+      },
+      {
+        "cls": "row2",
+        "y": 98,
+        "h": 44
+      },
+      {
+        "cls": "tabs",
+        "y": 142,
+        "h": 34
+      },
+      {
+        "cls": "body-tools",
+        "y": 176,
+        "h": 34
+      }
+    ],
+    [
+      {
+        "cls": "row1",
+        "y": 66,
+        "h": 32
+      },
+      {
+        "cls": "row2",
+        "y": 98,
+        "h": 44
+      },
+      {
+        "cls": "tabs",
+        "y": 142,
+        "h": 34
+      },
+      {
+        "cls": "code",
+        "y": 176,
+        "h": 610
+      }
+    ]
+  ],
+  "mockup-light": [
+    [
+      {
+        "cls": "row1",
+        "y": 66,
+        "h": 32
+      },
+      {
+        "cls": "row2",
+        "y": 98,
+        "h": 44
+      },
+      {
+        "cls": "tabs",
+        "y": 142,
+        "h": 34
+      },
+      {
+        "cls": "filter-row",
+        "y": 176,
+        "h": 40
+      }
+    ],
+    [
+      {
+        "cls": "row1",
+        "y": 66,
+        "h": 32
+      },
+      {
+        "cls": "row2",
+        "y": 98,
+        "h": 44
+      },
+      {
+        "cls": "tabs",
+        "y": 142,
+        "h": 34
+      },
+      {
+        "cls": "body-tools",
+        "y": 176,
+        "h": 34
+      }
+    ],
+    [
+      {
+        "cls": "row1",
+        "y": 66,
+        "h": 32
+      },
+      {
+        "cls": "row2",
+        "y": 98,
+        "h": 44
+      },
+      {
+        "cls": "tabs",
+        "y": 142,
+        "h": 34
+      },
+      {
+        "cls": "code",
+        "y": 176,
+        "h": 610
+      }
+    ]
+  ]
+}

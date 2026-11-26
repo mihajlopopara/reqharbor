@@ -1,0 +1,27 @@
+{
+  "name": "reqharbor-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ReqHarbor sync + share Cloudflare Worker",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "wrangler d1 migrations apply DB --local && wrangler dev --ip 0.0.0.0 --port 8787",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "cf-typegen": "wrangler types",
+    "parity:gen": "cargo run --quiet --manifest-path tools/curl-parity-gen/Cargo.toml --target-dir /tmp/curl-parity-target -- test/fixtures/curl_parity.json"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.9.2",
+    "typescript": "7.0.2",
+    "vitest": "5.1.2",
+    "wrangler": "4.168.0"
+  }
+}
