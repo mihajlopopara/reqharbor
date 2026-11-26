@@ -18,14 +18,14 @@ async function inViewport(page: Page, testid: string) {
 const AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"];
 async function axe(page: Page, name: string) {
   const r = await new AxeBuilder({ page }).withTags(AXE_TAGS).analyze();
-  const v = r.violations.map((x) => ({ id: x.id, impact: x.impact, nodes: x.nodes.length, sample: x.nodes.slice(0, 3).map((n) => n.target.join(" ")), help: x.help }));
+  const v = r.violations.map((x) => ({ id: x.id, impact: x.impact, nodes: x.nodes.length, sample: x.nodes.slice(0, 3).map((n) => n.target.join(" ")), all: x.nodes.map((n) => n.target.join(" ") + " :: " + (n.any[0]?.message ?? "").slice(0, 90)), help: x.help }));
   mkdirSync(OUT, { recursive: true });
   writeFileSync(`${OUT}/axe-${name}.json`, JSON.stringify(v, null, 2));
   return v;
 }
 
 for (const scheme of ["dark", "light"] as const) {
-  test(`axe: main screen + dialogs have no serious/critical WCAG A/AA violations (${scheme})`, async ({ page }) => {
+  test(`BUG QA-R3-002: axe — main screen + dialogs have no serious/critical WCAG A/AA violations (${scheme})`, async ({ page }) => {
     await page.emulateMedia({ colorScheme: scheme });
     await openApp(page);
     const all: Record<string, unknown[]> = {};

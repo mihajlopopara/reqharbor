@@ -97,7 +97,7 @@
   }
   @keyframes fade {
     from {
-      opacity: 0;
+      background: transparent;
     }
   }
   .dialog {

@@ -214,7 +214,8 @@
     <div class="blocked" role="alert" data-testid="send-blocked"><Icon name="alert" small />{app.sendBlocked}</div>
   {/if}
 
-  <div class="tabs" role="tablist" aria-label="Request">
+  <div class="tabs">
+    <div class="tablist" role="tablist" aria-label="Request">
     {#each TABS as t (t)}
       <button
         class="tab"
@@ -234,6 +235,7 @@
         {:else}Pre Run{/if}
       </button>
     {/each}
+    </div>
     <span class="end">
       <button
         class="icon-btn"

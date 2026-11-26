@@ -361,7 +361,7 @@ function detectBody(text: string, ct: string): Body {
 const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
 /** AC-CEXP-2..4 (variables already resolved by the caller unless keepVariables). */
-export function exportCurl(r: Request, keepVariables: boolean, inheritedAuth: Auth | null): string {
+export function exportCurl(r: Request, _keepVariables: boolean, inheritedAuth: Auth | null): string {
   const parts: string[] = ["curl"];
   const headers = r.headers.filter((h) => h.enabled && h.key);
   let url = r.url;
@@ -421,8 +421,8 @@ export function exportCurl(r: Request, keepVariables: boolean, inheritedAuth: Au
   const hasBody = bodyFlags.length > 0;
   if (r.method === "HEAD" && !hasBody) parts.push("--head");
   else if (!((r.method === "GET" && !hasBody) || (r.method === "POST" && hasBody))) parts.push(`-X ${r.method}`);
-  if (keepVariables) parts.push("--globoff");
   parts.push(sq(url));
+  if (/[{}[\]]/.test(url)) parts.push("--globoff");
   for (const h of headers) parts.push(`-H ${sq(`${h.key}: ${h.value}`)}`);
   parts.push(...extraHeaders);
   if (!hasCT && impliedCT[b.type]) parts.push(`-H ${sq(`Content-Type: ${impliedCT[b.type]}`)}`);

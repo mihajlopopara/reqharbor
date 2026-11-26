@@ -167,7 +167,7 @@
 
   function pointerdown(e: PointerEvent, row: TreeRow) {
     if (e.button !== 0 || ui.renaming || filter) return;
-    if ((e.target as HTMLElement).closest("button, input")) return;
+    if ((e.target as HTMLElement).closest("button, input, .chev, .more")) return;
     pending = { row, x: e.clientX, y: e.clientY, id: e.pointerId };
     window.addEventListener("pointermove", pointermove);
     window.addEventListener("pointerup", pointerup, { once: true });
@@ -340,15 +340,14 @@
         onkeydown={() => {}}
       >
         {#if r.kind !== "request"}
-          <button
+          <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+          <span
             class="chev"
-            type="button"
-            tabindex="-1"
-            aria-label={r.expanded ? "Collapse" : "Expand"}
+            aria-hidden="true"
             onclick={(e) => {
               e.stopPropagation();
               ui.toggleExpanded(r.id);
-            }}><Icon name={r.expanded ? "chev-d" : "chev-r"} small /></button
+            }}><Icon name={r.expanded ? "chev-d" : "chev-r"} small /></span
           >
           <span class="faint ic"><Icon name={r.kind === "collection" ? "stack" : "folder"} small /></span>
         {:else}
@@ -386,17 +385,16 @@
         {/if}
         {#if r.kind === "request" && app.isDirty(r.id)}<span class="unsaved" title="Unsaved changes" data-testid="tree-dirty"></span>{/if}
         {#if r.kind === "collection"}<span class="cnt">{r.count}</span>{/if}
-        <button
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+        <span
           class="icon-btn more"
-          type="button"
-          tabindex="-1"
-          aria-label="{r.name} actions"
+          aria-hidden="true"
           data-testid="tree-node-menu"
           onclick={(e) => {
             e.stopPropagation();
             focusIdx = i;
             openMenu(r, e.currentTarget);
-          }}><Icon name="more" small /></button
+          }}><Icon name="more" small /></span
         >
       </div>
     {/snippet}
@@ -463,6 +461,7 @@
     width: 16px;
     height: 16px;
     display: inline-grid;
+    cursor: pointer;
     place-items: center;
     padding: 0;
     border: 0;

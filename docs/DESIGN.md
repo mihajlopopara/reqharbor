@@ -81,7 +81,7 @@ Weights: 400 body, 500 active tab/buttons/names, 600 titles/badges. Use `font-va
 Spacing (4px base): 2, 4, 6, 8, 12, 16, 20, 24, 32 (`--sp-1…9`). Radii: 3 (checkbox, chip, key-cap), 4 (buttons, inputs), 6 (menus, popovers, toasts), 10 (dialogs), pill (filter inputs). Control heights: 24 small / 28 default / 30 request bar. Rows: tree 26, KV 28, history 40 (two lines). Elevation only on floating layers: `--shadow-popover`, `--shadow-dialog`. Icons: inline SVG, 16px (14px in dense rows), 1.5 stroke, `currentColor`; bundle a small set (Lucide-style), no icon font.
 
 ### 3.6 Motion
-`--dur-fast` 80ms for color/background/opacity; `--dur-base` 120ms for menus, popovers, toasts, dialogs (opacity + 4px translate, ease-out). Nothing else animates: no tab sliding, no tree expand animation, no list reordering animation. `prefers-reduced-motion: reduce` sets both to 0 and replaces the loading bar with static text.
+`--dur-fast` 80ms for color/background/opacity; `--dur-base` 120ms for menus, popovers, toasts, dialogs (4px translate only, ease-out; only the dialog backdrop fades — popover/dialog text is never semi-transparent, so contrast holds at every frame — QA-R3-002). Nothing else animates: no tab sliding, no tree expand animation, no list reordering animation. `prefers-reduced-motion: reduce` sets both to 0 and replaces the loading bar with static text.
 
 ## 4. Interaction states (all components)
 | State | Treatment |

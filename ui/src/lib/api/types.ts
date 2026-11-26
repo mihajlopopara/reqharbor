@@ -212,7 +212,7 @@ export interface Settings {
   theme: Theme;
   windowWidth: number | null;
   windowHeight: number | null;
-  /** default 300 */
+  /** default 300. Fractional values are accepted and rounded; persisted as an integer. */
   sidebarWidth: number;
   sidebarCollapsed: boolean;
   /** Request/Response split, 0..1, default 0.5 */

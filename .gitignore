@@ -12,7 +12,7 @@ ui/playwright-report/
 
 # QA generated artifacts (regenerate with the scripts in qa/ and ui/e2e/design_review/)
 qa/r2/out/
-docs/qa/design/screens/
+docs/qa/design/screens*/
 
 # Local tooling
 .claude/settings.local.json

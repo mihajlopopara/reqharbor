@@ -170,7 +170,8 @@ svg.i.sm {
   flex: none;
   padding: 0;
 }
-.icon-btn:hover:not([disabled]) {
+.icon-btn:hover:not([disabled]),
+span.icon-btn:hover {
   background: var(--bg-hover);
   color: var(--text-1);
 }
@@ -220,6 +221,12 @@ svg.i.sm {
   padding: 0 var(--sp-5);
   border-bottom: 1px solid var(--border-subtle);
   flex: none;
+}
+.tabs > .tablist {
+  display: flex;
+  align-items: stretch;
+  gap: var(--sp-5);
+  min-width: 0;
 }
 .tab {
   position: relative;
@@ -698,11 +705,9 @@ mark {
 /* Popover/dialog motion */
 @keyframes pop-in {
   from {
-    opacity: 0;
     transform: translateY(4px);
   }
   to {
-    opacity: 1;
     transform: none;
   }
 }

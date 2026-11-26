@@ -646,11 +646,10 @@ export class MockServer {
     },
     get_settings: () => clone(this.settings),
     save_settings: ({ settings }) => {
+      // Real backend accepts fractional u32 fields and rounds them (QA-R3-003).
       for (const k of ["sidebarWidth", "windowWidth", "windowHeight"] as const) {
         const v = settings[k];
-        if (v !== null && v !== undefined && (!Number.isInteger(v) || (v as number) < 0)) {
-          fail("invalid", `invalid args 'settings' for command 'save_settings': invalid type: floating point '${v}', expected u32`);
-        }
+        if (typeof v === "number") (settings as Record<string, unknown>)[k] = Math.max(0, Math.round(v));
       }
       this.settings = { ...defaultSettings(), ...this.settings, ...clone(settings) };
       return clone(this.settings);

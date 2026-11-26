@@ -212,7 +212,8 @@
       </div>
     </div>
   {:else}
-    <div class="tabs" role="tablist" aria-label="Response">
+    <div class="tabs">
+      <div class="tablist" role="tablist" aria-label="Response">
       <button class="tab" role="tab" type="button" aria-selected={tab === "body"} tabindex={tab === "body" ? 0 : -1} onclick={() => (tab = "body")} onkeydown={tabKey} data-testid="res-tab-body">Response</button>
       <button class="tab" role="tab" type="button" aria-selected={tab === "headers"} tabindex={tab === "headers" ? 0 : -1} onclick={() => (tab = "headers")} onkeydown={tabKey} data-testid="res-tab-headers"
         >Headers{#if headerCount}<sup>{headerCount}</sup>{/if}</button
@@ -220,6 +221,7 @@
       <button class="tab" role="tab" type="button" aria-selected={tab === "cookies"} tabindex={tab === "cookies" ? 0 : -1} onclick={() => (tab = "cookies")} onkeydown={tabKey} data-testid="res-tab-cookies"
         >Cookies{#if cookieCount}<sup>{cookieCount}</sup>{/if}</button
       >
+      </div>
       {#if tab === "body" && meta}
         <span class="end">
           {#if canPretty}

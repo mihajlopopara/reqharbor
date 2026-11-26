@@ -57,7 +57,7 @@ const theme = EditorView.theme({
   ".cm-content": { caretColor: "var(--text-1)", padding: "4px 0 16px" },
   ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--text-1)", borderLeftWidth: "1.5px" },
   ".cm-gutters": { backgroundColor: "var(--bg-pane)", color: "var(--text-3)", border: "none" },
-  ".cm-lineNumbers .cm-gutterElement": { minWidth: "32px", padding: "0 8px 0 4px", opacity: ".8" },
+  ".cm-lineNumbers .cm-gutterElement": { minWidth: "32px", padding: "0 8px 0 4px" }, // --text-3 at full opacity: ≥ 4.5:1
   ".cm-activeLineGutter": { backgroundColor: "transparent", color: "var(--text-2)" },
   ".cm-activeLine": { backgroundColor: "var(--bg-code-active-line)" },
   "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, ::selection": {
@@ -247,6 +247,11 @@ export async function createEditor(parent: HTMLElement, opts: EditorOptions): Pr
   ];
   if (opts.placeholder) extensions.push(placeholderExt(opts.placeholder));
   const view = new EditorView({ parent, state: EditorState.create({ doc: opts.value, extensions }) });
+  if (opts.readOnly) {
+    view.scrollDOM.tabIndex = 0;
+    view.scrollDOM.setAttribute("role", "region");
+    view.scrollDOM.setAttribute("aria-label", opts.ariaLabel ?? "Editor");
+  }
 
   return {
     view,

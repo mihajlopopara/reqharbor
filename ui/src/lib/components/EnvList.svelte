@@ -92,15 +92,14 @@
       {/if}
       <span class="cnt">{env.variables.length}</span>
       {#if active}<span class="check" title="Active environment"><Icon name="check" small /></span>{/if}
-      <button
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+      <span
         class="icon-btn more"
-        type="button"
-        tabindex="-1"
-        aria-label="{env.name} actions"
+        aria-hidden="true"
         onclick={(e) => {
           e.stopPropagation();
           menu(env, e.currentTarget);
-        }}><Icon name="more" small /></button
+        }}><Icon name="more" small /></span
       >
     </div>
   {/each}

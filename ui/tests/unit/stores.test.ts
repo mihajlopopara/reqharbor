@@ -163,8 +163,13 @@ describe("app store", () => {
   });
 
   it("rounds pane sizes before saving and toasts (once) when a save fails (QA-R2-001)", async () => {
+    let sent: unknown = null;
+    const orig0 = server.handlers.save_settings;
+    server.handlers.save_settings = (a) => ((sent = a.settings.sidebarWidth), orig0(a));
     app.updateSettings({ sidebarWidth: 312.5 }, true);
     await until(() => server.settings.sidebarWidth === 313);
+    expect(sent).toBe(313);
+    server.handlers.save_settings = orig0;
     const orig = server.handlers.save_settings;
     server.handlers.save_settings = () => {
       throw new Error("disk full");

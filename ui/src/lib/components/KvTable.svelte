@@ -139,7 +139,9 @@
 
 <div class="kvt" data-testid="{testid}-table">
   <div class="toolbar">
-    <span class="faint count">{enabledCount} {enabledCount === 1 ? noun[0] : noun[1]}</span>
+    <span class="faint count" data-testid="{testid}-count"
+      >{rows.length} {rows.length === 1 ? noun[0] : noun[1]}{#if enabledCount !== rows.length} · {enabledCount} enabled{/if}</span
+    >
     <span class="grow"></span>
     {#if kind !== "env"}
       <button class="link" type="button" aria-pressed={showDesc} onclick={() => (showDesc = !showDesc)}>Description</button>

@@ -285,7 +285,7 @@ describe("cURL import/export (mock parity with AC-CURL)", () => {
     expect(await call("export_curl", { request: r, projectId: pid, keepVariables: false })).toContain("Bearer stg_9f8e7d6c5b4a");
     const raw = await call("export_curl", { request: r, projectId: pid, keepVariables: true });
     expect(raw).toContain("{{baseUrl}}/v1");
-    expect(raw).toContain("--globoff");
+    expect(raw).toContain("'{{baseUrl}}/v1' \\\n  --globoff");
   });
 });
 
@@ -454,9 +454,9 @@ describe("QA fixtures and round-2 parity", () => {
     expect(b.spec.label).toBe("Swagger 2.0 · JSON");
   });
 
-  it("save_settings rejects fractional u32 fields like the real backend (QA-R2-001)", async () => {
+  it("save_settings accepts fractional u32 fields and rounds them like the real backend (QA-R3-003)", async () => {
     const s = await call("get_settings", {});
-    expect((await rejects(call("save_settings", { settings: { ...s, sidebarWidth: 320.5 } }))).code).toBe("invalid");
+    expect((await call("save_settings", { settings: { ...s, sidebarWidth: 320.6 } })).sidebarWidth).toBe(321);
     expect((await call("save_settings", { settings: { ...s, sidebarWidth: 321, splitRatio: 0.437 } })).splitRatio).toBe(0.437);
   });
 

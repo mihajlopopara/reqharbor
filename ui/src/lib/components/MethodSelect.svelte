@@ -147,7 +147,7 @@
       data-testid="method-list"
     >
       {#each OPTIONS as o, i (o)}
-        {#if o === "CUSTOM"}<div class="sep" role="separator"></div>{/if}
+        {#if o === "CUSTOM"}<div class="sep" aria-hidden="true"></div>{/if}
         <div
           id="method-opt-{i}"
           class="mi"

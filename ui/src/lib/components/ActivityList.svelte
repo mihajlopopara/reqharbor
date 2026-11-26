@@ -136,15 +136,14 @@
             {/if}
             {#if h.timeMs !== null}<span class="dur">{formatMs(h.timeMs)}</span>{/if}
           </span>
-          <button
+          <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+          <span
             class="icon-btn more"
-            type="button"
-            tabindex="-1"
-            aria-label="History entry actions"
+            aria-hidden="true"
             onclick={(e) => {
               e.stopPropagation();
               rowMenu(h, e.currentTarget);
-            }}><Icon name="more" /></button
+            }}><Icon name="more" /></span
           >
         </div>
       {/if}

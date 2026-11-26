@@ -66,7 +66,7 @@
     </div>
     <div class="opts" role="listbox" id="env-picker-list">
       {#each opts as o, i (o.label + i)}
-        {#if o.manage}<div class="sep" role="separator"></div>{/if}
+        {#if o.manage}<div class="sep" aria-hidden="true"></div>{/if}
         <div
           id="env-opt-{i}"
           class="mi"
