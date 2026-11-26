@@ -237,7 +237,7 @@ Sanitising (AC-SHARE-2): secret variables are always removed from the attached e
 
 ## 4. Storage (for reference)
 
-App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.app`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping), `history.jsonl`. Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
+App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping), `history.jsonl`. Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
 
 ## 5. Not provided by the backend (UI responsibility)
 
