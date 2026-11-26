@@ -97,7 +97,7 @@
     <button class="link" type="button" onclick={() => (ui.filters.activity = "")}>Clear filter</button>
   </div>
 {:else}
-  <VirtualList {items} itemHeight={(it) => (it.type === "group" ? 30 : 40)} role="listbox" label="History" testid="history-list" {onkeydown} bind:scrollToIndex={scrollTo}>
+  <VirtualList {items} itemHeight={(it) => (it.type === "group" ? 30 : 52)} role="listbox" label="History" testid="history-list" {onkeydown} bind:scrollToIndex={scrollTo}>
     {#snippet row(it)}
       {#if it.type === "group"}
         <div class="group" role="presentation">{it.label}</div>
@@ -176,8 +176,10 @@
     display: grid;
     grid-template-columns: var(--w-method-col) 1fr;
     align-content: center;
-    row-gap: 2px;
+    row-gap: 4px;
     padding: 0 var(--sp-4) 0 var(--sp-5);
+    border-bottom: 1px solid var(--border-subtle);
+    box-sizing: border-box;
     cursor: default;
     position: relative;
     outline: none;
@@ -239,7 +241,8 @@
   .more {
     position: absolute;
     right: var(--sp-3);
-    top: 8px;
+    top: 50%;
+    transform: translateY(-50%);
     opacity: 0;
   }
   .hrow:hover .more,

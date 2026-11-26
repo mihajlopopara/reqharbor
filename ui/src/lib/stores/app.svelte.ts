@@ -23,7 +23,7 @@ import {
 import { copyText } from "../api/platform";
 import { indexTree, ancestorsOf, type TreeIndex } from "../util/tree";
 import { makeLookup } from "../util/vars";
-import { requestFingerprint, scratchRequest } from "../util/request";
+import { looksLikeCurl, requestFingerprint, scratchRequest } from "../util/request";
 import { ulid } from "../util/ulid";
 import { urlToParams, paramsToUrl } from "../util/urlx";
 import { prettyJson } from "../util/json";
@@ -400,6 +400,9 @@ class AppStore {
       this.sendBlocked = "Enter a URL";
       return;
     }
+    // A cURL command that reached the URL bar without the paste hook (typed,
+    // dropped, or pasted from a context menu): import it instead of sending it.
+    if (looksLikeCurl(req.url) && (await this.importCurlInPlace(req.url))) return;
     if (req.body.type === "graphql" && req.body.graphql?.variables.trim()) {
       try {
         JSON.parse(req.body.graphql.variables);

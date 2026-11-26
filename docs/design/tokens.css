@@ -59,7 +59,7 @@
   --h-control-lg: 30px;   /* request bar: method, URL, Send */
   --h-row-tree: 26px;
   --h-row-kv: 28px;
-  --h-row-history: 40px;  /* two-line activity row */
+  --h-row-history: 52px;  /* two-line activity row */
   --h-pane-header: 32px;  /* row 1 in every pane */
   --h-pane-bar: 44px;     /* row 2: New Request / request bar / status strip */
   --h-tabs: 34px;         /* row 3: tabs in every pane */

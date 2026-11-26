@@ -3,6 +3,7 @@
   import { app } from "../stores/app.svelte";
   import { ui } from "../stores/ui.svelte";
   import { shortcutText } from "../util/shortcuts";
+  import { looksLikeCurl } from "../util/request";
   import type { EditorController } from "../cm/editor";
   import MethodSelect from "./MethodSelect.svelte";
   import VarInput from "./VarInput.svelte";
@@ -90,7 +91,7 @@
 
   async function onUrlPaste(e: ClipboardEvent) {
     const text = e.clipboardData?.getData("text/plain") ?? "";
-    if (/^\s*curl\s/.test(text)) {
+    if (looksLikeCurl(text)) {
       e.preventDefault();
       const ok = await app.importCurlInPlace(text);
       if (!ok) app.setUrl(text);

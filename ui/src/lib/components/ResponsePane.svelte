@@ -6,6 +6,7 @@
   import { copyText, saveResponseToFile } from "../api/platform";
   import { formatSize, formatMs, statusClass, agoPhrase, dateTime, ERROR_LABEL } from "../util/format";
   import { prettyJson } from "../util/json";
+  import { withBaseHref } from "../util/preview";
   import { shortcutKeys } from "../util/shortcuts";
   import CodeEditor from "./CodeEditor.svelte";
   import Icon from "./Icon.svelte";
@@ -24,6 +25,7 @@
   const kind = $derived(meta?.bodyKind ?? "empty");
   const text = $derived(view?.body && kind !== "image" && kind !== "binary" ? decodeBody(view.body) : null);
   const limited = $derived(!!view?.bodyLimited);
+  const previewHtml = $derived(kind === "html" && mode === "preview" && text !== null ? withBaseHref(text, meta?.finalUrl ?? view?.resolvedUrl) : "");
   const canPretty = $derived(!limited && (kind === "json" || kind === "xml" || kind === "html"));
 
   let xmlPretty = $state<{ src: string; out: string | null } | null>(null);
@@ -308,7 +310,7 @@
             <span class="faint small">{imgDims}{imgDims ? " · " : ""}{formatSize(meta.sizeBytes)}</span>
           </div>
         {:else if kind === "html" && mode === "preview"}
-          <iframe class="preview" title="HTML preview" sandbox="" srcdoc={text ?? ""} data-testid="body-html-preview"></iframe>
+          <iframe class="preview" title="HTML preview" sandbox="" referrerpolicy="no-referrer" srcdoc={previewHtml} data-testid="body-html-preview"></iframe>
         {:else if kind === "image" && view.body}
           <CodeEditor value={decodeBody(view.body)} language="xml" readOnly wrap ariaLabel="Response body" testid="response-body" />
         {:else}

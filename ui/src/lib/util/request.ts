@@ -1,6 +1,13 @@
 import type { Auth, Body, Request } from "../api/types";
 import { ulid } from "./ulid";
 
+/** Mirrors core looks_like_curl: does this text look like a pasted cURL command? */
+export function looksLikeCurl(text: string): boolean {
+  let t = text.replace(/^[\s﻿​‌‍⁠]+/, "");
+  if (t.startsWith("$ ")) t = t.slice(2);
+  return /^curl(?:\.exe)?[\s\\]/.test(t);
+}
+
 export function scratchRequest(partial: Partial<Request> = {}): Request {
   return {
     id: ulid(),
