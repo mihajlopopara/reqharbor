@@ -92,15 +92,16 @@
   {#if body.type === "none"}
     <p class="faint pad line">This request has no body.</p>
   {:else if body.type === "json" || body.type === "xml" || body.type === "text"}
-    <div class="sublabel">
+    {#if app.formatError}
+      <div class="pad"><div class="hint danger" role="alert" data-testid="format-error"><Icon name="alert" />{app.formatError.message}</div></div>
+    {/if}
+    <div class="box">
+    <div class="box-head">
       <span>{LABELS[body.type]}</span>
       {#if body.type !== "text"}
         <button class="link" type="button" title="Format  {app.mod}⇧F" onclick={format} data-testid="format-body">Format</button>
       {/if}
     </div>
-    {#if app.formatError}
-      <div class="pad"><div class="hint danger" role="alert" data-testid="format-error"><Icon name="alert" />{app.formatError.message}</div></div>
-    {/if}
     <CodeEditor
       value={body.text ?? ""}
       language={body.type}
@@ -113,21 +114,22 @@
         app.formatError = null;
       }}
     />
+    </div>
   {:else if body.type === "form" || body.type === "formEncoded"}
     <div class="pad scroll">
       <KvTable rows={body.type === "form" ? (body.form ?? []) : (body.formEncoded ?? [])} kind={body.type} lookup={app.lookup} testid={body.type === "form" ? "form" : "form-encoded"} />
     </div>
   {:else if body.type === "graphql" && body.graphql}
     {@const gql = body.graphql}
-    <div class="sublabel"><span>Query</span></div>
-    <div class="gq">
+    <div class="box gq">
+      <div class="box-head"><span>Query</span></div>
       <CodeEditor value={gql.query} language="text" lookup={app.lookup} ariaLabel="GraphQL query" testid="graphql-query" placeholder={"query { … }"} onchange={(v) => (gql.query = v)} />
     </div>
-    <div class="sublabel vars">
-      <span>Variables</span>
-      <button class="link" type="button" title="Format  {app.mod}⇧F" onclick={format}>Format</button>
-    </div>
-    <div class="gv">
+    <div class="box gv">
+      <div class="box-head">
+        <span>Variables</span>
+        <button class="link" type="button" title="Format  {app.mod}⇧F" onclick={format}>Format</button>
+      </div>
       <CodeEditor value={gql.variables} language="json" lookup={app.lookup} ariaLabel="GraphQL variables" testid="graphql-variables" placeholder={"{ }"} bind:controller={varsEditor} onchange={(v) => (gql.variables = v)} />
     </div>
     {#if gqlVarsError || app.formatError}
@@ -169,18 +171,36 @@
     padding: var(--sp-4) var(--sp-5) var(--sp-2);
     flex: none;
   }
-  .sublabel {
+  /* Bordered card around each editor; the header carries its label + actions. */
+  .box {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    margin: var(--sp-2) var(--sp-5) var(--sp-5);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-md);
+    background: var(--bg-pane);
+    overflow: hidden;
+    transition: border-color var(--dur-fast);
+  }
+  .box:focus-within {
+    border-color: var(--border-strong);
+  }
+  .box-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: var(--sp-2) var(--sp-5) var(--sp-3);
+    height: 30px;
+    padding: 0 var(--sp-4);
     font-size: var(--fs-sm);
     color: var(--text-3);
+    background: var(--bg-sidebar);
+    border-bottom: 1px solid var(--border-subtle);
     flex: none;
   }
-  .sublabel.vars {
-    border-top: 1px solid var(--border-subtle);
-    padding-top: var(--sp-3);
+  .box :global(.cm-editor) {
+    padding-top: var(--sp-2);
   }
   .pad {
     padding: var(--sp-2) var(--sp-5);
@@ -194,13 +214,12 @@
   }
   .gq {
     flex: 2;
-    min-height: 80px;
-    display: flex;
+    min-height: 120px;
+    margin-bottom: var(--sp-3);
   }
   .gv {
     flex: 1;
-    min-height: 80px;
-    display: flex;
+    min-height: 100px;
   }
   .drop {
     height: 120px;
