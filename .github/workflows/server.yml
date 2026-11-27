@@ -72,6 +72,9 @@ jobs:
             exit 1
           fi
 
+      - name: Self-hoster compose example is valid
+        run: docker compose -f docker-compose.example.yml --profile tls config -q
+
   image:
     needs: test
     runs-on: ubuntu-latest

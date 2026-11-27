@@ -9,7 +9,7 @@
 //!
 //! The raw workspace creates here send a random `CF-Connecting-IP` (the script trusts 127.0.0.1
 //! as a proxy), so they never use the 127.0.0.1 bucket that qa_sync_live's creates need under the
-//! default 10 per hour limit. (b) of §1.6, the restore paths, arrives with `restore` in S7.
+//! default 10 per hour limit.
 //!
 //! The accounts case (S4) signs up the first account through the hosted pages with raw HTTP. It
 //! needs the setup code, which the script reads from the server log and passes as
@@ -19,10 +19,18 @@
 //! the script creates with `invite create` and passes as `REQHARBOR_LIVE_INVITE_CODE`. An invite
 //! cannot create the first account, so it relies on libtest's name order (with
 //! --test-threads=1): `live_password_…` runs before `live_provider_dev_…`.
+//!
+//! The restore cases (S7, §6 "Restore") stop and restart the server through
+//! qa/live_server_ctl.sh, which the script passes as `REQHARBOR_LIVE_SERVER_CTL`: one restores a
+//! backup with `reqharbor-server restore`, the other copies it over the database by hand (the
+//! unsupported path). Each restores a backup taken inside the case, so the accounts that earlier
+//! cases created survive it.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use reqharbor_core::sync::SyncClient;
+use reqharbor_core::model::Request;
+use reqharbor_core::storage::Store;
+use reqharbor_core::sync::{self, SyncClient};
 use serde_json::{Value, json};
 
 fn server_url() -> String {
@@ -796,4 +804,126 @@ async fn live_space_personal_sync_me_and_shares() {
         (status, err["error"]["code"].clone()),
         (404, json!("space_not_found"))
     );
+}
+
+/// Runs qa/live_server_ctl.sh with `args` and returns its stdout.
+fn server_ctl(args: &[&str]) -> String {
+    let ctl = std::env::var("REQHARBOR_LIVE_SERVER_CTL").expect(
+        "REQHARBOR_LIVE_SERVER_CTL: qa/live_server_ctl.sh (qa/run_live_server_tests.sh sets it)",
+    );
+    let out = std::process::Command::new("bash")
+        .arg(&ctl)
+        .args(args)
+        .output()
+        .expect("run the server control script");
+    assert!(
+        out.status.success(),
+        "server ctl {args:?} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// A device: a fresh local store connected to the legacy workspace of `token`.
+async fn sync_device(token: &str) -> (tempfile::TempDir, Store, SyncClient) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    sync::connect(&mut s, &server_url(), token)
+        .await
+        .expect("connect");
+    let c = sync::client_for(&s).unwrap();
+    (dir, s, c)
+}
+
+async fn sync_epoch(c: &reqwest::Client) -> String {
+    let v: Value = c
+        .get(format!("{}/v1/server", server_url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    v["syncEpoch"].as_str().unwrap().to_string()
+}
+
+/// §6 Restore, both paths: device 1 pushes A, the admin takes a backup, device 1 pushes B (and
+/// syncs again, so its cursor covers B), the backup is put back, then device 1 syncs: it notices
+/// the restore (the new epoch, or by hand the cursor regression), pulls everything again and
+/// re-pushes B; device 2 ends with A and B and no conflict.
+async fn restore_round_trip(by_hand: bool) {
+    let c = http();
+    let token = raw_workspace(&c).await;
+    let (_d1, mut a, ca) = sync_device(&token).await;
+    let pid = a.project_list()[0].id.clone();
+    let col = a.create_collection(&pid, "Restore").unwrap();
+    let req = |name: &str| Request {
+        name: name.into(),
+        method: "GET".into(),
+        url: format!("https://api.example.com/{name}"),
+        ..Request::default()
+    };
+    let ra = a.create_request(&col.id, None, req("a")).unwrap();
+    sync::sync_now(&ca, &mut a).await.expect("device 1 pushes A");
+    let (_d2, mut b, cb) = sync_device(&token).await;
+    sync::sync_now(&cb, &mut b).await.expect("device 2 pulls A");
+    assert!(b.request(&ra.id).is_some(), "device 2 has A");
+
+    let backup = server_ctl(&["backup"]).trim().to_string();
+    assert!(backup.ends_with(".db"), "backup path {backup:?}");
+
+    let rb = a.create_request(&col.id, None, req("b")).unwrap();
+    let rep = sync::sync_now(&ca, &mut a).await.expect("device 1 pushes B");
+    assert!(rep.pushed >= 1, "{rep:?}");
+    sync::sync_now(&ca, &mut a).await.expect("device 1 pulls its own B");
+    let epoch_before = sync_epoch(&c).await;
+
+    server_ctl(&[if by_hand { "replace" } else { "restore" }, &backup]);
+    // The server process was restarted: connections pooled before it (keep-alive) are dead, so
+    // take fresh clients, as an app does after a failed request.
+    let c = http();
+    let ca = sync::client_for(&a).unwrap();
+    let cb = sync::client_for(&b).unwrap();
+    let epoch_after = sync_epoch(&c).await;
+    if by_hand {
+        assert_eq!(epoch_after, epoch_before, "copying a file keeps the epoch");
+    } else {
+        assert_ne!(epoch_after, epoch_before, "restore rotates the epoch");
+    }
+    let lost = ca.pull_all(0).await.expect("pull after the restore");
+    assert!(
+        !lost.changes.iter().any(|ch| ch.id == rb.id),
+        "B was pushed after the backup, so the restored server lacks it"
+    );
+
+    let rep = sync::sync_now(&ca, &mut a)
+        .await
+        .expect("device 1 after the restore");
+    assert!(rep.restored, "device 1 noticed the restore: {rep:?}");
+    assert!(rep.pushed >= 1, "device 1 re-pushed B: {rep:?}");
+    assert!(rep.conflicts.is_empty(), "{rep:?}");
+    let back = ca.pull_all(0).await.unwrap();
+    assert!(
+        back.changes.iter().any(|ch| ch.id == rb.id && !ch.deleted),
+        "the server has B again"
+    );
+
+    let rep = sync::sync_now(&cb, &mut b)
+        .await
+        .expect("device 2 after the restore");
+    assert!(rep.conflicts.is_empty(), "{rep:?}");
+    assert!(b.request(&ra.id).is_some(), "device 2 keeps A");
+    assert_eq!(b.request(&rb.id).map(|r| r.name.as_str()), Some("b"), "device 2 has B");
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_restore_a_with_the_command_rotates_the_epoch_and_clients_re_push() {
+    restore_round_trip(false).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_restore_b_by_hand_is_recovered_by_the_cursor_regression_rule() {
+    restore_round_trip(true).await;
 }

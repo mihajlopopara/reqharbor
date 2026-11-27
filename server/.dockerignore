@@ -4,3 +4,6 @@ Dockerfile
 .dockerignore
 **/*_test.go
 **/testdata/
+*.md
+docker-compose.example.yml
+Caddyfile.example

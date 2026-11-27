@@ -14,7 +14,9 @@
 #      script reads from the log and passes as REQHARBOR_LIVE_SIGNUP_CODE; and the S5 dev-provider
 #      case, which signs up through the dev form with an invite made here with `invite create` and
 #      passed as REQHARBOR_LIVE_INVITE_CODE; and the S6 personal-spaces case, which signs two more
-#      accounts up with the same invite, so it has 5 uses)
+#      accounts up with the same invite, so it has 5 uses; and the S7 restore cases, which stop the
+#      server, restore a backup with `restore` (or copy it over by hand) and start it again through
+#      qa/live_server_ctl.sh, passed as REQHARBOR_LIVE_SERVER_CTL)
 #   4. cargo test --test qa_auth_live -- --ignored  (the client's sign-in, M1-client C1; §7.5 step 6)
 #      with REQHARBOR_LIVE_SIGNUP_CODE set to a multi-use invite made with `invite create`. It needs
 #      the S6 routes (GET /v1/me, sessions, personal spaces; §9, §10 S6), so by default
@@ -30,58 +32,30 @@
 # worker_smoke.sh sends CF-Connecting-IP, honoured because 127.0.0.1 is a trusted proxy, so its
 # creates land in random 203.0.113.x / 192.0.2.x buckets; qa_sync_live's creates send no header
 # and share the 127.0.0.1 bucket; qa_server_live sends random 198.18.0.0/15 addresses.
+# The server start, stop and readiness helpers live in qa/live_server_lib.sh, which
+# qa/live_server_ctl.sh shares (the restore cases restart the server through it).
 set -u
 ROOT=${ROOT:-/app}
-BIN="$ROOT/server/bin/reqharbor-server-devauth"
-PORT=${PORT:-8080}
-BASE="http://127.0.0.1:$PORT"
+QA_LIVE_DATA=$(mktemp -d /tmp/qa-reqharbor-server-XXXX)
+export QA_LIVE_DATA
+# shellcheck source=qa/live_server_lib.sh
+. "$ROOT/qa/live_server_lib.sh"
 
 if [ ! -x "$BIN" ]; then
   echo "missing $BIN; build it first:" >&2
   echo "  docker compose run --rm go go build -tags devauth -o bin/reqharbor-server-devauth ./cmd/reqharbor-server" >&2
+  rm -rf "$QA_LIVE_DATA"
   exit 2
 fi
 
-DATA=$(mktemp -d /tmp/qa-reqharbor-server-XXXX)
-LOG="$DATA/server.log"
-# Exactly the §7.5 settings, for serve and for the CLI next to it (rh <command>).
-RH_ENV=(
-  PATH="$PATH" HOME="${HOME:-/root}"
-  REQHARBOR_LISTEN="127.0.0.1:$PORT"
-  REQHARBOR_PUBLIC_URL="$BASE"
-  REQHARBOR_DATA_DIR="$DATA/data"
-  REQHARBOR_DEV_AUTH=true
-  REQHARBOR_LEGACY_WORKSPACES=open
-  REQHARBOR_TRUSTED_PROXIES=127.0.0.1/32
-  REQHARBOR_CLIENT_IP_HEADER=CF-Connecting-IP
-  REQHARBOR_LOG_FORMAT=json
-)
-rh() { env -i "${RH_ENV[@]}" "$BIN" "$@"; }
-env -i "${RH_ENV[@]}" "$BIN" serve >"$LOG" 2>&1 &
-SPID=$!
+server_start
 cleanup() {
-  kill "$SPID" 2>/dev/null
-  wait "$SPID" 2>/dev/null
-  rm -rf "$DATA"
+  server_stop >/dev/null 2>&1
+  rm -rf "$QA_LIVE_DATA"
 }
 trap cleanup EXIT
 
-ready=""
-for _ in $(seq 1 60); do
-  if ! kill -0 "$SPID" 2>/dev/null; then
-    echo "server exited during startup:" >&2
-    cat "$LOG" >&2
-    exit 2
-  fi
-  code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/readyz")
-  if [ "$code" = 200 ]; then ready=1; break; fi
-  sleep 0.5
-done
-if [ -z "$ready" ]; then
-  echo "server not ready after 30 s:" >&2
-  cat "$LOG" >&2
-  exit 2
-fi
+server_wait_ready || exit 2
 echo "server ready: $(curl -s "$BASE/v1/server" | head -c 200)"
 SETUP_CODE=$(sed -n 's/.*enter setup code \([0-9A-Z]\{4\}-[0-9A-Z]\{4\}-[0-9A-Z]\{4\}-[0-9A-Z]\{4\}\).*/\1/p' "$LOG" | head -1)
 if [ -z "$SETUP_CODE" ]; then
@@ -98,7 +72,7 @@ cd "$ROOT" || exit 2
 run_live() { # run_live <test target> [signup code] [invite code]
   echo "=== live Rust client <-> Go server: $1 ==="
   REQHARBOR_SERVER_URL="$BASE" REQHARBOR_WORKER_URL="$BASE" REQHARBOR_LIVE_SIGNUP_CODE="${2:-}" \
-    REQHARBOR_LIVE_INVITE_CODE="${3:-}" \
+    REQHARBOR_LIVE_INVITE_CODE="${3:-}" REQHARBOR_LIVE_SERVER_CTL="$ROOT/qa/live_server_ctl.sh" \
     cargo test -p reqharbor-core --test "$1" -- --ignored --test-threads=1 2>&1 \
     | grep -vE '^\s+(Compiling|Running|Finished)'
   return "${PIPESTATUS[0]}"

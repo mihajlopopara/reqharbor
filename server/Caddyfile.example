@@ -1,0 +1,7 @@
+# Caddy in front of the ReqHarbor server (docker-compose.example.yml, profile "tls"). Copy it to
+# ./Caddyfile and replace rh.example.com with the host of REQHARBOR_PUBLIC_URL. Caddy obtains and
+# renews the certificate itself; ports 80 and 443 must reach this host.
+rh.example.com {
+    encode zstd gzip
+    reverse_proxy reqharbor:8080
+}

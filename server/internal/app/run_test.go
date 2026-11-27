@@ -27,7 +27,12 @@ type running struct {
 
 func startRun(t *testing.T, dataDir string, hook func(context.Context)) *running {
 	t.Helper()
-	cfg := tu.ParseEnv(t, tu.DefaultEnv(dataDir))
+	return startRunWith(t, dataDir, nil, app.RunOptions{BeforeMigrate: hook})
+}
+
+func startRunWith(t *testing.T, dataDir string, env []string, opts app.RunOptions) *running {
+	t.Helper()
+	cfg := tu.ParseEnv(t, append(tu.DefaultEnv(dataDir), env...))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +41,8 @@ func startRun(t *testing.T, dataDir string, hook func(context.Context)) *running
 	r := &running{base: "http://" + ln.Addr().String(), done: make(chan error, 1), stop: cancel}
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	go func() {
-		r.done <- app.Run(ctx, cfg, logger, app.DefaultVersion, app.RunOptions{Listener: ln, BeforeMigrate: hook})
+		opts.Listener = ln
+		r.done <- app.Run(ctx, cfg, logger, app.DefaultVersion, opts)
 	}()
 	t.Cleanup(func() {
 		cancel()

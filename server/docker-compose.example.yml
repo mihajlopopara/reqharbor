@@ -1,0 +1,59 @@
+# ReqHarbor server for self-hosters (06-go-server.md §7.3). Copy this file to docker-compose.yml
+# next to a Caddyfile (from Caddyfile.example), replace rh.example.com with your domain, then:
+#
+#   docker compose up -d                    # the server alone, on 127.0.0.1:8080 of this host
+#   docker compose --profile tls up -d      # plus Caddy with automatic HTTPS on ports 80 and 443
+#   docker compose logs reqharbor | grep setup    # the first-run setup code
+#
+# Backups and restores (see README.md, "Backups and restore"):
+#   docker compose exec reqharbor /reqharbor-server backup
+#   docker compose stop reqharbor
+#   docker compose run --rm reqharbor restore /data/backups/<file>.db
+#   docker compose start reqharbor
+services:
+  reqharbor:
+    image: ghcr.io/mihajlopopara/reqharbor-server:0.2   # 0.y: pin the minor; there is no major-only tag before 1.0
+    restart: unless-stopped
+    stop_grace_period: 60s        # keep it about 40 s above REQHARBOR_SHUTDOWN_TIMEOUT (20s): shutdown also waits for writes and the checkpoint
+    environment:
+      REQHARBOR_PUBLIC_URL: https://rh.example.com    # required: the address users type in the app
+      REQHARBOR_SIGNUP: invite
+      REQHARBOR_TRUSTED_PROXIES: 172.30.53.10/32      # Caddy's fixed address below, and nothing else
+      # REQHARBOR_LEGACY_WORKSPACES: existing         # default off; see the README before enabling open
+      # REQHARBOR_GITHUB_CLIENT_ID: Iv1.0123456789abcdef
+      # REQHARBOR_GITHUB_CLIENT_SECRET_FILE: /run/secrets/github_secret
+    # secrets: [github_secret]
+    volumes:
+      - reqharbor-data:/data
+    networks:
+      reqharbor-net:
+        ipv4_address: 172.30.53.20
+    ports:
+      - "127.0.0.1:8080:8080"     # direct access from this host for testing; remove when using Caddy
+
+  caddy:                          # optional: automatic HTTPS. Start with: docker compose --profile tls up -d
+    profiles: ["tls"]
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    networks:
+      reqharbor-net:
+        ipv4_address: 172.30.53.10
+    depends_on: [reqharbor]
+
+networks:
+  reqharbor-net:
+    ipam:
+      config:
+        - subnet: 172.30.53.0/24  # fixed, so the trusted proxy address above is stable
+
+volumes:
+  reqharbor-data:
+  caddy-data:
+
+# secrets:
+#   github_secret:
+#     file: ./github_client_secret.txt

@@ -1,5 +1,6 @@
-// Package jobs runs the background goroutines: the breaker sampler and the limiter sweeper (S1),
-// later GC and scheduled backups (06-go-server.md §6).
+// Package jobs runs the background goroutines of serve (06-go-server.md §6): the breaker sampler
+// (every 10 s), the limiter sweeper (every minute), GC (every 10 minutes) and the daily database
+// maintenance. Scheduled backups follow in M3.
 package jobs
 
 import (

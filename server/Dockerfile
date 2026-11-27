@@ -14,12 +14,14 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
       -o /out/reqharbor-server ./cmd/reqharbor-server \
- && mkdir -p /out/data
+ && mkdir -p -m 0700 /out/root/data
 
 # Distroless static, non-root; CA certificates and tzdata included.
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY --from=build /out/reqharbor-server /reqharbor-server
-COPY --from=build --chown=65532:65532 /out/data /data
+# Copy the parent, so /data keeps its 0700 mode (copying the directory itself copies only its
+# contents into a 0755 /data). The database holds password and token hashes.
+COPY --from=build --chown=65532:65532 /out/root/ /
 ENV REQHARBOR_DATA_DIR=/data REQHARBOR_LISTEN=:8080
 VOLUME ["/data"]
 EXPOSE 8080

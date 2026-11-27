@@ -23,11 +23,15 @@ commands:
   user <list|create|set-password|reset-link|set-admin|disable|enable|unlock|sessions revoke> …
   invite <create|list|revoke> …
   setup-code                print a fresh first-run setup code (only while no account exists)
+  backup [--out PATH]       online snapshot of the database (works while serve runs)
+  restore FILE [--rev-base N]
+                            replace the database with a backup (serve must be stopped)
   healthcheck [--url URL]   exit 0 when /healthz answers 200 (Docker HEALTHCHECK)
   version
 `
 
 func main() {
+	privateUmask()
 	os.Exit(run(os.Args[1:], os.Environ(), os.Stdout, os.Stderr))
 }
 
@@ -48,6 +52,10 @@ func run(args, environ []string, stdout, stderr io.Writer) int {
 		return invite(args, environ, stdout, stderr)
 	case "setup-code":
 		return setupCode(args, environ, stdout, stderr)
+	case "backup":
+		return backup(args, environ, stdout, stderr)
+	case "restore":
+		return restore(args, environ, stdout, stderr)
 	case "healthcheck":
 		return healthcheck(args, environ, stderr)
 	case "version", "--version", "-v":

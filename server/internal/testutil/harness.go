@@ -48,10 +48,11 @@ type Harness struct {
 }
 
 type options struct {
-	env    []string
-	store  store.Store
-	config []func(*config.Config)
-	client *http.Client
+	dataDir string
+	env     []string
+	store   store.Store
+	config  []func(*config.Config)
+	client  *http.Client
 }
 
 // Option customises New.
@@ -68,6 +69,10 @@ func WithConfig(f func(*config.Config)) Option {
 
 // WithHTTPClient sets the client of the outbound provider calls.
 func WithHTTPClient(c *http.Client) Option { return func(o *options) { o.client = c } }
+
+// WithDataDir serves an existing data directory (for example a database seeded at an older
+// schema) instead of a fresh one; New migrates it like serve does.
+func WithDataDir(dir string) Option { return func(o *options) { o.dataDir = dir } }
 
 // WithStore serves from a stub store instead of a real database.
 func WithStore(s store.Store) Option { return func(o *options) { o.store = s } }
@@ -124,7 +129,10 @@ func New(t testing.TB, opts ...Option) *Harness {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	dir := t.TempDir()
+	dir := o.dataDir
+	if dir == "" {
+		dir = t.TempDir()
+	}
 	cfg := ParseEnv(t, append(DefaultEnv(dir), o.env...))
 	for _, f := range o.config {
 		f(cfg)
