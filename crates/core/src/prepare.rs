@@ -5,6 +5,7 @@
 //! This is pure (no I/O): file bodies are referenced by path and read by
 //! [`PreparedBody::materialize`].
 
+use crate::dynamic::DynamicCtx;
 use crate::model::{
     ApiKeyLocation, Auth, AuthType, BodyType, FormFieldKind, Request, RequestSettings,
     is_valid_method,
@@ -45,13 +46,21 @@ pub enum PrepareError {
     InvalidGraphqlVariables(String),
     #[error("URL is empty")]
     EmptyUrl,
+    /// A non-HTTP kind, an unknown body type or a newer `minClientVersion`
+    /// (AC-FWD-3/4): this build cannot send it faithfully.
+    #[error("This request needs a newer version of ReqHarbor")]
+    NeedsNewerVersion,
+    /// The request inherits its collection's auth, and that auth comes from a
+    /// newer ReqHarbor (an unknown scheme): it can't be applied here.
+    #[error("The collection's auth needs a newer version of ReqHarbor")]
+    InheritedAuthNeedsNewerVersion,
 }
 
 /// The default Content-Type implied by a body type (AC-REQ-4). Multipart's
 /// boundary is appended by [`prepare`].
-pub fn default_content_type(body_type: BodyType) -> Option<&'static str> {
+pub fn default_content_type(body_type: &BodyType) -> Option<&'static str> {
     match body_type {
-        BodyType::None => None,
+        BodyType::None | BodyType::Other(_) => None,
         BodyType::Json | BodyType::Graphql => Some("application/json"),
         BodyType::Xml => Some("application/xml"),
         BodyType::Text => Some("text/plain"),
@@ -93,7 +102,12 @@ impl PreparedBody {
                 for part in parts {
                     out.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
                     let name = escape_disposition(&part.name);
-                    match part.kind {
+                    match &part.kind {
+                        FormFieldKind::Other(kind) => {
+                            return Err(std::io::Error::other(format!(
+                                "Form field kind \"{kind}\" needs a newer version of ReqHarbor"
+                            )));
+                        }
                         FormFieldKind::Text => {
                             out.extend_from_slice(
                                 format!("Content-Disposition: form-data; name=\"{name}\"\r\n")
@@ -209,6 +223,28 @@ pub fn prepare_with_boundary(
     collection_auth: Option<&Auth>,
     boundary: &str,
 ) -> Result<PreparedRequest, PrepareError> {
+    prepare_in(
+        request,
+        scope,
+        collection_auth,
+        boundary,
+        &DynamicCtx::new(),
+    )
+}
+
+/// [`prepare_with_boundary`] with a caller-owned dynamic-variable memo, so
+/// later resolves (cURL export) reuse the values this preparation drew.
+/// Every resolve below shares `dynamic`: `url` and `display_url` agree.
+pub fn prepare_in(
+    request: &Request,
+    scope: &VarScope,
+    collection_auth: Option<&Auth>,
+    boundary: &str,
+    dynamic: &DynamicCtx,
+) -> Result<PreparedRequest, PrepareError> {
+    if !request.is_editable() {
+        return Err(PrepareError::NeedsNewerVersion);
+    }
     let method = request.method.trim().to_string();
     if !is_valid_method(&method) {
         return Err(PrepareError::InvalidMethod(request.method.clone()));
@@ -221,7 +257,7 @@ pub fn prepare_with_boundary(
     let full = ResolveOptions::default();
     let keep = ResolveOptions { keep_secrets: true };
     let mut scratch = Unresolved::default();
-    let mut r = |s: &str| scope.resolve(s, full, &mut unresolved);
+    let mut r = |s: &str| scope.resolve_in(s, full, &mut unresolved, dynamic);
 
     // --- headers (AC-REQ-3) ---
     let mut headers: Vec<(String, String)> = request
@@ -238,8 +274,12 @@ pub fn prepare_with_boundary(
     let mut extra_query: Vec<(String, String)> = Vec::new();
     let mut sensitive_headers: Vec<String> = Vec::new();
     let mut extra_query_display: Vec<(String, String)> = Vec::new();
-    if let Some(auth) = effective_auth(&request.auth, collection_auth) {
-        match auth.auth_type {
+    let auth = effective_auth(&request.auth, collection_auth);
+    if auth.is_some_and(|a| !a.is_known()) {
+        return Err(PrepareError::InheritedAuthNeedsNewerVersion);
+    }
+    if let Some(auth) = auth {
+        match &auth.auth_type {
             AuthType::Basic => {
                 if !has_header(&headers, "Authorization") {
                     let user = r(auth.username.as_deref().unwrap_or(""));
@@ -261,7 +301,8 @@ pub fn prepare_with_boundary(
                 {
                     let key = r(k.key.trim());
                     let value = r(&k.value);
-                    match k.location {
+                    match &k.location {
+                        ApiKeyLocation::Other(_) => {}
                         ApiKeyLocation::Header => {
                             sensitive_headers.push(key.clone());
                             if !has_header(&headers, &key) {
@@ -269,22 +310,22 @@ pub fn prepare_with_boundary(
                             }
                         }
                         ApiKeyLocation::Query => {
-                            let dk = scope.resolve(k.key.trim(), keep, &mut scratch);
-                            let dv = scope.resolve(&k.value, keep, &mut scratch);
+                            let dk = scope.resolve_in(k.key.trim(), keep, &mut scratch, dynamic);
+                            let dv = scope.resolve_in(&k.value, keep, &mut scratch, dynamic);
                             extra_query.push((key, value));
                             extra_query_display.push((dk, dv));
                         }
                     }
                 }
             }
-            AuthType::None | AuthType::Inherit => {}
+            AuthType::None | AuthType::Inherit | AuthType::Other(_) => {}
         }
     }
 
     // --- URL (AC-REQ-2, AC-REQ-10) ---
     let build_url =
         |opts: ResolveOptions, extra: &[(String, String)], unresolved: &mut Unresolved| {
-            let mut res = |s: &str| scope.resolve(s, opts, unresolved);
+            let mut res = |s: &str| scope.resolve_in(s, opts, unresolved, dynamic);
             let raw = request.url.trim();
             let mut url = if request.params.is_empty() {
                 res(raw)
@@ -334,11 +375,12 @@ pub fn prepare_with_boundary(
     let display_url = build_url(keep, &extra_query_display, &mut scratch);
 
     // --- body (AC-REQ-4, AC-REQ-5, AC-QRY-2/3) ---
-    let mut r = |s: &str| scope.resolve(s, full, &mut unresolved);
+    let mut r = |s: &str| scope.resolve_in(s, full, &mut unresolved, dynamic);
     let body_def = &request.body;
-    let mut content_type = default_content_type(body_def.body_type).map(str::to_string);
-    let body = match body_def.body_type {
+    let mut content_type = default_content_type(&body_def.body_type).map(str::to_string);
+    let body = match &body_def.body_type {
         BodyType::None => None,
+        BodyType::Other(_) => return Err(PrepareError::NeedsNewerVersion),
         BodyType::Json | BodyType::Xml | BodyType::Text => {
             Some(PreparedBody::Bytes(r(body_def.text_str()).into_bytes()))
         }
@@ -390,7 +432,7 @@ pub fn prepare_with_boundary(
                 .filter(|f| f.enabled && !f.key.is_empty())
                 .map(|f| MultipartPart {
                     name: r(&f.key),
-                    kind: f.kind,
+                    kind: f.kind.clone(),
                     value: r(&f.value),
                     content_type: f.content_type.clone(),
                 })
@@ -419,7 +461,7 @@ pub fn prepare_with_boundary(
         display_url,
         headers,
         body,
-        settings: request.settings,
+        settings: request.settings.clone(),
         unresolved: unresolved.into_names(),
         sensitive_headers,
     })
@@ -448,6 +490,7 @@ mod tests {
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
+            extra: Default::default(),
         };
         VarScope::new(None, Some(&env))
     }
@@ -570,6 +613,7 @@ mod tests {
             graphql: Some(GraphqlBody {
                 query: "q".into(),
                 variables: "{oops".into(),
+                extra: Default::default(),
             }),
             ..Body::default()
         };
@@ -687,6 +731,45 @@ mod tests {
         let pr = p(&r);
         assert!(pr.body.is_none());
         assert_eq!(pr.header("Content-Type"), None);
+    }
+
+    #[test]
+    fn dynamic_variables_one_value_per_send_and_never_unresolved() {
+        let s = scope(vec![Variable::new("tok", "SECRET").secret()]);
+        let mut r = req(
+            "POST",
+            "https://api.dev/u/{{$uuid}}?t={{tok}}&again={{$uuid}}",
+        );
+        r.params = crate::urlx::url_to_params(&r.url, &[]);
+        r.headers = vec![KeyValue::new("X-Request-Id", "{{$uuid}}")];
+        r.body = Body::json(r#"{"email":"{{$randomEmail}}","id":"{{$uuid}}"}"#);
+        let pr = prepare(&r, &s, None).unwrap();
+        assert!(pr.unresolved.is_empty(), "{:?}", pr.unresolved);
+        let id = pr.header("X-Request-Id").unwrap().to_string();
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        // url and display_url (history) agree on the generated parts
+        assert_eq!(
+            pr.url,
+            format!("https://api.dev/u/{id}?t=SECRET&again={id}")
+        );
+        assert_eq!(
+            pr.display_url,
+            format!("https://api.dev/u/{id}?t={{{{tok}}}}&again={id}")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(&pr)).unwrap();
+        assert_eq!(body["id"], id.as_str());
+        let email = body["email"].as_str().unwrap();
+        assert!(email.contains('@') && !email.contains("{{"), "{email}");
+        // a new send draws new values
+        let again = prepare(&r, &s, None).unwrap();
+        assert_ne!(again.header("X-Request-Id").unwrap(), id);
+    }
+
+    #[test]
+    fn unknown_dynamic_variable_sent_literally_and_reported() {
+        let pr = p(&req("GET", "https://x.dev/{{$notAThing}}"));
+        assert_eq!(pr.url, "https://x.dev/{{$notAThing}}");
+        assert_eq!(pr.unresolved, vec!["$notAThing".to_string()]);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 pub mod cookies;
 pub mod curl;
+pub mod dynamic;
 pub mod format;
 pub mod history;
 pub mod http;

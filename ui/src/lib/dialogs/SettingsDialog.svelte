@@ -7,7 +7,7 @@
   import { toasts } from "../stores/toasts.svelte";
   import { call, toCommandError, type RemoteWorkspace, type ShareInfo, type Theme } from "../api";
   import { copyText } from "../api/platform";
-  import { formatSize, relativeTime, dateTime } from "../util/format";
+  import { formatSize, relativeTime, dateTime, unsupportedNotice } from "../util/format";
   import { SHORTCUT_LIST, shortcutKeys } from "../util/shortcuts";
 
   type Section = "general" | "sync" | "shares" | "shortcuts" | "about";
@@ -84,6 +84,8 @@
     if (rep) {
       toasts.success(`Synced · ${rep.pushed} pushed, ${rep.pulled} pulled`);
       if (rep.tooLarge.length) toasts.warning(`Not synced (too large): ${rep.tooLarge.map((s) => s.name).join(", ")}`);
+      const notice = unsupportedNotice(rep.unsupported?.length ?? 0);
+      if (notice) toasts.warning(notice);
       await loadInfo();
     }
   }

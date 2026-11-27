@@ -1,10 +1,11 @@
 <script lang="ts" module>
+  import type { FormField } from "../api/types";
   export interface KvRow {
     key: string;
     value: string;
     enabled: boolean;
     description?: string;
-    kind?: "text" | "file";
+    kind?: FormField["kind"];
     contentType?: string;
     secret?: boolean;
   }

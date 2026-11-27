@@ -1,13 +1,17 @@
 //! `{{variable}}` substitution (AC-ENV-1 .. AC-ENV-4).
 //!
-//! * A reference is `{{ name }}` where name matches `[A-Za-z0-9_.-]+`;
+//! * A reference is `{{ name }}` where name matches `\$?[A-Za-z0-9_.-]+`;
 //!   whitespace inside the braces is trimmed.
+//! * A name starting with `$` is a dynamic variable (`{{$uuid}}`, see
+//!   [`crate::dynamic`]): generated, never looked up, never unresolved when
+//!   known. Environment variable names may not start with `$`.
 //! * Lookup order: active project environment, then Global. Disabled
 //!   variables are skipped.
 //! * Values may reference other variables up to depth 3. A reference that
 //!   would recurse deeper, or that is part of a cycle, is left as literal text.
 //! * Unresolved references are left verbatim and reported.
 
+use crate::dynamic::DynamicCtx;
 use crate::model::{Environment, Variable};
 use serde::Serialize;
 
@@ -138,10 +142,29 @@ impl VarScope {
             .any(|n| self.lookup(n).is_some_and(|(v, _)| v.secret))
     }
 
-    /// Resolve all references in `text`.
+    /// Resolve all references in `text`. Dynamic variables get fresh values;
+    /// use [`VarScope::resolve_in`] to share them across several calls.
     pub fn resolve(&self, text: &str, opts: ResolveOptions, unresolved: &mut Unresolved) -> String {
+        self.resolve_in(text, opts, unresolved, &DynamicCtx::new())
+    }
+
+    /// Resolve all references in `text`; `{{$name}}` takes its value from
+    /// `dynamic` (one value per name for every call sharing it).
+    pub fn resolve_in(
+        &self,
+        text: &str,
+        opts: ResolveOptions,
+        unresolved: &mut Unresolved,
+        dynamic: &DynamicCtx,
+    ) -> String {
         let mut stack = Vec::new();
-        self.resolve_inner(text, opts, unresolved, &mut stack, 0)
+        let mut cx = Cx {
+            opts,
+            unresolved,
+            stack: &mut stack,
+            dynamic,
+        };
+        self.resolve_inner(text, &mut cx, 0)
             .unwrap_or_else(|_| text.to_string())
     }
 
@@ -153,14 +176,7 @@ impl VarScope {
     }
 
     // Err(()) signals a cycle: the caller leaves its reference literal.
-    fn resolve_inner(
-        &self,
-        text: &str,
-        opts: ResolveOptions,
-        unresolved: &mut Unresolved,
-        stack: &mut Vec<String>,
-        depth: usize,
-    ) -> Result<String, ()> {
+    fn resolve_inner(&self, text: &str, cx: &mut Cx<'_>, depth: usize) -> Result<String, ()> {
         if !text.contains("{{") {
             return Ok(text.to_string());
         }
@@ -170,19 +186,31 @@ impl VarScope {
             out.push_str(&rest[..found.start]);
             let literal = &rest[found.start..found.end];
             let name = found.name;
+            if name.starts_with('$') {
+                match cx.dynamic.value(name) {
+                    Some(_) if cx.dynamic.keeps() => out.push_str(literal),
+                    Some(v) => out.push_str(&v),
+                    None => {
+                        cx.unresolved.add(name);
+                        out.push_str(literal);
+                    }
+                }
+                rest = &rest[found.end..];
+                continue;
+            }
             match self.lookup(name) {
                 None => {
-                    unresolved.add(name);
+                    cx.unresolved.add(name);
                     out.push_str(literal);
                 }
-                Some((var, _)) if var.secret && opts.keep_secrets => out.push_str(literal),
-                Some(_) if stack.iter().any(|s| s == name) => return Err(()),
+                Some((var, _)) if var.secret && cx.opts.keep_secrets => out.push_str(literal),
+                Some(_) if cx.stack.iter().any(|s| s == name) => return Err(()),
                 Some(_) if depth > MAX_DEPTH => out.push_str(literal),
                 Some((var, _)) => {
-                    stack.push(name.to_string());
+                    cx.stack.push(name.to_string());
                     let value = var.value.clone();
-                    let resolved = self.resolve_inner(&value, opts, unresolved, stack, depth + 1);
-                    stack.pop();
+                    let resolved = self.resolve_inner(&value, cx, depth + 1);
+                    cx.stack.pop();
                     match resolved {
                         Ok(v) => out.push_str(&v),
                         Err(()) if depth == 0 => {
@@ -200,6 +228,14 @@ impl VarScope {
     }
 }
 
+/// State threaded through one top-level resolve.
+struct Cx<'a> {
+    opts: ResolveOptions,
+    unresolved: &'a mut Unresolved,
+    stack: &'a mut Vec<String>,
+    dynamic: &'a DynamicCtx,
+}
+
 struct Found<'a> {
     start: usize,
     end: usize,
@@ -210,6 +246,12 @@ fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
 }
 
+/// `\$?[A-Za-z0-9_.-]+`: a leading `$` marks a dynamic variable.
+pub fn is_valid_reference_name(name: &str) -> bool {
+    let rest = name.strip_prefix('$').unwrap_or(name);
+    !rest.is_empty() && rest.chars().all(is_name_char)
+}
+
 fn find_reference(text: &str) -> Option<Found<'_>> {
     let mut search_from = 0;
     while let Some(rel) = text[search_from..].find("{{") {
@@ -218,7 +260,7 @@ fn find_reference(text: &str) -> Option<Found<'_>> {
         let close_rel = text[inner_start..].find("}}")?;
         let inner = &text[inner_start..inner_start + close_rel];
         let name = inner.trim();
-        if !name.is_empty() && name.chars().all(is_name_char) {
+        if is_valid_reference_name(name) {
             return Some(Found {
                 start,
                 end: inner_start + close_rel + 2,
@@ -257,6 +299,7 @@ mod tests {
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
+            extra: Default::default(),
         }
     }
 
@@ -361,5 +404,85 @@ mod tests {
         assert!(u.is_empty());
         assert!(s.references_secret("{{ tok }}"));
         assert!(!s.references_secret("{{h}}"));
+    }
+
+    #[test]
+    fn dynamic_names_are_references_and_generated() {
+        let s = VarScope::empty();
+        let (out, missing) = s.resolve_simple("id={{ $uuid }}");
+        assert!(missing.is_empty());
+        let id = out.strip_prefix("id=").unwrap();
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{out}");
+        // `$` only as the first character
+        assert_eq!(s.resolve_simple("{{a$b}}").0, "{{a$b}}");
+        assert_eq!(s.resolve_simple("{{$}}").0, "{{$}}");
+        assert_eq!(s.resolve_simple("{{$$uuid}}").0, "{{$$uuid}}");
+        assert_eq!(references("{{$uuid}} {{x}}"), vec!["$uuid", "x"]);
+    }
+
+    #[test]
+    fn dynamic_values_are_stable_within_one_ctx() {
+        let g = env("g", "G", vec![Variable::new("id", "{{$uuid}}")]);
+        let s = VarScope::new(None, Some(&g));
+        let ctx = DynamicCtx::new();
+        let mut u = Unresolved::default();
+        let a = s.resolve_in(
+            "{{$uuid}}/{{$uuid}}",
+            ResolveOptions::default(),
+            &mut u,
+            &ctx,
+        );
+        let (x, y) = a.split_once('/').unwrap();
+        assert_eq!(x, y);
+        // nested through an env var, and across calls
+        let b = s.resolve_in(
+            "{{id}}",
+            ResolveOptions { keep_secrets: true },
+            &mut u,
+            &ctx,
+        );
+        assert_eq!(b, x);
+        assert!(u.is_empty());
+        // a new ctx draws a new value
+        let c = s.resolve_in(
+            "{{$uuid}}",
+            ResolveOptions::default(),
+            &mut u,
+            &DynamicCtx::new(),
+        );
+        assert_ne!(c, x);
+    }
+
+    #[test]
+    fn dynamic_keep_mode_leaves_literal() {
+        let s = VarScope::empty();
+        let mut u = Unresolved::default();
+        let out = s.resolve_in(
+            "{{ $randomEmail }} {{$nope}}",
+            ResolveOptions::default(),
+            &mut u,
+            &DynamicCtx::keep(),
+        );
+        assert_eq!(out, "{{ $randomEmail }} {{$nope}}");
+        assert_eq!(u.names(), ["$nope".to_string()]);
+    }
+
+    #[test]
+    fn unknown_dynamic_and_missing_vars_untouched() {
+        let s = VarScope::empty();
+        let (out, missing) = s.resolve_simple("{{$randomEmial}}-{{host}}-{{$randomInt}}");
+        assert!(out.starts_with("{{$randomEmial}}-{{host}}-"), "{out}");
+        assert!(out.rsplit('-').next().unwrap().parse::<u32>().is_ok());
+        assert_eq!(
+            missing,
+            vec!["$randomEmial".to_string(), "host".to_string()]
+        );
+    }
+
+    #[test]
+    fn env_vars_named_with_dollar_are_never_looked_up() {
+        let g = env("g", "G", vec![Variable::new("$uuid", "fixed")]);
+        let s = VarScope::new(None, Some(&g));
+        assert_ne!(s.resolve_simple("{{$uuid}}").0, "fixed");
     }
 }

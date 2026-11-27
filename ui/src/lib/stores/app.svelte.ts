@@ -22,11 +22,12 @@ import {
 } from "../api";
 import { copyText } from "../api/platform";
 import { indexTree, ancestorsOf, type TreeIndex } from "../util/tree";
-import { makeLookup } from "../util/vars";
-import { looksLikeCurl, requestFingerprint, scratchRequest } from "../util/request";
+import { makeLookup, setDynamicCatalogue } from "../util/vars";
+import { isContainerReadOnly, isReadOnlyNewer, looksLikeCurl, NEEDS_NEWER_VERSION, requestFingerprint, scratchRequest } from "../util/request";
 import { ulid } from "../util/ulid";
 import { urlToParams, paramsToUrl } from "../util/urlx";
 import { prettyJson } from "../util/json";
+import { RESTORED_NOTICE } from "../util/format";
 import { toasts } from "./toasts.svelte";
 import { ui } from "./ui.svelte";
 
@@ -67,6 +68,7 @@ const defaultSync: SyncStatus = {
   retryAttempt: 0,
   pendingChanges: 0,
   skippedEntities: [],
+  unsupportedEntities: [],
   warning: null,
 };
 
@@ -74,6 +76,8 @@ class AppStore {
   ready = $state(false);
   fatal = $state<string | null>(null);
   platform = $state("macos");
+  /** This build's version (Bootstrap.appVersion), for `minClientVersion` checks. */
+  appVersion = $state("0.1.0");
   workspaceName = $state("My Workspace");
   settings = $state<Settings>({
     theme: "system",
@@ -120,9 +124,15 @@ class AppStore {
   isScratch = $derived(this.request.collectionId === "");
   fingerprint = $derived(requestFingerprint(this.request));
   dirty = $derived(!this.isScratch && this.savedFingerprint !== null && this.fingerprint !== this.savedFingerprint);
+  /**
+   * The open request came from a newer ReqHarbor: view only, never saved or sent (AC-FWD-3/4).
+   * The saved copy decides too, so an editor copy that lost `kind` / `body.type` can't unlock it.
+   */
+  readOnly = $derived(isReadOnlyNewer(this.request, this.appVersion) || (!this.isScratch && this.isReadOnly(this.request.id)));
   currentResponse = $derived(this.responses[this.request.id] ?? null);
   currentInflight = $derived(this.inflight[this.request.id] ?? null);
-  skippedIds = $derived(new Set(this.sync.skippedEntities.map((s) => s.id)));
+  /** Not-synced items by id, with the reason (`SkippedEntity.reason`). */
+  skippedReasons = $derived(new Map(this.sync.skippedEntities.map((s) => [s.id, s.reason] as const)));
   mod = $derived(this.platform === "macos" ? "⌘" : "Ctrl+");
 
   private settingsTimer: ReturnType<typeof setTimeout> | null = null;
@@ -136,9 +146,11 @@ class AppStore {
       await listen("sync://changed", (r) => {
         void this.reloadAll();
         for (const c of r.conflicts) toasts.warning(`Sync conflict: kept your edit as “${c.name}”`);
+        if (r.restored) toasts.info(RESTORED_NOTICE);
       });
       const b = await call("bootstrap", {});
       this.platform = b.platform;
+      if (b.appVersion) this.appVersion = b.appVersion;
       this.workspaceName = b.workspace.name;
       this.settings = b.settings;
       this.projects = b.projects;
@@ -149,7 +161,7 @@ class AppStore {
       this.exportKeepVariables = !!extra.exportKeepVariables;
       const pid = b.projects.find((p) => p.id === b.settings.activeProjectId)?.id ?? b.projects[0]?.id ?? null;
       this.activeProjectId = pid;
-      await Promise.all([this.loadTree(), this.loadVariables(), this.loadHistory()]);
+      await Promise.all([this.loadTree(), this.loadVariables(), this.loadHistory(), this.loadDynamicVariables()]);
       const last = b.settings.lastOpenedRequestId;
       if (last && this.index?.requestById.has(last)) this.openRequest(last, { reveal: true });
       for (const c of b.corruptFiles) {
@@ -186,6 +198,8 @@ class AppStore {
     if (t.project.id !== this.activeProjectId) return;
     this.tree = t;
     this.projects = this.projects.map((p) => (p.id === t.project.id ? t.project : p));
+    /** Unsaved edits of requests that a newer ReqHarbor changed underneath us (AC-FWD-3). */
+    const lost: { draft: Request; saved: Request }[] = [];
     // Keep the open saved request's baseline in sync (rename/move change it).
     if (!this.isScratch) {
       const saved = t.requests.find((r) => r.id === this.request.id);
@@ -193,6 +207,15 @@ class AppStore {
         // deleted underneath us → becomes a scratch
         this.request = { ...this.request, collectionId: "", folderId: null };
         this.savedFingerprint = null;
+      } else if (isReadOnlyNewer(saved, this.appVersion)) {
+        // A sync pull turned it into a request from a newer ReqHarbor: switch the editor to the
+        // view-only saved copy. Unsaved edits can't be applied to it; they are offered as a copy.
+        if (this.dirty && !isReadOnlyNewer(this.request, this.appVersion)) {
+          lost.push({ draft: $state.snapshot(this.request) as Request, saved });
+        }
+        this.request = structuredClone(saved);
+        this.savedFingerprint = requestFingerprint(saved);
+        this.sendBlocked = null;
       } else {
         const wasDirty = this.dirty;
         if (!wasDirty) {
@@ -206,13 +229,62 @@ class AppStore {
         }
       }
     }
-    const ids = new Set(t.requests.map((r) => r.id));
-    const d = Object.fromEntries(Object.entries(this.drafts).filter(([id]) => ids.has(id)));
+    const byId = new Map(t.requests.map((r) => [r.id, r]));
+    const d = Object.fromEntries(
+      Object.entries(this.drafts).filter(([id, draft]) => {
+        const saved = byId.get(id);
+        if (!saved) return false;
+        if (!isReadOnlyNewer(saved, this.appVersion)) return true;
+        if (!isReadOnlyNewer(draft, this.appVersion)) lost.push({ draft, saved });
+        return false;
+      }),
+    );
     if (Object.keys(d).length !== Object.keys(this.drafts).length) this.drafts = d;
+    this.offerDraftCopies(lost);
+  }
+
+  /** Drafts dropped because their request became read-only: one persistent toast offering copies. */
+  private offerDraftCopies(lost: { draft: Request; saved: Request }[]) {
+    if (!lost.length) return;
+    const msg =
+      lost.length === 1
+        ? `“${lost[0].saved.name}” was changed with a newer version of ReqHarbor and is now read-only here. Your unsaved edits weren't applied.`
+        : `${lost.length} requests were changed with a newer version of ReqHarbor and are now read-only here. Your unsaved edits weren't applied.`;
+    toasts.warning(msg, {
+      actionLabel: lost.length === 1 ? "Save my edits as a copy" : "Save my edits as copies",
+      action: () => void this.saveDraftCopies(lost),
+      timeout: 0,
+    });
+  }
+
+  private async saveDraftCopies(lost: { draft: Request; saved: Request }[]) {
+    let last: Request | null = null;
+    try {
+      for (const { draft, saved } of lost) {
+        const request: Request = { ...draft, name: `${draft.name || saved.name} (my edits)` };
+        last = await call("create_request", { collectionId: saved.collectionId, folderId: saved.folderId, request });
+      }
+    } catch (e) {
+      this.reportError(e);
+    }
+    await this.loadTree();
+    if (last) {
+      this.openRequest(last.id, { reveal: true });
+      toasts.success(lost.length === 1 ? `Saved your edits as “${last.name}”` : `Saved your edits as ${lost.length} copies`);
+    }
   }
 
   async loadVariables() {
     this.variables = await call("get_variables", { projectId: this.activeProjectId });
+  }
+
+  /** `{{$name}}` catalogue (AC-ENV-8); the built-in copy stays if this fails. */
+  async loadDynamicVariables() {
+    try {
+      setDynamicCatalogue(await call("get_dynamic_variables", {}));
+    } catch {
+      /* keep the built-in catalogue */
+    }
   }
 
   async loadHistory() {
@@ -288,6 +360,25 @@ class AppStore {
     }
   }
 
+  /** Saved request `id` (or the given request) is from a newer ReqHarbor. */
+  isReadOnly(r: string | Request): boolean {
+    const req = typeof r === "string" ? this.index?.requestById.get(r) : r;
+    return !!req && isReadOnlyNewer(req, this.appVersion);
+  }
+
+  /** A collection or folder of the open project carries a newer `minClientVersion` (AC-FWD-4). */
+  isContainerReadOnly(kind: "collection" | "folder", id: string): boolean {
+    const e = kind === "collection" ? this.index?.collectionById.get(id) : this.index?.folderById.get(id);
+    return isContainerReadOnly(e, this.appVersion);
+  }
+
+  /** Guard for request mutations: explains and returns true when `id` is read-only. */
+  private refuseReadOnly(id: string): boolean {
+    if (!this.isReadOnly(id)) return false;
+    toasts.info(`${NEEDS_NEWER_VERSION}. Update ReqHarbor to edit it.`);
+    return true;
+  }
+
   // ───────────── editor ─────────────
   private stashDraft() {
     if (this.isScratch) return;
@@ -353,6 +444,10 @@ class AppStore {
 
   async save(): Promise<void> {
     if (this.middle.kind !== "request") return;
+    if (this.readOnly) {
+      toasts.info(`${NEEDS_NEWER_VERSION}. Update ReqHarbor to edit it.`);
+      return;
+    }
     if (this.isScratch) {
       ui.picker = { kind: "saveRequest" };
       return;
@@ -396,6 +491,10 @@ class AppStore {
 
   async send() {
     const req = $state.snapshot(this.request) as Request;
+    if (this.readOnly) {
+      this.sendBlocked = NEEDS_NEWER_VERSION;
+      return;
+    }
     if (!req.url.trim()) {
       this.sendBlocked = "Enter a URL";
       return;
@@ -439,7 +538,8 @@ class AppStore {
       if (res.response) void this.fetchBody(view);
     } catch (e) {
       const err = toCommandError(e);
-      if (err.code === "validation") {
+      if (err.code === "read_only_newer") this.sendBlocked = NEEDS_NEWER_VERSION;
+      else if (err.code === "validation") {
         const d = err.details as { kind?: string; message?: string } | undefined;
         this.sendBlocked =
           d?.kind === "invalidGraphqlVariables" ? "Fix GraphQL variables" : d?.kind === "emptyUrl" ? "Enter a URL" : err.message;
@@ -567,7 +667,7 @@ class AppStore {
     this.formatError = null;
     try {
       if (b.type === "json" || b.type === "xml") {
-        b.text = await call("format_body", { kind: b.type, text: b.text ?? "" });
+        b.text = await call("format_body", { kind: b.type as "json" | "xml", text: b.text ?? "" });
       } else if (b.type === "graphql" && b.graphql) {
         b.graphql.variables = await call("format_body", { kind: "json", text: b.graphql.variables || "{}" });
       }
@@ -684,6 +784,7 @@ class AppStore {
         await call("rename_folder", { folderId: id, name: n });
         await this.loadTree();
       } else if (kind === "request") {
+        if (this.refuseReadOnly(id)) return;
         await call("rename_request", { requestId: id, name: n });
         if (this.request.id === id) this.request.name = n;
         if (this.drafts[id]) this.drafts = { ...this.drafts, [id]: { ...this.drafts[id], name: n } };
@@ -702,6 +803,7 @@ class AppStore {
   }
 
   async duplicate(kind: "collection" | "folder" | "request", id: string) {
+    if (kind === "request" && this.refuseReadOnly(id)) return;
     try {
       if (kind === "collection") this.setTree(await call("duplicate_collection", { collectionId: id }));
       else if (kind === "folder") this.setTree(await call("duplicate_folder", { folderId: id }));
@@ -748,6 +850,7 @@ class AppStore {
   }
 
   async moveNode(kind: "collection" | "folder" | "request", id: string, targetCollectionId: string | null, targetFolderId: string | null, index: number) {
+    if (kind === "request" && this.refuseReadOnly(id)) return;
     try {
       const t = await call("move_node", { kind, id, targetCollectionId, targetFolderId, index });
       this.setTree(t);
@@ -869,7 +972,9 @@ class AppStore {
   // ───────────── misc ─────────────
   reportError(e: unknown) {
     const err: CommandError = toCommandError(e);
-    toasts.error(err.message);
+    // AC-FWD-3: a refusal to touch a request from a newer ReqHarbor is an explanation, not a failure.
+    if (err.code === "read_only_newer") toasts.info(err.message);
+    else toasts.error(err.message);
   }
 }
 

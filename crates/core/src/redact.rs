@@ -116,6 +116,7 @@ mod tests {
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
+            extra: Default::default(),
         };
         let r = Redactor::from_scope(&VarScope::new(None, Some(&env)));
         assert_eq!(r.redact("x=a b\"c&d"), "x={{tok}}");

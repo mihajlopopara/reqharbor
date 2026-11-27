@@ -3508,6 +3508,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "quick-xml 0.42.0",
+ "rand",
  "rcgen",
  "reqwest",
  "rustls",
@@ -3521,6 +3522,7 @@ dependencies = [
  "tokio-util",
  "ulid",
  "url",
+ "uuid",
  "wiremock",
 ]
 

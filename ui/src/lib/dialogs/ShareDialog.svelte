@@ -24,7 +24,10 @@
   async function loadPreview() {
     try {
       preview = await call("share_preview", { kind, entityId, includeCredentials, environmentId: environmentId || null });
+      error = null;
     } catch (e) {
+      // e.g. read_only_newer: an item from a newer ReqHarbor can only be shared with credentials.
+      preview = null;
       error = toCommandError(e).message;
     }
   }
@@ -85,7 +88,7 @@
   }
 </script>
 
-<Dialog title="Share “{name}”" width={520} testid="share-dialog" footer={needsSync ? undefined : shareFooter} onclose={close} onsubmit={() => !needsSync && !busy && void create()}>
+<Dialog title="Share “{name}”" width={520} testid="share-dialog" footer={needsSync ? undefined : shareFooter} onclose={close} onsubmit={() => !needsSync && !busy && preview && void create()}>
   {#if needsSync}
     <div class="empty" data-testid="share-needs-sync">
       <Icon name="cloud-off" />
@@ -166,7 +169,7 @@
       <span class="grow"></span>
     {/if}
     <button class="btn btn-secondary" type="button" onclick={close}>Close</button>
-    <button class="btn btn-primary" type="button" disabled={busy} onclick={create} data-testid="share-create">{existing ? "Update share" : "Create link"}</button>
+    <button class="btn btn-primary" type="button" disabled={busy || !preview} onclick={create} data-testid="share-create">{existing ? "Update share" : "Create link"}</button>
 {/snippet}
 
 <style>

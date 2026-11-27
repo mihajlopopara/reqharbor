@@ -27,6 +27,7 @@ fn env(id: &str, project: Option<&str>, vars: Vec<Variable>) -> Environment {
         sort_order: 0,
         created_at: 0,
         updated_at: 0,
+        extra: Default::default(),
     }
 }
 

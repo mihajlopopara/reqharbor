@@ -1,6 +1,7 @@
 <script lang="ts">
-  import type { Auth, AuthType, Collection } from "../api/types";
+  import type { Auth, AuthType, Collection, KnownAuthType } from "../api/types";
   import type { VarLookup } from "../util/vars";
+  import { isKnownAuth } from "../util/request";
   import VarInput from "./VarInput.svelte";
   import Icon from "./Icon.svelte";
 
@@ -23,15 +24,18 @@
     oneditcollection?: () => void;
   } = $props();
 
-  const TYPES: { v: AuthType; label: string }[] = [
+  const TYPES: { v: KnownAuthType; label: string }[] = [
     { v: "none", label: "None" },
     { v: "inherit", label: "Inherit" },
     { v: "basic", label: "Basic" },
     { v: "bearer", label: "Bearer" },
     { v: "apikey", label: "API Key" },
   ];
-  const LABEL: Record<AuthType, string> = { none: "None", inherit: "Inherit", basic: "Basic", bearer: "Bearer", apikey: "API Key" };
+  const LABEL: Record<KnownAuthType, string> = { none: "None", inherit: "Inherit", basic: "Basic", bearer: "Bearer", apikey: "API Key" };
+  const label = (t: AuthType) => (LABEL as Record<string, string>)[t] ?? t;
   let showSecret = $state(false);
+  /** AC-FWD-3: a scheme (or API key location) from a newer ReqHarbor can't be edited here. */
+  const unknown = $derived(!isKnownAuth(auth));
 
   function setType(t: AuthType) {
     auth.type = t;
@@ -48,7 +52,10 @@
   <label class="field type">
     <span>Type</span>
     <span class="select-wrap">
-    <select class="input" value={auth.type} onchange={(e) => setType(e.currentTarget.value as AuthType)} data-testid="auth-type">
+    <select class="input" value={auth.type} disabled={unknown} onchange={(e) => setType(e.currentTarget.value as AuthType)} data-testid="auth-type">
+      {#if unknown && !TYPES.some((t) => t.v === auth.type)}
+        <option value={auth.type}>{auth.type}</option>
+      {/if}
       {#each TYPES.filter((t) => allowInherit || t.v !== "inherit") as t (t.v)}
         <option value={t.v}>{t.label}</option>
       {/each}
@@ -59,12 +66,19 @@
     <div class="hint"><Icon name="info" />An Authorization header in Headers overrides this.</div>
   {/if}
 
-  {#if auth.type === "none"}
+  {#if unknown}
+    <div class="hint warn" role="status" data-testid="auth-needs-newer">
+      <Icon name="alert" />This auth (“{auth.type === "apikey" ? `API key in ${auth.apiKey?.in}` : auth.type}”) was set up with a newer version of ReqHarbor. It's kept intact but can't be edited here.
+    </div>
+  {:else if auth.type === "none"}
     <p class="faint line">No auth header will be added.</p>
   {:else if auth.type === "inherit"}
     <div class="inherit">
       {#if inheritFrom}
-        <span>Inherits <b>{LABEL[inheritFrom.auth.type]}</b> from {inheritFrom.name}</span>
+        <span>Inherits <b>{label(inheritFrom.auth.type)}</b> from {inheritFrom.name}</span>
+        {#if !isKnownAuth(inheritFrom.auth)}
+          <span class="faint" data-testid="inherit-needs-newer">— needs a newer version of ReqHarbor to send</span>
+        {/if}
       {:else}
         <span class="faint">Inherits the collection's auth once this request is saved to a collection.</span>
       {/if}

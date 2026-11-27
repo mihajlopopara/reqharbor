@@ -18,7 +18,7 @@ ReqHarbor is a native-feeling desktop HTTP client for developers who want Postma
 6. cURL import (paste dialog + auto-detect on paste into URL bar) and cURL export.
 7. OpenAPI import: Swagger 2.0, OpenAPI 3.0 / 3.1 / 3.2, JSON or YAML, file or pasted text.
 8. Projects > Collections > Folders (nested) > Requests: create, rename, duplicate, delete, drag-reorder.
-9. Environments (per-project + one Global) with `{{variables}}`, secret flag, active-env switcher.
+9. Environments (per-project + one Global) with `{{variables}}`, secret flag, active-env switcher; Postman-compatible dynamic variables (`{{$uuid}}`, `{{$randomEmail}}`, …) that generate fake data at send time.
 10. History (Activity tab): last 500 sends, filterable, click to restore.
 11. Local persistence as JSON files in the app data dir; no account required.
 12. Cloudflare Worker: workspace token auth, push/pull sync, share links with a read-only web view.
@@ -26,7 +26,7 @@ ReqHarbor is a native-feeling desktop HTTP client for developers who want Postma
 
 ### 2.2 Later (not in MVP)
 
-Multiple open request tabs; scripting (pre-request/tests); OAuth 1/2, AWS SigV4, Digest, NTLM; GraphQL schema introspection/autocomplete; WebSocket, SSE, gRPC; dynamic variables (`{{$uuid}}`, `{{$timestamp}}`); collection runner; Postman/Insomnia/Thunder import; HAR import; code generation beyond cURL; OS keychain for tokens; real-time collaboration and multi-user permissions; deep link `reqharbor://` to import shares; proxy and client-certificate settings; Windows `cmd` (`^`) and PowerShell cURL dialects.
+Multiple open request tabs; scripting (pre-request/tests); OAuth 1/2, AWS SigV4, Digest, NTLM; GraphQL schema introspection/autocomplete; WebSocket, SSE, gRPC; collection runner; Postman/Insomnia/Thunder import; HAR import; code generation beyond cURL; OS keychain for tokens; real-time collaboration and multi-user permissions; deep link `reqharbor://` to import shares; proxy and client-certificate settings; Windows `cmd` (`^`) and PowerShell cURL dialects.
 
 ## 3. Data model
 
@@ -153,13 +153,16 @@ Entry points: ⌘U dialog; pasting text starting with `curl ` into the URL bar t
 - AC-COL-6: Changes are written to disk within 500 ms (debounced) and survive a force quit; a corrupted project file is renamed `*.corrupt-<ts>.json` and reported, never silently dropped.
 
 ### 5.8 Environments & variables (ENV)
-- AC-ENV-1: `{{name}}` (name matches `[A-Za-z0-9_.-]+`, whitespace inside braces trimmed) resolves in URL, params, headers, auth fields, body text, form values, and file paths.
+- AC-ENV-1: `{{name}}` (name matches `\$?[A-Za-z0-9_.-]+`, whitespace inside braces trimmed) resolves in URL, params, headers, auth fields, body text, form values, and file paths.
 - AC-ENV-2: Resolution order: active project environment, then Global; disabled variables are skipped. Values may reference other variables up to depth 3; cycles leave the literal text.
 - AC-ENV-3: Unresolved variables are highlighted red in editors; sending is allowed, the literal `{{name}}` is sent, and a warning shows in the response strip.
 - AC-ENV-4: Hovering a resolved variable shows its value and source environment (secret values masked until clicked).
 - AC-ENV-5: ⌘E opens a quick picker of the current project's environments plus "No environment"; selection persists per project.
 - AC-ENV-6: Env tab supports create/rename/duplicate/delete environments and editing variables in a key/value grid with enabled and secret toggles.
 - AC-ENV-7: Secret values are never synced, shared, or written to history; they stay only in local `environments.json`.
+- AC-ENV-8: `{{$name}}` (a leading `$`) is a dynamic variable: a value generated at send time from a built-in catalogue of ~45 Postman-compatible generators (`$uuid`, `$guid`, `$timestamp`, `$isoTimestamp`, `$randomInt`, `$randomEmail`, `$randomFullName`, `$randomIP`, `$randomPrice`, `$randomLoremSentence`, `$randomDatePast`, …). It resolves everywhere AC-ENV-1 does, including inside environment values. One value per name per send: two `{{$uuid}}` in one request agree, and the URL in history is the URL that was sent. A new send draws new values. Known dynamic variables never count as unresolved; an unknown `{{$name}}` is sent literally and reported like AC-ENV-3. Environment variable names may not start with `$` (the Env editor and the store reject them). cURL export with "Keep {{variables}}" leaves `{{$name}}` literal, without it generates one value per name for the whole command. Share pages show `{{$name}}` literally.
+- AC-ENV-9: Dynamic variables have their own highlight colour (`--var-dynamic-fg`); hovering one shows "Random email · e.g. jane.doe@example.com · new value each send". Typing `{{` in the URL bar, key/value cells, form fields and body editors opens autocomplete: environment variables first (value · source), then the `$` catalogue (description); prefix matches rank first; Enter/Tab accepts, Esc closes.
+- AC-ENV-10: JSON, XML, Text and GraphQL-variables editors have "Insert fake data" next to Format: a menu of the catalogue that inserts `{{$name}}` at the caret.
 
 ### 5.9 History (HIST)
 - AC-HIST-1: Every send (success, error, or cancel) appends a history entry; the newest 500 are kept.
@@ -179,7 +182,7 @@ Entry points: ⌘U dialog; pasting text starting with `curl ` into the URL bar t
 
 ### 5.11 Sharing (SHARE)
 - AC-SHARE-1: "Share…" on a collection or request (requires sync connection) uploads an immutable snapshot and copies the share URL.
-- AC-SHARE-2: Before sharing, a dialog lists what will be stripped: secret variables are always removed; Authorization/Cookie headers and Auth tab values are replaced by `{{placeholder}}` unless "Include credentials" is checked. Optionally an environment (non-secret variables only) can be attached.
+- AC-SHARE-2: Before sharing, a dialog lists what will be stripped: secret variables are always removed; Authorization/Cookie headers and Auth tab values are replaced by `{{placeholder}}` unless "Include credentials" is checked. Without credentials, fields this version doesn't know are left out too (a newer ReqHarbor may keep secrets there), and an item made with a newer ReqHarbor can only be shared with "Include credentials" checked. Optionally an environment (non-secret variables only) can be attached.
 - AC-SHARE-3: The share URL opens a read-only web page with the collection tree, method badges, URLs, headers, and bodies, and a "Copy as cURL" button per request. No editing is possible.
 - AC-SHARE-4: "Update share" replaces the snapshot behind the same URL; "Revoke" makes the URL return 410 Gone.
 - AC-SHARE-5: "Import from link" in the app accepts a share URL and creates a copy in the current project (new IDs).
@@ -245,6 +248,8 @@ Auth: `Authorization: Bearer <token>`. Token = 32 random bytes, base64url, prefi
 | `GET /s/:shareId.json` | public | Snapshot JSON (used by "Import from link") |
 
 `Change = { type, id, updatedAt, deleted: bool, data: object|null, rev? }`. The server assigns a per-workspace monotonically increasing `rev`; `cursor` is the highest `rev` seen. A push whose `updatedAt` is older than the stored one returns `stale` with the current server copy included in the next pull.
+
+Self-hosted servers (accounts plan, `06-go-server.md` §9) add two things the client honours with any server: a pull page (and `GET /v1/server`) may carry `syncEpoch`; when it changes, or a pull returns a `cursor` below the `since` that was sent, the server was restored from a backup, so the client re-pulls from 0 and re-sends everything (LWW makes this idempotent). `GET /v1/server` may list `sync.types`; the client pushes only those types and keeps the others local-only with a notice ("N items aren't synced because this server is older than your app…"). The Worker has neither: a 404 means the five base types.
 
 Share semantics: `shareId` is 128 bits of randomness, base62 (unguessable; possession = read access). The snapshot is built and sanitized by the client (§5.11), contains `schemaVersion`, the entity tree, and an optional environment, and is immutable until `PUT`. Revoked shares return 410. Shared pages send `X-Robots-Tag: noindex`, a strict CSP, no cookies, and `Cache-Control: public, max-age=60`. The HTML view is server-rendered with no client framework; its "Copy as cURL" uses a small TS port of the §5.5 exporter.
 

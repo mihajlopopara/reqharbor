@@ -175,6 +175,9 @@
   --var-bg: rgba(121, 192, 255, 0.13);
   --var-unresolved-fg: #ff7b72;
   --var-unresolved-bg: rgba(255, 123, 114, 0.15);
+  /* {{$dynamic}} variables: a generated value each send (AC-ENV-8) */
+  --var-dynamic-fg: #d2a8ff;
+  --var-dynamic-bg: rgba(210, 168, 255, 0.14);
 
   /* Syntax (CodeMirror) */
   --syn-key: #9cc8ff;
@@ -262,6 +265,8 @@
   --var-bg: rgba(11, 98, 196, 0.1);
   --var-unresolved-fg: #b0281f;
   --var-unresolved-bg: rgba(196, 49, 42, 0.1);
+  --var-dynamic-fg: #7a3fd1;
+  --var-dynamic-bg: rgba(122, 63, 209, 0.1);
 
   --syn-key: #1b5fa6;
   --syn-string: #2b6e1f;
@@ -344,6 +349,8 @@
     --var-bg: rgba(11, 98, 196, 0.1);
     --var-unresolved-fg: #b0281f;
     --var-unresolved-bg: rgba(196, 49, 42, 0.1);
+    --var-dynamic-fg: #7a3fd1;
+    --var-dynamic-bg: rgba(122, 63, 209, 0.1);
 
     --syn-key: #1b5fa6;
     --syn-string: #2b6e1f;

@@ -12,7 +12,10 @@
 //! Sanitising (AC-SHARE-2): secret variables are always removed from the
 //! attached environment; unless "Include credentials" is set, `Authorization`,
 //! `Proxy-Authorization` and `Cookie` header values and Auth tab secrets are
-//! replaced by `{{placeholder}}` variables.
+//! replaced by `{{placeholder}}` variables, and every field this build
+//! doesn't know (`extra`, at every level) is left out, because it can't tell
+//! whether such a field holds a secret. A request or container from a newer
+//! ReqHarbor (AC-FWD-3/4) can only be shared with credentials included.
 
 use crate::model::*;
 use crate::storage::{NodeKind, Store, StoreError};
@@ -68,7 +71,7 @@ fn sanitize_auth(auth: &mut Auth, replace: bool) -> usize {
             }
         }
     };
-    match auth.auth_type {
+    match auth.auth_type.clone() {
         AuthType::Basic => {
             swap(&mut auth.username, "{{username}}");
             swap(&mut auth.password, "{{password}}");
@@ -84,13 +87,96 @@ fn sanitize_auth(auth: &mut Auth, replace: bool) -> usize {
                 }
             }
         }
+        AuthType::Other(_) => {
+            // A scheme from a newer ReqHarbor: this build can't tell which of
+            // its fields are secret, so all of them count as credentials.
+            let has_values = [&auth.username, &auth.password, &auth.token]
+                .iter()
+                .any(|f| f.as_deref().is_some_and(|v| !v.is_empty()))
+                || auth.api_key.as_ref().is_some_and(|k| !k.value.is_empty())
+                || !auth.extra.is_empty();
+            if has_values {
+                n += 1;
+                if replace {
+                    auth.username = None;
+                    auth.password = None;
+                    auth.token = None;
+                    if let Some(k) = auth.api_key.as_mut() {
+                        k.value.clear();
+                        k.extra.clear();
+                    }
+                    auth.extra.clear();
+                }
+            }
+        }
         AuthType::None | AuthType::Inherit => {}
     }
     n
 }
 
+/// Count (and, when `replace`, clear) a block of unknown keys.
+fn strip_extra(extra: &mut Extra, replace: bool) -> usize {
+    if extra.is_empty() {
+        return 0;
+    }
+    if replace {
+        extra.clear();
+    }
+    1
+}
+
+/// Unknown keys of an auth block of a known scheme. (An unknown scheme is
+/// handled as a whole by [`sanitize_auth`].)
+fn strip_auth_extra(auth: &mut Auth, replace: bool) -> usize {
+    if !auth.auth_type.is_known() {
+        return 0;
+    }
+    let mut n = strip_extra(&mut auth.extra, replace);
+    if let Some(k) = auth.api_key.as_mut() {
+        n += strip_extra(&mut k.extra, replace);
+    }
+    n
+}
+
+/// Unknown keys at every level of a request: a newer ReqHarbor may keep
+/// credentials there (say, gRPC metadata or an OAuth refresh token), and this
+/// build can't tell, so each block counts as a credential field.
+fn strip_request_extra(r: &mut Request, replace: bool) -> usize {
+    let mut n = strip_extra(&mut r.extra, replace);
+    n += strip_auth_extra(&mut r.auth, replace);
+    n += strip_extra(&mut r.settings.extra, replace);
+    for kv in r.params.iter_mut().chain(r.headers.iter_mut()) {
+        n += strip_extra(&mut kv.extra, replace);
+    }
+    n += strip_extra(&mut r.body.extra, replace);
+    if let Some(g) = r.body.graphql.as_mut() {
+        n += strip_extra(&mut g.extra, replace);
+    }
+    for kv in r.body.form_encoded.iter_mut().flatten() {
+        n += strip_extra(&mut kv.extra, replace);
+    }
+    for f in r.body.form.iter_mut().flatten() {
+        n += strip_extra(&mut f.extra, replace);
+    }
+    n
+}
+
+/// `ReadOnlyNewer` for a share without credentials that holds an entity
+/// from a newer ReqHarbor: its fields can't be sorted into secret and not.
+fn share_needs_credentials(name: &str) -> StoreError {
+    let name = if name.trim().is_empty() {
+        "An item".to_string()
+    } else {
+        format!("\u{201c}{name}\u{201d}")
+    };
+    StoreError::ReadOnlyNewer(format!(
+        "{name} was made with a newer version of ReqHarbor, so this version can't tell which of its fields are credentials. Turn on Include credentials to share it as it is, or update ReqHarbor."
+    ))
+}
+
 fn sanitize_request(r: &mut Request, replace: bool) -> usize {
     let mut n = sanitize_auth(&mut r.auth, replace);
+    n += strip_request_extra(r, replace);
     for h in &mut r.headers {
         if CREDENTIAL_HEADERS.contains(&h.key.trim().to_ascii_lowercase().as_str())
             && !h.value.is_empty()
@@ -125,8 +211,7 @@ pub fn build_snapshot(
                 .find(|c| c.id == entity_id)
                 .cloned()
                 .ok_or_else(|| StoreError::NotFound(entity_id.into()))?;
-            preview.credential_fields += sanitize_auth(&mut c.auth, replace);
-            let folders: Vec<Folder> = tree
+            let mut folders: Vec<Folder> = tree
                 .folders
                 .iter()
                 .filter(|f| f.collection_id == entity_id)
@@ -138,6 +223,23 @@ pub fn build_snapshot(
                 .filter(|r| r.collection_id == entity_id)
                 .cloned()
                 .collect();
+            if replace {
+                if !c.is_editable() {
+                    return Err(share_needs_credentials(&c.name));
+                }
+                if let Some(f) = folders.iter().find(|f| !f.is_editable()) {
+                    return Err(share_needs_credentials(&f.name));
+                }
+                if let Some(r) = requests.iter().find(|r| !r.is_editable()) {
+                    return Err(share_needs_credentials(&r.name));
+                }
+            }
+            preview.credential_fields += sanitize_auth(&mut c.auth, replace);
+            preview.credential_fields += strip_auth_extra(&mut c.auth, replace);
+            preview.credential_fields += strip_extra(&mut c.extra, replace);
+            for f in &mut folders {
+                preview.credential_fields += strip_extra(&mut f.extra, replace);
+            }
             for r in &mut requests {
                 preview.credential_fields += sanitize_request(r, replace);
             }
@@ -162,6 +264,9 @@ pub fn build_snapshot(
                 .request(entity_id)
                 .cloned()
                 .ok_or_else(|| StoreError::NotFound(entity_id.into()))?;
+            if replace && !r.is_editable() {
+                return Err(share_needs_credentials(&r.name));
+            }
             // Inline the collection auth for Inherit so the share is self-contained.
             if r.auth.auth_type == AuthType::Inherit {
                 r.auth = store
@@ -190,7 +295,19 @@ pub fn build_snapshot(
                 .environment(eid)
                 .ok_or_else(|| StoreError::NotFound(format!("Environment {eid}")))?;
             preview.secret_variables_removed = env.variables.iter().filter(|v| v.secret).count();
-            let vars: Vec<&Variable> = env.variables.iter().filter(|v| !v.secret).collect();
+            let mut vars: Vec<Variable> = env
+                .variables
+                .iter()
+                .filter(|v| !v.secret)
+                .cloned()
+                .collect();
+            for v in &mut vars {
+                let n = strip_extra(&mut v.extra, replace);
+                preview.credential_fields += n;
+                if replace {
+                    preview.credentials_replaced += n;
+                }
+            }
             json!({ "name": env.name, "variables": vars })
         }
         None => Value::Null,
@@ -338,6 +455,7 @@ pub fn import_snapshot_with_warnings(
                 sort_order: 0,
                 created_at: now,
                 updated_at: now,
+                extra: Default::default(),
             };
             let request = Request {
                 id: new_id(),

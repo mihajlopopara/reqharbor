@@ -43,6 +43,9 @@ pub struct SyncStatus {
     pub pending_changes: usize,
     /// Entities not synced because they exceed 512 KB (contract C2).
     pub skipped_entities: Vec<SkippedEntity>,
+    /// Local items of a type this server doesn't accept; they stay
+    /// local-only until the server is updated (06-go-server §9).
+    pub unsupported_entities: Vec<SkippedEntity>,
     /// Non-fatal warning for the sync indicator tooltip, e.g. skipped items.
     pub warning: Option<String>,
 }
@@ -52,6 +55,11 @@ impl SyncStatus {
         let cfg = store.workspace.sync.clone();
         let skipped = if cfg.is_some() {
             sync::skipped_entities(store)
+        } else {
+            Vec::new()
+        };
+        let unsupported = if cfg.is_some() {
+            sync::unsupported_entities(store)
         } else {
             Vec::new()
         };
@@ -70,32 +78,83 @@ impl SyncStatus {
             next_retry_at: None,
             retry_attempt: 0,
             pending_changes: if cfg.is_some() {
-                sync::collect_push(store).len()
+                sync::pending_count(store)
             } else {
                 0
             },
-            warning: skipped_warning(&skipped),
+            warning: sync_warning(&skipped, &unsupported),
             skipped_entities: skipped,
+            unsupported_entities: unsupported,
         }
     }
 }
 
+/// One sentence (no final period) per skip reason, in a fixed order:
 /// "2 items are too large to sync (over 512 KB): Big upload, Fixtures".
+/// The reason is the one the server gave (`invalid_json_value`,
+/// `forbidden_role`, …) or `too_large` for entities over 512 KB.
 pub fn skipped_warning(skipped: &[SkippedEntity]) -> Option<String> {
     if skipped.is_empty() {
         return None;
     }
-    let names: Vec<&str> = skipped.iter().map(|s| s.name.as_str()).collect();
-    let noun = if skipped.len() == 1 {
-        "item is"
-    } else {
-        "items are"
+    let rank = |r: &str| match r {
+        sync::TOO_LARGE => 0,
+        sync::INVALID_JSON_VALUE => 1,
+        sync::FORBIDDEN_ROLE => 2,
+        _ => 3,
     };
-    Some(format!(
-        "{} {noun} too large to sync (over 512 KB): {}",
-        skipped.len(),
-        names.join(", ")
-    ))
+    let mut reasons: Vec<&str> = Vec::new();
+    for s in skipped {
+        if !reasons.contains(&s.reason.as_str()) {
+            reasons.push(&s.reason);
+        }
+    }
+    reasons.sort_by_key(|r| (rank(r), *r));
+    let parts: Vec<String> = reasons
+        .into_iter()
+        .map(|reason| {
+            let items: Vec<&SkippedEntity> =
+                skipped.iter().filter(|s| s.reason == reason).collect();
+            let names: Vec<&str> = items.iter().map(|s| s.name.as_str()).collect();
+            let n = items.len();
+            let one = n == 1;
+            let head = match reason {
+                sync::TOO_LARGE => format!(
+                    "{n} {} too large to sync (over 512 KB)",
+                    if one { "item is" } else { "items are" }
+                ),
+                sync::INVALID_JSON_VALUE => format!(
+                    "{n} {} synced because the server can't store one of {} values",
+                    if one { "item isn't" } else { "items aren't" },
+                    if one { "its" } else { "their" }
+                ),
+                sync::FORBIDDEN_ROLE => format!(
+                    "{n} {} synced because your role can't change {} on the server",
+                    if one { "item isn't" } else { "items aren't" },
+                    if one { "it" } else { "them" }
+                ),
+                other => format!(
+                    "{n} {} rejected by the server ({other})",
+                    if one { "item was" } else { "items were" }
+                ),
+            };
+            format!("{head}: {}", names.join(", "))
+        })
+        .collect();
+    Some(parts.join(". "))
+}
+
+/// Both warnings for the sync indicator, joined into one sentence block.
+pub fn sync_warning(skipped: &[SkippedEntity], unsupported: &[SkippedEntity]) -> Option<String> {
+    let parts: Vec<String> = [
+        skipped_warning(skipped),
+        sync::unsupported_notice(unsupported.len()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    // The too-large sentence has no final period; the notice has one.
+    (!parts.is_empty()).then(|| parts.join(". "))
 }
 
 /// Focus pull at most once per minute, never while syncing (AC-SYNC-2).
@@ -112,7 +171,13 @@ pub fn begin(s: &mut SyncStatus) {
     s.connected = true;
 }
 
-pub fn on_success(s: &mut SyncStatus, now: i64, pending: usize, skipped: Vec<SkippedEntity>) {
+pub fn on_success(
+    s: &mut SyncStatus,
+    now: i64,
+    pending: usize,
+    skipped: Vec<SkippedEntity>,
+    unsupported: Vec<SkippedEntity>,
+) {
     s.state = SyncState::Idle;
     s.connected = true;
     s.last_sync_at = Some(now);
@@ -121,8 +186,9 @@ pub fn on_success(s: &mut SyncStatus, now: i64, pending: usize, skipped: Vec<Ski
     s.next_retry_at = None;
     s.retry_attempt = 0;
     s.pending_changes = pending;
-    s.warning = skipped_warning(&skipped);
+    s.warning = sync_warning(&skipped, &unsupported);
     s.skipped_entities = skipped;
+    s.unsupported_entities = unsupported;
 }
 
 /// What the runtime must do after a failed sync.
@@ -196,6 +262,7 @@ mod tests {
             retry_attempt: 0,
             pending_changes: 0,
             skipped_entities: vec![],
+            unsupported_entities: vec![],
             warning: None,
         }
     }
@@ -204,7 +271,7 @@ mod tests {
     fn ac_sync_2_focus_pull_at_most_once_per_minute() {
         let mut s = connected();
         assert!(should_pull_on_focus(&s, 1_000));
-        on_success(&mut s, 1_000, 0, vec![]);
+        on_success(&mut s, 1_000, 0, vec![], vec![]);
         assert!(!should_pull_on_focus(&s, 30_000));
         assert!(should_pull_on_focus(&s, 61_001));
         begin(&mut s);
@@ -232,7 +299,7 @@ mod tests {
             on_failure(&mut s, &SyncError::Server("503".into()), 0, false),
             FailureAction::Retry(_)
         ));
-        on_success(&mut s, 5, 0, vec![]);
+        on_success(&mut s, 5, 0, vec![], vec![]);
         assert_eq!(s.retry_attempt, 0);
         assert_eq!(s.state, SyncState::Idle);
         assert_eq!(s.next_retry_at, None);
@@ -287,13 +354,72 @@ mod tests {
             name: "Big upload".into(),
             reason: "too_large".into(),
         }];
-        on_success(&mut s, 1, 0, skipped);
+        on_success(&mut s, 1, 0, skipped, vec![]);
         assert_eq!(s.skipped_entities.len(), 1);
         assert_eq!(
             s.warning.as_deref(),
             Some("1 item is too large to sync (over 512 KB): Big upload")
         );
-        on_success(&mut s, 2, 0, vec![]);
+        on_success(&mut s, 2, 0, vec![], vec![]);
         assert!(s.warning.is_none());
+    }
+
+    #[test]
+    fn unsupported_types_surface_as_a_notice() {
+        let item = |t, name: &str, reason: &str| SkippedEntity {
+            entity_type: t,
+            id: name.into(),
+            name: name.into(),
+            reason: reason.into(),
+        };
+        let mut s = connected();
+        let unsupported = vec![
+            item(EntityType::Environment, "Global", "unsupported_type"),
+            item(EntityType::Environment, "Dev", "unsupported_type"),
+        ];
+        on_success(&mut s, 1, 2, vec![], unsupported.clone());
+        assert_eq!(s.unsupported_entities.len(), 2);
+        assert_eq!(
+            s.warning.as_deref(),
+            Some(
+                "2 items aren't synced because this server is older than your app. Ask its admin to update reqharbor-server."
+            )
+        );
+        let big = vec![item(EntityType::Request, "Big", "too_large")];
+        on_success(&mut s, 2, 2, big, unsupported[..1].to_vec());
+        assert_eq!(
+            s.warning.as_deref(),
+            Some(
+                "1 item is too large to sync (over 512 KB): Big. 1 item isn't synced because this server is older than your app. Ask its admin to update reqharbor-server."
+            )
+        );
+        on_success(&mut s, 3, 0, vec![], vec![]);
+        assert!(s.warning.is_none() && s.unsupported_entities.is_empty());
+    }
+
+    #[test]
+    fn skipped_warnings_use_the_servers_reason() {
+        let item = |name: &str, reason: &str| SkippedEntity {
+            entity_type: EntityType::Request,
+            id: name.into(),
+            name: name.into(),
+            reason: reason.into(),
+        };
+        let w = skipped_warning(&[
+            item("Odd", "invalid_json_value"),
+            item("Big", "too_large"),
+            item("Mine", "forbidden_role"),
+            item("X", "future_reason"),
+            item("Odd2", "invalid_json_value"),
+        ])
+        .unwrap();
+        assert_eq!(
+            w,
+            "1 item is too large to sync (over 512 KB): Big. \
+             2 items aren't synced because the server can't store one of their values: Odd, Odd2. \
+             1 item isn't synced because your role can't change it on the server: Mine. \
+             1 item was rejected by the server (future_reason): X"
+        );
+        assert!(!w.contains("too large to sync (over 512 KB): Odd"));
     }
 }

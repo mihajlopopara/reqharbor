@@ -6,6 +6,125 @@ use serde::{Deserialize, Serialize};
 /// File-level schema version written into every persisted JSON file.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// This build's version, compared against an entity's `minClientVersion`
+/// and sent as `X-ReqHarbor-Version` on sync calls.
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Unknown JSON keys preserved on read and written back unchanged
+/// (forward compatibility, AC-FWD-1). Never holds a key the struct itself
+/// declares: serde hands known keys to their fields first.
+pub type Extra = serde_json::Map<String, serde_json::Value>;
+
+/// A string-backed enum whose unknown values (written by a newer ReqHarbor)
+/// are kept verbatim in `Other` and serialized back byte-for-byte.
+macro_rules! open_string_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident = $s:literal, )+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+        pub enum $name {
+            $( $(#[$vmeta])* $variant, )+
+            /// A value this build does not know; round-trips unchanged.
+            Other(String),
+        }
+
+        impl $name {
+            /// The wire string.
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $( $name::$variant => $s, )+
+                    $name::Other(s) => s.as_str(),
+                }
+            }
+            /// Parse a wire string; unknown values become `Other`.
+            pub fn parse(s: &str) -> Self {
+                match s {
+                    $( $s => $name::$variant, )+
+                    other => $name::Other(other.to_string()),
+                }
+            }
+            /// False for `Other` (a value from a newer client).
+            pub fn is_known(&self) -> bool {
+                !matches!(self, $name::Other(_))
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let s = std::borrow::Cow::<'de, str>::deserialize(d)?;
+                Ok($name::parse(&s))
+            }
+        }
+    };
+}
+
+open_string_enum! {
+    /// What a request talks (AC-FWD-2). Only `Http` is editable and sendable
+    /// in this build; the others are reserved for GraphQL, gRPC and WebSocket
+    /// editors. Omitted from JSON when `Http`, so older readers see no change.
+    pub enum RequestKind {
+        #[default]
+        Http = "http",
+        Graphql = "graphql",
+        Grpc = "grpc",
+        Ws = "ws",
+    }
+}
+
+impl RequestKind {
+    pub fn is_http(&self) -> bool {
+        *self == RequestKind::Http
+    }
+}
+
+/// Parse `major.minor.patch` (missing parts are 0; a leading `v` and any
+/// `-pre`/`+build` suffix are ignored).
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.trim().trim_start_matches('v');
+    let core = v.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let mut next = || -> Option<u64> {
+        match parts.next() {
+            None => Some(0),
+            Some(p) => p.parse().ok(),
+        }
+    };
+    let out = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(out)
+}
+
+/// Whether `required` is newer than this build. Unparseable versions count
+/// as newer, so an entity we cannot reason about is never modified.
+pub fn requires_newer_client(required: &str) -> bool {
+    match (parse_version(required), parse_version(CLIENT_VERSION)) {
+        (Some(req), Some(cur)) => req > cur,
+        _ => true,
+    }
+}
+
+/// Whether an entity's unknown keys carry a `minClientVersion` newer than
+/// this build (AC-FWD-4). Containers (projects, collections, folders,
+/// environments) keep the key in `extra`; a value that isn't a string or
+/// `null` counts as newer, so an entity we cannot reason about is never
+/// modified.
+pub fn extra_requires_newer(extra: &Extra) -> bool {
+    match extra.get("minClientVersion") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(v)) => requires_newer_client(v),
+        Some(_) => true,
+    }
+}
+
 /// Generate a new ULID string id.
 pub fn new_id() -> String {
     ulid::Ulid::generate().to_string()
@@ -47,6 +166,8 @@ pub struct Workspace {
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncConfig>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +195,16 @@ pub struct Project {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl Project {
+    /// False when the project carries a `minClientVersion` newer than this
+    /// build (AC-FWD-4): it is read-only here and never pushed modified.
+    pub fn is_editable(&self) -> bool {
+        !extra_requires_newer(&self.extra)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,6 +223,22 @@ pub struct Collection {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl Collection {
+    /// False when the collection's auth comes from a newer ReqHarbor: its
+    /// auth can't be changed here and isn't applied to inheriting requests.
+    pub fn auth_is_known(&self) -> bool {
+        self.auth.is_known()
+    }
+    /// False when the collection carries a `minClientVersion` newer than
+    /// this build (AC-FWD-4): it is read-only here and never pushed
+    /// modified. Unknown auth alone keeps the rest of it editable.
+    pub fn is_editable(&self) -> bool {
+        !extra_requires_newer(&self.extra)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,12 +255,28 @@ pub struct Folder {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl Folder {
+    /// False when the folder carries a `minClientVersion` newer than this
+    /// build (AC-FWD-4).
+    pub fn is_editable(&self) -> bool {
+        !extra_requires_newer(&self.extra)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Request {
     pub id: String,
+    /// `http` unless written by a newer client (AC-FWD-2). Omitted when `http`.
+    #[serde(default, skip_serializing_if = "RequestKind::is_http")]
+    pub kind: RequestKind,
+    /// Oldest ReqHarbor that may edit this request (AC-FWD-4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_client_version: Option<String>,
     /// Owning collection. Empty string for an unsaved "scratch" request.
     #[serde(default)]
     pub collection_id: String,
@@ -141,6 +304,8 @@ pub struct Request {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 fn default_method() -> String {
@@ -151,6 +316,8 @@ impl Default for Request {
     fn default() -> Self {
         Request {
             id: new_id(),
+            kind: RequestKind::Http,
+            min_client_version: None,
             collection_id: String::new(),
             folder_id: None,
             name: String::new(),
@@ -164,7 +331,28 @@ impl Default for Request {
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
+            extra: Extra::new(),
         }
+    }
+}
+
+/// Message shown when a request from a newer ReqHarbor is sent or edited.
+pub const NEEDS_NEWER_VERSION: &str = "This request needs a newer version of ReqHarbor";
+
+impl Request {
+    /// False when this build cannot faithfully edit or send the request: a
+    /// non-HTTP kind, an unknown body type, form field kind, auth scheme or
+    /// API key location, or a `minClientVersion` newer than this build
+    /// (AC-FWD-3/4). Such requests are read-only, are never sent, and a
+    /// locally modified version is never pushed.
+    pub fn is_editable(&self) -> bool {
+        self.kind.is_http()
+            && self.body.is_known()
+            && self.auth.is_known()
+            && !self
+                .min_client_version
+                .as_deref()
+                .is_some_and(requires_newer_client)
     }
 }
 
@@ -178,6 +366,8 @@ pub struct KeyValue {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl KeyValue {
@@ -187,6 +377,7 @@ impl KeyValue {
             value: value.into(),
             enabled: true,
             description: None,
+            extra: Extra::new(),
         }
     }
 
@@ -200,15 +391,17 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthType {
-    #[default]
-    None,
-    Inherit,
-    Basic,
-    Bearer,
-    Apikey,
+open_string_enum! {
+    /// Auth scheme. An unknown value (from a newer client, e.g. `oauth2`) is
+    /// kept in `Other` and makes a request read-only (AC-FWD-3).
+    pub enum AuthType {
+        #[default]
+        None = "none",
+        Inherit = "inherit",
+        Basic = "basic",
+        Bearer = "bearer",
+        Apikey = "apikey",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -224,9 +417,16 @@ pub struct Auth {
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<ApiKeyAuth>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl Auth {
+    /// False when the scheme or the API key location comes from a newer
+    /// ReqHarbor: this build cannot apply or edit such auth faithfully.
+    pub fn is_known(&self) -> bool {
+        self.auth_type.is_known() && self.api_key.as_ref().is_none_or(|k| k.location.is_known())
+    }
     pub fn none() -> Self {
         Auth::default()
     }
@@ -262,6 +462,7 @@ impl Auth {
                 key: key.into(),
                 value: value.into(),
                 location,
+                extra: Extra::new(),
             }),
             ..Auth::default()
         }
@@ -276,28 +477,34 @@ pub struct ApiKeyAuth {
     pub value: String,
     #[serde(rename = "in", default)]
     pub location: ApiKeyLocation,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApiKeyLocation {
-    #[default]
-    Header,
-    Query,
+open_string_enum! {
+    /// Where an API key goes. Unknown values (e.g. `cookie`) round-trip and
+    /// make a request read-only (AC-FWD-3).
+    pub enum ApiKeyLocation {
+        #[default]
+        Header = "header",
+        Query = "query",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BodyType {
-    #[default]
-    None,
-    Json,
-    Xml,
-    Text,
-    Form,
-    FormEncoded,
-    Graphql,
-    Binary,
+open_string_enum! {
+    /// Body editor type. An unknown value (from a newer client) is kept in
+    /// `Other` and makes the request read-only (AC-FWD-3).
+    pub enum BodyType {
+        #[default]
+        None = "none",
+        Json = "json",
+        Xml = "xml",
+        Text = "text",
+        Form = "form",
+        FormEncoded = "formEncoded",
+        Graphql = "graphql",
+        Binary = "binary",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -319,9 +526,16 @@ pub struct Body {
     /// File streamed as the body (body type `binary`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl Body {
+    /// False when the body type or a multipart field kind comes from a newer
+    /// ReqHarbor (AC-FWD-3).
+    pub fn is_known(&self) -> bool {
+        self.body_type.is_known() && self.form.iter().flatten().all(|f| f.kind.is_known())
+    }
     pub fn none() -> Self {
         Body::default()
     }
@@ -355,6 +569,7 @@ impl Body {
             graphql: Some(GraphqlBody {
                 query: query.into(),
                 variables: variables.into(),
+                extra: Extra::new(),
             }),
             ..Body::default()
         }
@@ -380,14 +595,18 @@ pub struct GraphqlBody {
     /// Variables as JSON text, exactly as edited. Empty means "no variables".
     #[serde(default)]
     pub variables: String,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FormFieldKind {
-    #[default]
-    Text,
-    File,
+open_string_enum! {
+    /// Multipart field kind. Unknown values round-trip and make a request
+    /// read-only (AC-FWD-3).
+    pub enum FormFieldKind {
+        #[default]
+        Text = "text",
+        File = "file",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +623,8 @@ pub struct FormField {
     /// Optional part Content-Type (from cURL `;type=` suffixes, AC-CURL-10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl FormField {
@@ -414,6 +635,7 @@ impl FormField {
             kind: FormFieldKind::Text,
             enabled: true,
             content_type: None,
+            extra: Extra::new(),
         }
     }
     pub fn file(key: impl Into<String>, path: impl Into<String>) -> Self {
@@ -423,11 +645,12 @@ impl FormField {
             kind: FormFieldKind::File,
             enabled: true,
             content_type: None,
+            extra: Extra::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestSettings {
     #[serde(default = "default_true")]
@@ -436,6 +659,8 @@ pub struct RequestSettings {
     pub timeout_ms: u64,
     #[serde(default = "default_true")]
     pub verify_tls: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 fn default_timeout() -> u64 {
@@ -448,6 +673,7 @@ impl Default for RequestSettings {
             follow_redirects: true,
             timeout_ms: default_timeout(),
             verify_tls: true,
+            extra: Extra::new(),
         }
     }
 }
@@ -469,6 +695,16 @@ pub struct Environment {
     pub created_at: i64,
     #[serde(default)]
     pub updated_at: i64,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl Environment {
+    /// False when the environment carries a `minClientVersion` newer than
+    /// this build (AC-FWD-4).
+    pub fn is_editable(&self) -> bool {
+        !extra_requires_newer(&self.extra)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,6 +717,8 @@ pub struct Variable {
     pub enabled: bool,
     #[serde(default)]
     pub secret: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl Variable {
@@ -490,6 +728,7 @@ impl Variable {
             value: value.into(),
             enabled: true,
             secret: false,
+            extra: Extra::new(),
         }
     }
     pub fn secret(mut self) -> Self {
@@ -580,6 +819,17 @@ impl EntityType {
             EntityType::Environment => "environment",
         }
     }
+    /// Parse a wire `type`; `None` for types this build does not know.
+    pub fn parse(s: &str) -> Option<EntityType> {
+        Some(match s {
+            "project" => EntityType::Project,
+            "collection" => EntityType::Collection,
+            "folder" => EntityType::Folder,
+            "request" => EntityType::Request,
+            "environment" => EntityType::Environment,
+            _ => return None,
+        })
+    }
     /// Parent-first ordering used when applying pulled changes.
     pub fn depth(&self) -> u8 {
         match self {
@@ -599,6 +849,8 @@ pub struct Tombstone {
     #[serde(rename = "type")]
     pub entity_type: EntityType,
     pub deleted_at: i64,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// One project's file: `projects/<projectId>.json`.
@@ -612,6 +864,22 @@ pub struct ProjectTree {
     pub folders: Vec<Folder>,
     #[serde(default)]
     pub requests: Vec<Request>,
+    /// Unknown file-level keys of `projects/<id>.json` (AC-FWD-1).
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl ProjectTree {
+    /// A project with no children.
+    pub fn new(project: Project) -> Self {
+        ProjectTree {
+            project,
+            collections: Vec::new(),
+            folders: Vec::new(),
+            requests: Vec::new(),
+            extra: Extra::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -36,6 +36,7 @@ impl From<StoreError> for CommandError {
             StoreError::NotFound(_) => "not_found",
             StoreError::Invalid(_) => "invalid",
             StoreError::Io(_) => "io",
+            StoreError::ReadOnlyNewer(_) => "read_only_newer",
         };
         CommandError::new(code, e.to_string())
     }
@@ -43,6 +44,9 @@ impl From<StoreError> for CommandError {
 
 impl From<PrepareError> for CommandError {
     fn from(e: PrepareError) -> Self {
+        if e == PrepareError::NeedsNewerVersion {
+            return CommandError::new("read_only_newer", e.to_string());
+        }
         let mut err = CommandError::new("validation", e.to_string());
         err.details = serde_json::to_value(&e).ok();
         err

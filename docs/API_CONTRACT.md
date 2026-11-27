@@ -26,6 +26,22 @@ Backend: `src-tauri/src/commands.rs` (thin wrappers) over `crates/core` (`reqhar
 | `export_curl` layout: every part on its own line — `curl`, then the method flag (if any), then the URL, then flags, joined with ` \` + newline + two spaces. E.g. `curl \⏎  -X QUERY \⏎  'https://…' \⏎  -H 'Content-Type: application/json' \⏎  --data-raw '{}'`. | §3.7 |
 | `duplicate_project` keeps the active environment (pointing at the copied environment). | §3.2 |
 
+### Forward compatibility (accounts plan M0)
+
+| Change | Where |
+|---|---|
+| Every data object (`Workspace`, `SyncState`, `Project`, `Collection`, `Folder`, `Request`, `Environment`, `Variable`, `KeyValue`, `Auth`, `ApiKeyAuth`, `Body`, `GraphqlBody`, `FormField`, `RequestSettings`) keeps keys it does not know — on disk, over IPC, on the sync wire, in duplicates, imports and conflict copies. `save_request` keeps unknown keys of the stored request that the update lacks. | §2 |
+| `Request` gains `kind?: RequestKind` (`"http"` default, omitted when `"http"`; `"graphql"`, `"grpc"`, `"ws"` or any other string) and `minClientVersion?: string`. `Body.type` accepts any string; unknown values round-trip unchanged. | §2 |
+| New error code `read_only_newer`: the request was made by a newer ReqHarbor and can't be edited or sent here. | §1, §3.3, §3.5 |
+| `Bootstrap` gains `appVersion`. | §3.1 |
+| Sync calls send `X-ReqHarbor-Version: <appVersion>`. Pulled changes of an unknown `type` are skipped without error and kept in `sync-state.json` (`unknownChanges`, capped). | §3.9 |
+| `Auth.type`, `ApiKeyAuth.in` and `FormField.kind` accept any string; unknown values round-trip unchanged and make a request read-only. A collection whose auth is unknown keeps it read-only (`update_collection` refuses auth changes); an inheriting request can't be sent (`validation`, `inheritedAuthNeedsNewerVersion`). | §2, §3.3, §3.5 |
+| Moves, duplicates and cascading deletes never rewrite, copy or remove a read-only request (`read_only_newer`). | §1, §3.3 |
+| Restore detection (`syncEpoch`, cursor going down) and push filtering by the server's `sync.types` (`GET /v1/server`). `SyncStatus.unsupportedEntities`, `SyncReport.unsupported` / `restored`. `SyncStatus.pendingChanges` leaves out `unsupportedEntities`. | §3.9 |
+| `Project`, `Collection`, `Folder` and `Environment` honour `minClientVersion` too (AC-FWD-4): when newer than `appVersion` the item can't be renamed, edited, copied, moved or deleted in a cascade (`read_only_newer`); siblings are reordered around it; it can still get children and be deleted on its own. Sync never pushes a locally modified version of one. | §1, §2 |
+| Per-change push results: `SkippedEntity.reason` is the server's reason (`invalid_json_value`, `forbidden_role`, … ; `entity_too_large` is reported as `too_large`); `clock_skew` and statuses this build doesn't know leave the change pending; a rejected delete stays pending. | §3.9 |
+| Shares without "Include credentials" leave out every field this build doesn't know (each block counts in `credentialsReplaced`), and refuse (`read_only_newer`) a collection or request share that holds an item from a newer ReqHarbor. | §3.10 |
+
 ## 1. Calling convention
 
 ```ts
@@ -66,6 +82,7 @@ try { await call("save_request", { request }); } catch (e) { const err = e as Co
 | `sync_too_large` | a single change exceeded the Worker's body limit (normally handled internally by splitting/skipping) |
 | `sync_not_found`, `sync_rejected`, `sync_protocol` | other Worker errors (message includes the Worker's `code: message`) |
 | `share_gone` | share link revoked (410) |
+| `read_only_newer` | the request was made by a newer ReqHarbor (non-HTTP `kind`, unknown `body.type`, `auth.type`, `auth.apiKey.in` or form field `kind`, or `minClientVersion` above `appVersion`): `save_request`, `rename_request`, `duplicate_request`, `move_node` (request), `create_request` (from such a template), `send_request` and `export_curl` refuse it. Container actions that would rewrite, copy or remove one refuse too: `move_node` of a folder to another collection, a reorder that can't keep its `sortOrder` (siblings are numbered around read-only requests; two adjacent ones leave no room between them), `duplicate_collection` / `duplicate_folder` / `duplicate_project`, and the cascading `delete_collection` / `delete_folder` / `delete_project` (the message says to delete that request on its own first). `update_collection` refuses changing an unknown auth or setting one. `delete_request` works. The same applies to a project, collection, folder or environment whose `minClientVersion` is newer than `appVersion`: `rename_project`, `set_active_environment`, `move_project` (other projects are numbered around it), `update_collection`, `rename_folder`, `update_environment`, `move_node` of it (siblings are numbered around it), duplicates of it or of a container holding it, and cascading deletes holding it refuse; `create_folder` / `create_request` inside it and deleting it on its own work. `share_preview` / `share_create` / `share_update` without `includeCredentials` refuse a collection or request share holding any such item (the message says to turn on Include credentials). Show the message as an info toast (in the Share dialog, inline). |
 | `internal` | unexpected |
 
 ## 2. Data model
@@ -78,9 +95,13 @@ Exactly PRODUCT.md §3, serialized as in `types.ts`. Notes that matter to the UI
 * **Sorting**: arrays inside `ProjectTree` are not sorted; order siblings by `sortOrder`. Folders and requests of the same parent share one `sortOrder` sequence; `move_node` reorders folders and requests separately (folders first is fine).
 * **Auth Inherit** uses the parent collection's saved `auth` at send/export time (AC-COL-5). An enabled `Authorization` header always wins over the Auth tab (AC-REQ-7) — show the hint.
 * **Default Content-Type** (AC-REQ-4) is added by the backend at send time only when no enabled `Content-Type` header exists: json/graphql `application/json`, xml `application/xml`, text `text/plain`, formEncoded `application/x-www-form-urlencoded`, form `multipart/form-data; boundary=…`, binary `application/octet-stream`. The UI may display them as greyed "auto" headers.
-* **Variables** (AC-ENV-1..4): `{{ name }}` with `name` in `[A-Za-z0-9_.-]+`, whitespace trimmed. Resolution: project's active environment → Global; disabled vars skipped; nested refs up to depth 3; cycles stay literal; unresolved stay literal and are reported in `SendResult.unresolvedVariables`. For editor decorations/hover use `get_variables(projectId)` (first definition per key wins, includes source env name; mask secrets).
+* **Variables** (AC-ENV-1..4): `{{ name }}` with `name` in `\$?[A-Za-z0-9_.-]+` (a leading `$` = dynamic variable, below), whitespace trimmed. Resolution: project's active environment → Global; disabled vars skipped; nested refs up to depth 3; cycles stay literal; unresolved stay literal and are reported in `SendResult.unresolvedVariables`. For editor decorations/hover use `get_variables(projectId)` (first definition per key wins, includes source env name; mask secrets).
+* **Dynamic variables** (AC-ENV-8..10): `{{ $name }}` — a leading `$` (only as the first character) names a generator from `get_dynamic_variables()` (`DynamicVariableInfo[]`: `name` incl. `$`, `description`, `example`), e.g. `$uuid`, `$timestamp`, `$isoTimestamp`, `$randomInt`, `$randomEmail`, `$randomFullName`, `$randomIP`, `$randomDatePast`. They are never looked up in an environment, and `update_environment` rejects a variable whose key starts with `$` (`invalid`). One value per name per send: every field of one `send_request` (URL, params, headers, auth, body, and `resolvedUrl` / history) shares the generated values; values may also come in through environment values (`token = "{{$uuid}}"`). Known names are never in `unresolvedVariables`; an unknown `{{$name}}` stays literal and is reported there. Highlight them with the `--var-dynamic-*` tokens and show `"<description> · e.g. <example> · new value each send"` on hover. The UI ships the same catalogue (`ui/src/lib/util/dynamic.ts`) so it renders before the command answers.
 * **Timestamps**: `updatedAt` is set by the backend on each mutation (strictly increasing per entity). Do not edit it.
 * **Timeout**: `settings.timeoutMs: 0` disables the timeout (imported from `curl -m 0`).
+* **Unknown keys (AC-FWD-1)**: objects may carry keys that are not in `types.ts`, written by a newer ReqHarbor (on another device, via sync or a share). The backend preserves them everywhere; the UI must not drop them — copy objects with spread / `structuredClone` instead of rebuilding them. As a safety net `save_request` re-adds keys the stored request has and the update lacks, at every nesting level (list rows are matched by `key`).
+* **Newer containers (AC-FWD-4)**: a `Project`, `Collection`, `Folder` or `Environment` may carry `minClientVersion`; newer than `Bootstrap.appVersion` (or not a string) = read-only here, see `read_only_newer` in §1. The tree shows the "Requires a newer ReqHarbor" badge on such a collection or folder, offers no Rename / Duplicate / Move / Settings for it, and never starts a rename or drag of it.
+* **Request kind (AC-FWD-2..4)**: `kind` is absent (= `"http"`) for every request this build creates. A request is **read-only** when `kind` is anything but `"http"`, when `body.type` is not one of the eight known types, when `auth.type` is not one of the five known schemes or `auth.apiKey.in` is not `header`/`query`, when a form field's `kind` is not `text`/`file`, or when `minClientVersion` is newer than `Bootstrap.appVersion` (an unparseable version counts as newer). The stored copy decides: the UI treats an open request as read-only when either the editor copy or the saved one is. When a sync pull turns the open request read-only, the editor switches to the saved, view-only copy; unsaved edits (of it or of a stashed draft) are offered once as "Save my edits as a copy" (a new, editable request via `create_request`). Read-only requests: the tree shows a "Requires a newer ReqHarbor" badge; the pane is view-only, Save and Send are disabled ("This request needs a newer version of ReqHarbor"); the only tree actions are Open and Delete. The backend refuses edits and sends with `read_only_newer` and sync never pushes a locally modified version of one (a remote version always replaces it).
 
 ## 3. Commands
 
@@ -90,7 +111,7 @@ Mutating commands persist atomically before resolving (AC-COL-6) and, when sync 
 
 | command | args | result | notes |
 |---|---|---|---|
-| `bootstrap` | – | `Bootstrap` | First call on startup. First launch already contains "My Workspace" / project "Default" / Global env (AC-COL-1). Show a persistent error toast for each `corruptFiles[]` entry (AC-COL-6). `platform` drives ⌘ vs Ctrl. |
+| `bootstrap` | – | `Bootstrap` | First call on startup. First launch already contains "My Workspace" / project "Default" / Global env (AC-COL-1). Show a persistent error toast for each `corruptFiles[]` entry (AC-COL-6). `platform` drives ⌘ vs Ctrl. `appVersion` is compared with `Request.minClientVersion`. |
 | `get_settings` | – | `Settings` | |
 | `save_settings` | `settings: Settings` | `Settings` | Whole object; unknown keys are preserved, so UI-only prefs can be added freely. Store `activeProjectId`, `lastOpenedRequestId`, pane sizes, theme here. Pixel sizes may be fractional (rounded to integers); the result echoes the normalised values. |
 
@@ -121,7 +142,7 @@ Mutating commands persist atomically before resolving (AC-COL-6) and, when sync 
 | `duplicate_folder` | `folderId` | `ProjectTree` (subtree copied) |
 | `delete_folder` | `folderId` | `ProjectTree` (subtree deleted) |
 | `create_request` | `collectionId, folderId?, request?` | `Request` — saves `request` (scratch, history "Save to collection", import) as a **new** request with a new id; omitted → empty GET "Untitled request" |
-| `save_request` | `request: Request` | `Request` — ⌘S; placement fields (`collectionId`, `folderId`, `sortOrder`) are ignored (use `move_node`); `invalid` if the method is invalid |
+| `save_request` | `request: Request` | `Request` — ⌘S; placement fields (`collectionId`, `folderId`, `sortOrder`) are ignored (use `move_node`); `invalid` if the method is invalid; `read_only_newer` if the stored or the given request is read-only (§2); unknown keys of the stored version that `request` lacks are kept |
 | `rename_request` | `requestId, name` | `Request` |
 | `duplicate_request` | `requestId` | `Request` ("X copy", placed last) |
 | `delete_request` | `requestId` | `ProjectTree` |
@@ -139,6 +160,7 @@ Dirty state (AC-REQ-11): the UI compares the edited request with the last saved 
 | `duplicate_environment` | `environmentId` | `Environment` (Global cannot be duplicated) |
 | `delete_environment` | `environmentId` | `Environment[]` (Global cannot be deleted; clears it as active env) |
 | `get_variables` | `projectId?` | `VariableInfo[]` |
+| `get_dynamic_variables` | — | `DynamicVariableInfo[]` — the `{{$name}}` catalogue, display order (AC-ENV-8) |
 
 ### 3.5 Sending & responses
 
@@ -156,7 +178,7 @@ Send flow:
 
 1. Generate `executionId`, switch Send → Cancel, call `send_request` with the request **as edited** (it is never saved).
 2. ⌘Enter / Cancel → `cancel_request(executionId)`; the pending `send_request` resolves within 100 ms with `error.kind = "cancelled"` (AC-REQ-8).
-3. Result: exactly one of `response` / `error` is set. `error.kind` ∈ `dns|connect|tls|timeout|cancelled|other` drives the error panel (AC-REQ-9) — never treat it as an exception. A rejection with code `validation` means nothing was sent (invalid custom method, invalid GraphQL variables → "Fix GraphQL variables", empty URL).
+3. Result: exactly one of `response` / `error` is set. `error.kind` ∈ `dns|connect|tls|timeout|cancelled|other` drives the error panel (AC-REQ-9) — never treat it as an exception. A rejection with code `validation` means nothing was sent (invalid custom method, invalid GraphQL variables → "Fix GraphQL variables", empty URL). A rejection with `read_only_newer` ("This request needs a newer version of ReqHarbor") means the request (or the stored request with the same id) is read-only (§2); nothing was sent.
 4. Fetch the body with `get_response_body(response.responseId)`. For bodies > 5 MB pass `limit: 5*1024*1024` and show "Showing first 5 MB" + Save full body (`save_response_body` with a path from the dialog plugin's `save()`), AC-RES-3. Decode text with `new TextDecoder()`. The last 8 response bodies stay available.
 5. Status strip: `status` + `statusText`, `sizeBytes` (decoded) with tooltip `wireSizeBytes` + `contentEncoding` (AC-RES-4), `timeMs`; `unresolvedVariables.length > 0` → amber warning (AC-ENV-3).
 6. Viewer by `bodyKind` (AC-RES-2); Headers tab from `headers` (received order, lowercase names), highlight `accept-query` (AC-QRY-7); Cookies tab from `cookies` (AC-RES-5).
@@ -183,7 +205,7 @@ Filtering (AC-HIST-3) is done in the UI over the summaries: case-insensitive sub
 |---|---|---|
 | `import_curl` | `text` | `CurlImport` — rejects `not_curl` / `curl_missing_url` / `curl_syntax` |
 | `looks_like_curl` | `text` | `boolean` — URL-bar paste detection (`text.trimStart().startsWith("curl ")` is equivalent) |
-| `export_curl` | `request, projectId?, keepVariables` | `string` — multi-line bash, one part per line (AC-CEXP-2..5). `keepVariables:false` resolves all variables incl. secrets against the active env; `true` exports raw `{{vars}}` (adds `--globoff`). Copy with the clipboard plugin. |
+| `export_curl` | `request, projectId?, keepVariables` | `string` — multi-line bash, one part per line (AC-CEXP-2..5). `keepVariables:false` resolves all variables incl. secrets against the active env, and generates each `{{$name}}` once for the whole command (URL, `-u`, form fields agree); `true` exports raw `{{vars}}` and `{{$name}}` (adds `--globoff`). Copy with the clipboard plugin. |
 
 Import preview summary ("3 headers · JSON body · Basic auth") is derived from `request`. Unknown flags → dismissible warning from `unknownFlags`; `warnings` lists other notes (e.g. a browser multipart copy omits file contents — "choose it again"). The imported request is a new scratch request; to save it use `create_request`. Export details: `-X` omitted for GET without body and POST with body; HEAD without body is exported as `--head`; implied Content-Type headers are written explicitly so cURL sends the same bytes; Basic → `-u`; Bearer/API key → header/query; `verifyTls:false` → `-k`.
 
@@ -205,7 +227,7 @@ Import preview summary ("3 headers · JSON body · Basic auth") is derived from 
 | `sync_connect` | `workerUrl, token` | `SyncStatus` — validates the token (`sync_unauthorized` if wrong), connects, runs the first sync (a fresh device adopts the remote tree; its empty default project is dropped) |
 | `sync_disconnect` | – | `SyncStatus` (local data untouched) |
 | `sync_rotate_token` | – | `{ token }` (old token invalid immediately; show once) |
-| `sync_now` | – | `SyncReport` — "Sync now" (pull, then push) |
+| `sync_now` | – | `SyncReport` — "Sync now" (discovery when due, pull, then push); toast `unsupported` with the notice above |
 | `sync_workspace_info` | – | `RemoteWorkspace` — name, entity count, `bytesUsed` / `quotaBytes` for a storage meter (null if the Worker doesn't report them) |
 
 Automatic behaviour (no UI work needed beyond listening): pull on startup and on window focus (max once per 60 s); push 2 s after any mutation; on offline/5xx a single retry timer with backoff 5 s → 10 s → … → 5 min (`nextRetryAt` for "Retrying in 30 s"); on 401 sync is disconnected and status becomes `unauthorized` → show "Token rejected — sync disconnected. Enter a new token." No timers run when idle.
@@ -218,6 +240,16 @@ Events (subscribe with `listen`):
 | `sync://changed` | `SyncReport` | reload `list_projects`, the open `get_project_tree`, `list_environments`; for each `conflicts[]` toast "Kept your edit as “{name}”" (AC-SYNC-4) |
 
 Synced: projects, collections, folders, requests, environments (secret values blanked; local secret values are kept on pull). Never synced: history, settings (AC-SYNC-3, AC-ENV-7).
+
+Forward compatibility: every sync call carries `X-ReqHarbor-Version: <appVersion>`. A pulled change whose `type` this build does not know is skipped without error (the rest of the page applies and the cursor advances) and its raw JSON is kept in `sync-state.json` → `unknownChanges` (latest per `type`+`id`, at most 5,000 entries / 8 MB; the oldest are dropped first and `unknownChangesTruncated` is set) so a newer build can apply it (AC-FWD-5). Tombstones of an unknown type in `sync-state.json` are kept and never pushed. Unknown keys inside known entities are kept and pushed back unchanged. A read-only request (§2) that is already on the server is never pushed once modified locally — only its deletion; the next remote version replaces it without a conflict copy, and no conflict copy is ever made of one.
+
+Server restore (06-go-server §9): pull pages and `GET /v1/server` may carry `syncEpoch`, stored in `sync-state.json` (`syncEpoch`). On every pull page, before the cursor moves, a `syncEpoch` that differs from the stored one, or a page `cursor` below the `since` that was sent, means the server was restored from a backup: the client sets the cursor to 0, re-pulls, and re-sends every entity (entities unchanged since their last sync are re-sent with their original `deviceId`, so LWW treats equal versions as the same; an older restored version never overwrites a newer local one, and no conflict copies are made for it). A first pull only stores the epoch; the Worker sends none and is only checked by the cursor rule. `SyncReport.restored` is then true and `sync://changed` fires; show "The sync server was restored from a backup. Your data was sent to it again."
+
+Sync types: before syncing, the client asks `GET /v1/server` (no token; again after 15 min, or on every run while items are held back). It pushes only changes whose `type` is in `sync.types`; a 404 (the Worker, an older server) or no `sync.types` means the five base types. A dirty entity of an unlisted type stays dirty and local-only and is listed in `SyncStatus.unsupportedEntities` / `SyncReport.unsupported` (`reason: "unsupported_type"`); `SyncStatus.warning` carries "3 items aren't synced because this server is older than your app. Ask its admin to update reqharbor-server." A per-change push result `rejected` with `reason: "unsupported_type"` is handled the same way (not marked too large) and makes the next run ask `GET /v1/server` again.
+
+`SyncStatus.pendingChanges` counts only what a push can clear: items in `unsupportedEntities` are left out (their notice covers them).
+
+Per-change push results: `applied` makes the entity clean; `stale` leaves it to the next pull. `rejected` is handled by its `reason`: `unsupported_type` as above; `clock_skew` leaves the change dirty (M1 restamps it); any other reason (`invalid_json_value`, `forbidden_role`, `entity_too_large`, or one this build doesn't know) marks the entity skipped until it is edited again and lists it in `SyncStatus.skippedEntities` / `SyncReport.tooLarge` with that reason (`entity_too_large` → `too_large`; no reason → `rejected`). A rejected **delete** keeps its tombstone and is sent again on the next run (the server still has the entity). A `status` this build doesn't know is treated like `stale`, and a result it can't parse is ignored: the change stays pending. `SyncStatus.warning` words each reason ("2 items aren't synced because the server can't store one of their values: …"); the tree badge uses `skippedReasonText(reason)`.
 
 Limits: pushes are batched by ≤ 500 changes and ≤ 4 MB per request. An entity whose data exceeds 512 KB is never sent: it is listed in `SyncStatus.skippedEntities` / `SyncReport.tooLarge` with `reason: "too_large"` and `SyncStatus.warning` carries a ready-made sentence — show it as a warning on the sync indicator (other changes keep syncing). Editing the item so it shrinks makes it sync again. Ties on `updatedAt` are resolved by a per-device id, so two devices always converge. Token rotation is serialised with sync runs.
 
@@ -233,11 +265,11 @@ Limits: pushes are batched by ≤ 500 changes and ≤ 4 MB per request. An entit
 | `preview_share` | `url` | `{ kind, snapshot: ShareSnapshot, warnings }` — Import dialog Link tab preview (`warnings` = file references that import will clear); `share_gone` if revoked |
 | `import_share` | `url, projectId` | `ShareImportResult { tree, warnings }` — copy with new ids (AC-SHARE-5); a request share lands in a new collection named after the request; an attached environment is created too. Binary body paths and Form file fields from the share are cleared (file fields disabled) so a crafted link cannot upload local files; show `warnings` |
 
-Sanitising (AC-SHARE-2): secret variables are always removed from the attached environment; unless `includeCredentials`, `Authorization` / `Proxy-Authorization` / `Cookie` header values become `{{authorization}}` / `{{proxyAuthorization}}` / `{{cookie}}` and auth values become `{{username}}`, `{{password}}`, `{{token}}`, `{{apiKey}}`. A request share inlines its collection's auth when it uses Inherit. The UI must remember `shareId` per entity for "Update share" — use `share_list` (`entityId`) to find it.
+Sanitising (AC-SHARE-2): secret variables are always removed from the attached environment; unless `includeCredentials`, `Authorization` / `Proxy-Authorization` / `Cookie` header values become `{{authorization}}` / `{{proxyAuthorization}}` / `{{cookie}}` and auth values become `{{username}}`, `{{password}}`, `{{token}}`, `{{apiKey}}`. Also unless `includeCredentials`, every field this build doesn't know (unknown keys at any level of the collection, its folders and requests, their auth, headers, params, form rows and the attached environment's variables) is left out, because a newer ReqHarbor may keep secrets there (e.g. gRPC metadata); each such block counts once in `credentialFields` / `credentialsReplaced`. A collection or request share holding an item from a newer ReqHarbor (§2: a read-only request, or a container with a newer `minClientVersion`) is refused with `read_only_newer` unless `includeCredentials`; the Share dialog shows the message inline and disables "Create link" until the preview succeeds. A request share inlines its collection's auth when it uses Inherit. The UI must remember `shareId` per entity for "Update share" — use `share_list` (`entityId`) to find it.
 
 ## 4. Storage (for reference)
 
-App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping), `history.jsonl`. Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
+App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping, incl. `unknownChanges`), `history.jsonl`. Unknown keys in these files are preserved on rewrite (AC-FWD-1). Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
 
 ## 5. Not provided by the backend (UI responsibility)
 

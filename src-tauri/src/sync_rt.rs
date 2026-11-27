@@ -31,17 +31,25 @@ fn current_token(state: &AppState) -> Option<String> {
         .map(|s| s.token.clone())
 }
 
-/// Pull, then push in size-bounded batches (contracts C1/C2). Holds the
-/// store lock only for the local steps.
-async fn sync_once(
-    state: &AppState,
-    client: &sync::SyncClient,
-    since: u64,
-) -> Result<SyncReport, SyncError> {
-    let (changes, cursor) = client.pull_all(since).await?;
+/// Discovery (when due), pull with restore detection, then push the types
+/// the server accepts in size-bounded batches (contracts C1/C2,
+/// 06-go-server §9). Holds the store lock only for the local steps.
+async fn sync_once(state: &AppState, client: &sync::SyncClient) -> Result<SyncReport, SyncError> {
+    let (due, start) = {
+        let store = state.store();
+        (
+            sync::server_info_due(&store, now_ms()),
+            sync::pull_start(&store)?,
+        )
+    };
+    let info = sync::refresh_server_info(client, due).await;
+    if let Some(info) = &info {
+        sync::record_server_info(&mut state.store(), info.as_ref());
+    }
+    let pulled = sync::pull_from(client, &start, info.as_ref().and_then(Option::as_ref)).await?;
     let report = {
         let mut store = state.store();
-        let r = sync::apply_pull(&mut store, changes, cursor);
+        let r = sync::apply_pulled(&mut store, pulled);
         store.save_all()?;
         r
     };
@@ -62,6 +70,8 @@ async fn sync_once(
         conflicts: report.conflicts,
         skipped: report.skipped,
         too_large: sync::skipped_entities(&mut store),
+        unsupported: sync::unsupported_entities(&store),
+        restored: report.restored,
         cursor: store.workspace.sync.as_ref().map(|s| s.cursor).unwrap_or(0),
     })
 }
@@ -70,33 +80,35 @@ async fn sync_once(
 pub async fn run_sync(app: &AppHandle) -> CmdResult<SyncReport> {
     let state = app.state::<AppState>();
     let _serial = state.sync_lock.lock().await;
-    let (client, since, token) = {
+    let (client, token) = {
         let store = state.store();
         let client = sync::client_for(&store)?;
-        let cfg = store.workspace.sync.as_ref();
-        (
-            client,
-            cfg.map(|s| s.cursor).unwrap_or(0),
-            cfg.map(|s| s.token.clone()),
-        )
+        let token = store.workspace.sync.as_ref().map(|s| s.token.clone());
+        (client, token)
     };
     emit_status(app, &state.update_sync(sync_policy::begin));
     // Any pending retry is superseded by this run.
     state.retry.cancel();
 
-    match sync_once(&state, &client, since).await {
+    match sync_once(&state, &client).await {
         Ok(report) => {
             let (pending, skipped) = {
                 let mut store = state.store();
                 (
-                    sync::collect_push(&store).len(),
+                    sync::pending_count(&store),
                     sync::skipped_entities(&mut store),
                 )
             };
-            let status =
-                state.update_sync(|s| sync_policy::on_success(s, now_ms(), pending, skipped));
+            let unsupported = report.unsupported.clone();
+            let status = state.update_sync(|s| {
+                sync_policy::on_success(s, now_ms(), pending, skipped, unsupported)
+            });
             emit_status(app, &status);
-            if report.pulled > 0 || report.deleted > 0 || !report.conflicts.is_empty() {
+            if report.pulled > 0
+                || report.deleted > 0
+                || !report.conflicts.is_empty()
+                || report.restored
+            {
                 let _ = app.emit(EVENT_CHANGED, &report);
             }
             Ok(report)
@@ -142,7 +154,7 @@ pub fn schedule_push(app: &AppHandle) {
         if store.workspace.sync.is_none() {
             return;
         }
-        sync::collect_push(&store).len()
+        sync::pending_count(&store)
     };
     let status = state.update_sync(|s| s.pending_changes = pending);
     emit_status(app, &status);

@@ -79,6 +79,7 @@ fn main() {
             commands::duplicate_environment,
             commands::delete_environment,
             commands::get_variables,
+            commands::get_dynamic_variables,
             commands::list_history,
             commands::open_history_entry,
             commands::delete_history_entry,

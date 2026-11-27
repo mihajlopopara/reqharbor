@@ -498,6 +498,7 @@ mod tests {
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
+            extra: Default::default(),
         };
         let scope = VarScope::new(Some(&env), None);
         let r = Request {
@@ -521,6 +522,48 @@ mod tests {
         assert!(kept.contains("Bearer {{tok}}"));
         assert!(kept.contains("--globoff"));
         assert!(!kept.contains("SECRET"));
+    }
+
+    #[test]
+    fn export_dynamic_variables_kept_or_generated_once() {
+        let r = Request {
+            method: "POST".into(),
+            url: "https://x.dev/u/{{$uuid}}".into(),
+            auth: Auth::basic("{{$uuid}}", "pw"),
+            body: Body {
+                body_type: BodyType::FormEncoded,
+                form_encoded: Some(vec![KeyValue::new("id", "{{$uuid}}")]),
+                ..Body::none()
+            },
+            ..Request::default()
+        };
+        let kept = export_curl(
+            &r,
+            &VarScope::empty(),
+            None,
+            ExportOptions {
+                keep_variables: true,
+            },
+        )
+        .unwrap();
+        assert!(kept.contains("'https://x.dev/u/{{$uuid}}'"), "{kept}");
+        assert!(kept.contains("-u '{{$uuid}}:pw'"), "{kept}");
+        assert!(kept.contains("--data-urlencode 'id={{$uuid}}'"), "{kept}");
+
+        let made = export(&r);
+        assert!(!made.contains("{{"), "{made}");
+        let id = made
+            .split("https://x.dev/u/")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(id).is_ok(), "{made}");
+        // the extra resolves (Basic -u, form fields) reuse the same value
+        assert!(made.contains(&format!("-u '{id}:pw'")), "{made}");
+        assert!(
+            made.contains(&format!("--data-urlencode 'id={id}'")),
+            "{made}"
+        );
     }
 
     #[test]

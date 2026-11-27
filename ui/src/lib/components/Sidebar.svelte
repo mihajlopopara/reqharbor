@@ -5,7 +5,7 @@
   import { toasts } from "../stores/toasts.svelte";
   import { call, toCommandError } from "../api";
   import { shortcutText } from "../util/shortcuts";
-  import { relativeTime } from "../util/format";
+  import { relativeTime, skippedWarning, unsupportedNotice } from "../util/format";
   import ActivityList from "./ActivityList.svelte";
   import CollectionsTree from "./CollectionsTree.svelte";
   import EnvList from "./EnvList.svelte";
@@ -131,7 +131,10 @@
     try {
       const rep = await call("sync_now", {});
       toasts.success(`Synced · ${rep.pushed} pushed, ${rep.pulled} pulled`);
-      if (rep.tooLarge.length) toasts.warning(`${rep.tooLarge.length} item(s) too large to sync: ${rep.tooLarge.map((s) => s.name).join(", ")}`);
+      const skipped = skippedWarning(rep.tooLarge);
+      if (skipped) toasts.warning(skipped);
+      const notice = unsupportedNotice(rep.unsupported?.length ?? 0);
+      if (notice) toasts.warning(notice);
     } catch (e) {
       toasts.error(toCommandError(e).message);
     }

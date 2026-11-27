@@ -644,6 +644,7 @@ impl<'a> Importer<'a> {
             sort_order: 0,
             created_at: now,
             updated_at: now,
+            extra: Default::default(),
         };
 
         // Folders: first tags in use, declared order first, then first-seen.
@@ -686,6 +687,7 @@ impl<'a> Importer<'a> {
                 sort_order: i as i64,
                 created_at: now,
                 updated_at: now,
+                extra: Default::default(),
             })
             .collect();
         let folder_index: HashMap<&str, usize> =
@@ -738,6 +740,7 @@ impl<'a> Importer<'a> {
             sort_order: 0,
             created_at: now,
             updated_at: now,
+            extra: Default::default(),
         };
 
         let report = ImportReport {
@@ -1081,6 +1084,9 @@ impl<'a> Importer<'a> {
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
+            kind: Default::default(),
+            min_client_version: None,
+            extra: Default::default(),
         }
     }
 
@@ -1124,6 +1130,7 @@ impl<'a> Importer<'a> {
             value: self.param_value(p, ctx),
             enabled: required,
             description: non_empty_str(p.get("description")).map(str::to_string),
+            extra: Default::default(),
         }
     }
 
@@ -2269,7 +2276,7 @@ mod tests {
         let form = imp.requests[0].body.form.clone().unwrap_or_default();
         let kinds: Vec<_> = form
             .iter()
-            .map(|f| (f.key.as_str(), f.kind, f.value.as_str()))
+            .map(|f| (f.key.as_str(), f.kind.clone(), f.value.as_str()))
             .collect();
         assert_eq!(
             kinds,

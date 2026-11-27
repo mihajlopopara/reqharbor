@@ -86,3 +86,55 @@ export const ERROR_LABEL: Record<string, string> = {
 export function stripScheme(url: string): string {
   return url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
 }
+
+/** Mirrors core `sync::unsupported_notice` (06-go-server §9): items the server doesn't accept yet. */
+export function unsupportedNotice(n: number): string | null {
+  if (n <= 0) return null;
+  return n === 1
+    ? "1 item isn't synced because this server is older than your app. Ask its admin to update reqharbor-server."
+    : `${n} items aren't synced because this server is older than your app. Ask its admin to update reqharbor-server.`;
+}
+
+/** Shown once when a sync found the server restored from a backup (06-go-server §9). */
+export const RESTORED_NOTICE = "The sync server was restored from a backup. Your data was sent to it again.";
+
+/**
+ * Tree badge for an item that isn't synced (`SkippedEntity.reason`): a short label and a tooltip.
+ * The reason is "too_large" or the one the server rejected the change with.
+ */
+export function skippedReasonText(reason: string): { label: string; title: string } {
+  switch (reason) {
+    case "too_large":
+    case "entity_too_large":
+      return { label: "too large", title: "Not synced: too large (over 512 KB). Make it smaller to sync again." };
+    case "invalid_json_value":
+      return { label: "not synced", title: "Not synced: the server can't store one of its values. Change it to sync again." };
+    case "forbidden_role":
+      return { label: "not synced", title: "Not synced: your role can't change it on the server." };
+    default:
+      return { label: "not synced", title: `Not synced: the server rejected it (${reason}). Change it to sync again.` };
+  }
+}
+
+/** Mirrors `sync_policy::skipped_warning` (src-tauri): one sentence per reason, joined with ". ". */
+export function skippedWarning(skipped: { name: string; reason: string }[]): string | null {
+  if (!skipped.length) return null;
+  const rank = (r: string) => (r === "too_large" ? 0 : r === "invalid_json_value" ? 1 : r === "forbidden_role" ? 2 : 3);
+  const reasons = [...new Set(skipped.map((s) => s.reason))].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0));
+  return reasons
+    .map((reason) => {
+      const items = skipped.filter((s) => s.reason === reason);
+      const n = items.length;
+      const one = n === 1;
+      const head =
+        reason === "too_large"
+          ? `${n} ${one ? "item is" : "items are"} too large to sync (over 512 KB)`
+          : reason === "invalid_json_value"
+            ? `${n} ${one ? "item isn't" : "items aren't"} synced because the server can't store one of ${one ? "its" : "their"} values`
+            : reason === "forbidden_role"
+              ? `${n} ${one ? "item isn't" : "items aren't"} synced because your role can't change ${one ? "it" : "them"} on the server`
+              : `${n} ${one ? "item was" : "items were"} rejected by the server (${reason})`;
+      return `${head}: ${items.map((s) => s.name).join(", ")}`;
+    })
+    .join(". ");
+}

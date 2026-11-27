@@ -4,8 +4,11 @@
  * shapes, same CommandError codes. State lives in memory and resets on reload.
  *
  * Query-string switches (browser only): `?seed=empty` (first launch),
- * `?platform=macos|windows|linux`, `?corrupt=1` (one quarantined file).
+ * `?platform=macos|windows|linux`, `?corrupt=1` (one quarantined file),
+ * `?newer=1` (adds requests written by a newer ReqHarbor: a gRPC one and one
+ * with an unknown body type, AC-FWD-3).
  */
+import { dynamicCatalogue, dynamicMemo } from "../../util/dynamic";
 import type { Backend, Unlisten } from "../index";
 import type {
   Auth,
@@ -39,6 +42,8 @@ import type {
 } from "../types";
 import { METHOD_RE } from "../types";
 import { ulid } from "../../util/ulid";
+import { isContainerReadOnly, isKnownAuth, isReadOnlyNewer } from "../../util/request";
+import { skippedWarning } from "../../util/format";
 import { applyDefaultScheme, paramsToUrl, urlToParams, encodeQueryValue } from "../../util/urlx";
 import { prettyJson, jsonErrorPosition } from "../../util/json";
 import { MockError, fail } from "./errors";
@@ -64,6 +69,199 @@ const HISTORY_MAX = 500;
 const HISTORY_BODY_MAX = 1024 * 1024;
 const SYNC_ENTITY_MAX = 512 * 1024;
 const enc = new TextEncoder();
+/** Mirrors Bootstrap.appVersion of the real app (workspace version). */
+export const MOCK_APP_VERSION = "0.1.0";
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+
+/**
+ * The keys this build knows per object, and where nested objects / keyed lists are. Mirrors the
+ * Rust structs: only keys *not* listed here are "unknown" (serde `extra`).
+ */
+export interface KeyShape {
+  known: readonly string[];
+  /** Nested objects, merged only when both sides have them. */
+  objects?: Record<string, KeyShape>;
+  /** Lists of rows matched by `key` (same index first). */
+  lists?: Record<string, KeyShape>;
+  /** Known optional keys that are restored too when the update lacks them (core does this for `minClientVersion`). */
+  restore?: readonly string[];
+}
+
+const KV_SHAPE: KeyShape = { known: ["key", "value", "enabled", "description"] };
+const FORM_FIELD_SHAPE: KeyShape = { known: ["key", "value", "kind", "enabled", "contentType"] };
+export const AUTH_SHAPE: KeyShape = {
+  known: ["type", "username", "password", "token", "apiKey"],
+  objects: { apiKey: { known: ["key", "value", "in"] } },
+};
+export const REQUEST_SHAPE: KeyShape = {
+  known: ["id", "kind", "minClientVersion", "collectionId", "folderId", "name", "method", "url", "params", "headers", "auth", "body", "settings", "sortOrder", "createdAt", "updatedAt"],
+  restore: ["minClientVersion"],
+  objects: {
+    auth: AUTH_SHAPE,
+    settings: { known: ["followRedirects", "timeoutMs", "verifyTls"] },
+    body: {
+      known: ["type", "text", "form", "formEncoded", "graphql", "binaryPath"],
+      objects: { graphql: { known: ["query", "variables"] } },
+      lists: { form: FORM_FIELD_SHAPE, formEncoded: KV_SHAPE },
+    },
+  },
+  lists: { params: KV_SHAPE, headers: KV_SHAPE },
+};
+
+export const COLLECTION_SHAPE: KeyShape = {
+  known: ["id", "projectId", "name", "description", "auth", "sortOrder", "createdAt", "updatedAt"],
+  objects: { auth: AUTH_SHAPE },
+};
+export const FOLDER_SHAPE: KeyShape = { known: ["id", "collectionId", "parentFolderId", "name", "sortOrder", "createdAt", "updatedAt"] };
+export const VARIABLE_SHAPE: KeyShape = { known: ["key", "value", "enabled", "secret"] };
+
+/**
+ * Mirrors core `share::strip_request_extra` and friends: removes the keys this build doesn't know at
+ * every level of `obj` (in place) and returns how many objects had some. A share without
+ * credentials leaves them out, since they may hold secrets.
+ */
+export function dropUnknownKeys(obj: unknown, shape: KeyShape): number {
+  if (!isPlainObject(obj)) return 0;
+  let n = 0;
+  const unknown = Object.keys(obj).filter((k) => !shape.known.includes(k));
+  if (unknown.length) {
+    n++;
+    for (const k of unknown) delete obj[k];
+  }
+  for (const [k, sub] of Object.entries(shape.objects ?? {})) n += dropUnknownKeys(obj[k], sub);
+  for (const [k, sub] of Object.entries(shape.lists ?? {})) {
+    const list = obj[k];
+    if (Array.isArray(list)) for (const row of list) n += dropUnknownKeys(row, sub);
+  }
+  return n;
+}
+
+function keepUnknownRows(update: unknown[], stored: unknown[], shape: KeyShape): unknown[] {
+  const used = new Set<number>();
+  return update.map((item, i) => {
+    if (!isPlainObject(item)) return item;
+    const k = item.key;
+    let j = isPlainObject(stored[i]) && stored[i].key === k && !used.has(i) ? i : -1;
+    if (j < 0) j = stored.findIndex((s, n) => !used.has(n) && isPlainObject(s) && s.key === k);
+    if (j < 0) return item;
+    used.add(j);
+    return keepUnknownKeys(item, stored[j], shape);
+  });
+}
+
+/**
+ * Mirrors core `merge_request_extra` (tech §9.1): keys of `stored` that this build doesn't know
+ * (not in `shape.known`) and that the update lacks are kept, at every level; list rows are matched
+ * by `key` (same index first). Known keys are never brought back, so removing an optional field
+ * (e.g. a header's description) sticks.
+ */
+export function keepUnknownKeys<T>(update: T, stored: unknown, shape: KeyShape = REQUEST_SHAPE): T {
+  if (!isPlainObject(update) || !isPlainObject(stored)) return update;
+  const out: Record<string, unknown> = { ...update };
+  for (const [k, v] of Object.entries(stored)) {
+    if (!(k in out) && (!shape.known.includes(k) || shape.restore?.includes(k))) out[k] = clone(v);
+  }
+  for (const [k, sub] of Object.entries(shape.objects ?? {})) {
+    if (isPlainObject(out[k]) && isPlainObject(stored[k])) out[k] = keepUnknownKeys(out[k], stored[k], sub);
+  }
+  for (const [k, sub] of Object.entries(shape.lists ?? {})) {
+    const u = out[k];
+    const st = stored[k];
+    if (Array.isArray(u) && Array.isArray(st)) out[k] = keepUnknownRows(u, st, sub);
+  }
+  return out as T;
+}
+
+/** Structural equality of JSON values (key order ignored). */
+function jsonEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => jsonEqual(x, b[i]));
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const ka = Object.keys(a).filter((k) => a[k] !== undefined);
+    const kb = Object.keys(b).filter((k) => b[k] !== undefined);
+    return ka.length === kb.length && ka.every((k) => jsonEqual(a[k], b[k]));
+  }
+  return false;
+}
+
+/** Message of core `storage::read_only_newer` for container actions (AC-FWD-3/4). */
+function readOnlyNewerMessage(r: { name: string }, verb: "move" | "copy" | "delete", fallback = "a request"): string {
+  const name = r.name.trim() ? `“${r.name}”` : fallback;
+  const advice = verb === "delete" ? `Delete ${name} on its own first, or update ReqHarbor.` : `Update ReqHarbor to ${verb} it.`;
+  return `This would change ${name}, which was made with a newer version of ReqHarbor and is read-only here. ${advice}`;
+}
+
+/**
+ * Mirrors core `renumber_around`: sort orders for `order` that keep the values of `fixed` items;
+ * the others are numbered into the gaps. Null when a gap is too small.
+ */
+export function renumberAround<T extends { sortOrder: number }>(order: T[], fixed: Set<T>): Map<T, number> | null {
+  const out = new Map<T, number>();
+  if (!fixed.size) {
+    order.forEach((x, i) => out.set(x, i));
+    return out;
+  }
+  let pending: T[] = [];
+  let prev: number | null = null;
+  for (const x of order) {
+    if (!fixed.has(x)) {
+      pending.push(x);
+      continue;
+    }
+    const v = x.sortOrder;
+    const k = pending.length;
+    let start: number;
+    if (prev === null) start = v - k;
+    else {
+      if (k > 0 && v - prev - 1 < k) return null;
+      start = prev + 1;
+    }
+    pending.forEach((p, i) => out.set(p, start + i));
+    pending = [];
+    out.set(x, v);
+    prev = v;
+  }
+  const start = prev === null ? 0 : prev + 1;
+  pending.forEach((p, i) => out.set(p, start + i));
+  return out;
+}
+
+/** Requests as written by a newer ReqHarbor (`?newer=1`). */
+export function newerRequests(collectionId: string, ts: number): Request[] {
+  const base = (): Omit<Request, "id" | "name" | "method" | "url" | "body" | "sortOrder"> => ({
+    collectionId,
+    folderId: null,
+    params: [],
+    headers: [],
+    auth: { type: "none" },
+    settings: { followRedirects: true, timeoutMs: 30000, verifyTls: true },
+    createdAt: ts,
+    updatedAt: ts,
+  });
+  return [
+    {
+      ...base(),
+      id: ulid(ts),
+      kind: "grpc",
+      name: "Say hello",
+      method: "POST",
+      url: "grpc://greeter.example.com:443",
+      body: { type: "none" },
+      sortOrder: 90,
+      grpc: { service: "helloworld.Greeter", method: "SayHello", message: '{ "name": "Ada" }' },
+    } as Request,
+    {
+      ...base(),
+      id: ulid(ts + 1),
+      name: "Upload protobuf",
+      method: "POST",
+      url: "https://api.example.com/v1/upload",
+      body: { type: "protobuf", schemaRef: "upload.proto#Upload" } as Request["body"],
+      sortOrder: 91,
+    },
+  ];
+}
 
 interface ShareRecord {
   info: ShareInfo;
@@ -78,6 +276,8 @@ export interface MockOptions {
   /** Scale simulated latency (0 = instant, for unit tests). */
   latency?: number;
   now?: () => number;
+  /** Seed requests from a newer ReqHarbor (AC-FWD-3). */
+  newer?: boolean;
 }
 
 export class MockServer {
@@ -107,6 +307,7 @@ export class MockServer {
     retryAttempt: 0,
     pendingChanges: 0,
     skippedEntities: [],
+    unsupportedEntities: [],
     warning: null,
   };
   syncToken: string | null = null;
@@ -124,6 +325,8 @@ export class MockServer {
     this.requests = s.requests;
     this.environments = s.environments;
     this.settings = s.settings;
+    const first = this.collections.find((c) => c.projectId === this.settings.activeProjectId);
+    if (opts.newer && first) this.requests.push(...newerRequests(first.id, now));
     for (const h of s.historySends) {
       const ts = now - h.ageMs;
       this.recordCanned(h.request, h.projectId, ts);
@@ -164,6 +367,47 @@ export class MockServer {
   }
   private request(id: string): Request {
     return this.requests.find((r) => r.id === id) ?? fail("not_found", `Request ${id} not found`);
+  }
+  /** Store guard (AC-FWD-3/4): mirrors core `StoreError::ReadOnlyNewer`. */
+  private ensureEditable(r: Request | undefined): void {
+    if (r && isReadOnlyNewer(r, MOCK_APP_VERSION)) {
+      fail("read_only_newer", `${r.name.trim() ? `“${r.name}”` : "This request"} was made with a newer version of ReqHarbor and is read-only here. Update ReqHarbor to edit it.`);
+    }
+  }
+  /** Container guard (AC-FWD-3): mirrors core moves/copies/cascading deletes refusing to touch read-only requests. */
+  private refuseReadOnlyIn(requests: Request[], verb: "move" | "copy" | "delete"): void {
+    const r = requests.find((x) => isReadOnlyNewer(x, MOCK_APP_VERSION));
+    if (r) fail("read_only_newer", readOnlyNewerMessage(r, verb));
+  }
+  /** Mirrors core `ensure_entity_editable` (AC-FWD-4): a project, collection, folder or environment with a newer `minClientVersion`. */
+  private ensureContainer(e: { name: string; minClientVersion?: unknown }, fallback: string): void {
+    if (isContainerReadOnly(e, MOCK_APP_VERSION)) {
+      fail("read_only_newer", `${e.name.trim() ? `“${e.name}”` : fallback} was made with a newer version of ReqHarbor and is read-only here. Update ReqHarbor to edit it.`);
+    }
+  }
+  /** Mirrors core `first_read_only`: cascades and copies never touch read-only containers. */
+  private refuseReadOnlyContainers(items: { name: string; minClientVersion?: unknown }[], verb: "move" | "copy" | "delete", fallback: string): void {
+    const x = items.find((i) => isContainerReadOnly(i, MOCK_APP_VERSION));
+    if (x) fail("read_only_newer", readOnlyNewerMessage(x, verb, fallback));
+  }
+  /** Sort orders for `list` (new sequence) keeping read-only items in place; fails like core when there's no room. */
+  private renumberContainers<T extends { sortOrder: number; name: string; minClientVersion?: unknown }>(list: T[], fallback: string): void {
+    const fixed = new Set(list.filter((x) => isContainerReadOnly(x, MOCK_APP_VERSION)));
+    const numbers = renumberAround(list, fixed);
+    if (!numbers) return fail("read_only_newer", readOnlyNewerMessage([...fixed][0], "move", fallback));
+    for (const [x, n] of numbers) x.sortOrder = n;
+  }
+  private requestsUnderFolder(folderId: string): Request[] {
+    const ids = new Set([folderId, ...this.descendantFolders(folderId).map((d) => d.id)]);
+    return this.requests.filter((r) => r.folderId !== null && ids.has(r.folderId));
+  }
+  private foldersOfProject(projectId: string): Folder[] {
+    const cols = new Set(this.collections.filter((c) => c.projectId === projectId).map((c) => c.id));
+    return this.folders.filter((f) => cols.has(f.collectionId));
+  }
+  private requestsOfProject(projectId: string): Request[] {
+    const cols = new Set(this.collections.filter((c) => c.projectId === projectId).map((c) => c.id));
+    return this.requests.filter((r) => cols.has(r.collectionId));
   }
   private env(id: string): Environment {
     return this.environments.find((e) => e.id === id) ?? fail("not_found", `Environment ${id} not found`);
@@ -211,9 +455,7 @@ export class MockServer {
       .filter((r) => enc.encode(JSON.stringify(r)).length > SYNC_ENTITY_MAX)
       .map((r) => ({ type: "request", id: r.id, name: r.name, reason: "too_large" }));
     this.sync.skippedEntities = skipped;
-    this.sync.warning = skipped.length
-      ? `${skipped.length} item${skipped.length === 1 ? " is" : "s are"} too large to sync (over 512 KB): ${skipped.map((s) => s.name).join(", ")}`
-      : null;
+    this.sync.warning = skippedWarning(skipped);
   }
   private projectOfCollection(collectionId: string): string {
     return this.collection(collectionId).projectId;
@@ -252,11 +494,17 @@ export class MockServer {
     }
     return m;
   }
-  private resolver(projectId: string | null | undefined, maskSecrets: boolean) {
+  /** `dynamic` is the per-send memo: share one across every resolve of a send (AC-ENV-8). */
+  private resolver(projectId: string | null | undefined, maskSecrets: boolean, dynamic = dynamicMemo()) {
     const map = this.lookup(projectId);
     const unresolved = new Set<string>();
     const resolve = (text: string, depth = 0, stack: string[] = []): string =>
-      text.replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (whole, name: string) => {
+      text.replace(/\{\{\s*(\$?[A-Za-z0-9_.-]+)\s*\}\}/g, (whole, name: string) => {
+        if (name.startsWith("$")) {
+          const v = dynamic(name);
+          if (v === undefined) unresolved.add(name);
+          return v ?? whole;
+        }
         const hit = map.get(name);
         if (!hit) {
           unresolved.add(name);
@@ -274,8 +522,8 @@ export class MockServer {
     return this.collections.find((c) => c.id === r.collectionId)?.auth ?? null;
   }
 
-  private resolveRequest(r: Request, projectId: string | null | undefined, maskSecrets: boolean) {
-    const { resolve, unresolved } = this.resolver(projectId, maskSecrets);
+  private resolveRequest(r: Request, projectId: string | null | undefined, maskSecrets: boolean, dynamic = dynamicMemo()) {
+    const { resolve, unresolved } = this.resolver(projectId, maskSecrets, dynamic);
     const kv = (rows: KeyValue[]) => rows.filter((x) => x.enabled).map((x) => ({ ...x, key: resolve(x.key), value: resolve(x.value) }));
     let url = resolve(r.url.trim());
     const params = kv(r.params);
@@ -299,6 +547,9 @@ export class MockServer {
   private prepare(r: Request, projectId: string | null | undefined): { prepared: PreparedRequest; displayUrl: string; unresolved: string[] } {
     if (!METHOD_RE.test(r.method)) fail("validation", `Invalid method "${r.method}"`, { kind: "invalidMethod", message: "Use A–Z, 0–9, _ or -, starting with a letter" });
     if (!r.url.trim()) fail("validation", "Enter a URL", { kind: "emptyUrl" });
+    if (r.auth.type === "inherit" && !isKnownAuth(this.inheritedAuth(r))) {
+      fail("validation", "The collection's auth needs a newer version of ReqHarbor", { kind: "inheritedAuthNeedsNewerVersion" });
+    }
     if (r.body.type === "graphql" && r.body.graphql?.variables.trim()) {
       try {
         JSON.parse(r.body.graphql.variables);
@@ -306,8 +557,10 @@ export class MockServer {
         fail("validation", "Fix GraphQL variables", { kind: "invalidGraphqlVariables", message: (e as Error).message });
       }
     }
-    const res = this.resolveRequest(r, projectId, false);
-    const display = this.resolveRequest(r, projectId, true);
+    // One memo: the URL sent and the URL kept in history agree on {{$…}} values.
+    const dynamic = dynamicMemo();
+    const res = this.resolveRequest(r, projectId, false, dynamic);
+    const display = this.resolveRequest(r, projectId, true, dynamic);
     const headers: [string, string][] = res.headers.map((h) => [h.key, h.value]);
     const has = (k: string) => headers.some(([n]) => n.toLowerCase() === k);
     let url = res.url;
@@ -484,33 +737,59 @@ export class MockServer {
 
   private snapshotFor(kind: ShareKind, entityId: string, includeCredentials: boolean, environmentId: string | null | undefined) {
     let credentialFields = 0;
+    const replace = !includeCredentials;
+    // Mirrors core `share_needs_credentials`: without credentials, an item from a newer ReqHarbor
+    // can't be shared, since this build can't tell which of its fields are secret.
+    const refuse = (name: string) =>
+      fail(
+        "read_only_newer",
+        `${name.trim() ? `“${name}”` : "An item"} was made with a newer version of ReqHarbor, so this version can't tell which of its fields are credentials. Turn on Include credentials to share it as it is, or update ReqHarbor.`,
+      );
+    /** Unknown keys: dropped (and counted) without credentials, counted with them. */
+    const unknownKeys = (obj: unknown, shape: KeyShape): number => (replace ? dropUnknownKeys(obj, shape) : dropUnknownKeys(clone(obj), shape));
     const scrub = (r: Request): Request => {
       const c = clone(r);
       for (const h of c.headers) {
-        const k = h.key.toLowerCase();
-        if (k === "authorization" || k === "proxy-authorization" || k === "cookie") {
+        const k = h.key.trim().toLowerCase();
+        if ((k === "authorization" || k === "proxy-authorization" || k === "cookie") && h.value) {
           credentialFields++;
-          if (!includeCredentials) h.value = `{{${k === "authorization" ? "authorization" : k === "cookie" ? "cookie" : "proxyAuthorization"}}}`;
+          if (replace) h.value = `{{${k === "authorization" ? "authorization" : k === "cookie" ? "cookie" : "proxyAuthorization"}}}`;
         }
       }
-      c.auth = scrubAuth(c.auth);
-      return c;
+      // The auth block is handled by scrubAuth (unknown schemes as a whole).
+      const { auth, ...rest } = c;
+      credentialFields += unknownKeys(rest, REQUEST_SHAPE);
+      return { ...rest, auth: scrubAuth(auth) } as Request;
     };
     const scrubAuth = (a: Auth): Auth => {
       const c = clone(a);
+      if (!isKnownAuth({ type: c.type })) {
+        // Mirrors core sanitize_auth for AuthType::Other: every field may be a secret.
+        const { type, ...fields } = c as Auth & Record<string, unknown>;
+        if (Object.values(fields).some((v) => v !== undefined && v !== null && v !== "")) {
+          credentialFields++;
+          if (replace) return { type } as Auth;
+        }
+        return c;
+      }
+      const has = (v: string | undefined) => !!v;
       if (c.type === "basic") {
-        credentialFields += 2;
-        if (!includeCredentials) {
-          c.username = "{{username}}";
-          c.password = "{{password}}";
+        if (has(c.username)) credentialFields++;
+        if (has(c.password)) credentialFields++;
+        if (replace) {
+          if (has(c.username)) c.username = "{{username}}";
+          if (has(c.password)) c.password = "{{password}}";
         }
       } else if (c.type === "bearer") {
+        if (has(c.token)) {
+          credentialFields++;
+          if (replace) c.token = "{{token}}";
+        }
+      } else if (c.type === "apikey" && c.apiKey && has(c.apiKey.value)) {
         credentialFields++;
-        if (!includeCredentials) c.token = "{{token}}";
-      } else if (c.type === "apikey" && c.apiKey) {
-        credentialFields++;
-        if (!includeCredentials) c.apiKey.value = "{{apiKey}}";
+        if (replace) c.apiKey.value = "{{apiKey}}";
       }
+      credentialFields += unknownKeys(c, AUTH_SHAPE);
       return c;
     };
     const snapshot: ShareSnapshot = { schemaVersion: 1, environment: null };
@@ -520,34 +799,49 @@ export class MockServer {
     if (kind === "collection") {
       const col = this.collection(entityId);
       const folders = this.folders.filter((f) => f.collectionId === col.id);
-      const requests = this.requests.filter((r) => r.collectionId === col.id).map(scrub);
-      snapshot.collection = { ...clone(col), auth: scrubAuth(col.auth), folders: clone(folders), requests };
+      const raw = this.requests.filter((r) => r.collectionId === col.id);
+      if (replace) {
+        if (isContainerReadOnly(col, MOCK_APP_VERSION)) refuse(col.name);
+        const f = folders.find((x) => isContainerReadOnly(x, MOCK_APP_VERSION));
+        if (f) refuse(f.name);
+        const r = raw.find((x) => isReadOnlyNewer(x, MOCK_APP_VERSION));
+        if (r) refuse(r.name);
+      }
+      const c = { ...clone(col), auth: scrubAuth(col.auth) };
+      credentialFields += unknownKeys(c, { ...COLLECTION_SHAPE, objects: {} });
+      const fs = clone(folders);
+      for (const f of fs) credentialFields += unknownKeys(f, FOLDER_SHAPE);
+      const requests = raw.map(scrub);
+      snapshot.collection = { ...c, folders: fs, requests };
       name = col.name;
       requestCount = requests.length;
       folderCount = folders.length;
     } else {
       const r = this.request(entityId);
+      if (replace && isReadOnlyNewer(r, MOCK_APP_VERSION)) refuse(r.name);
       const inlined = r.auth.type === "inherit" ? { ...r, auth: this.inheritedAuth(r) ?? { type: "none" as const } } : r;
       snapshot.request = scrub(inlined);
       name = r.name;
       requestCount = 1;
     }
+    const credentialsReplaced = replace ? credentialFields : 0;
     let secretVariablesRemoved = 0;
     if (environmentId) {
       const env = this.env(environmentId);
       secretVariablesRemoved = env.variables.filter((v) => v.secret).length;
-      snapshot.environment = { name: env.name, variables: clone(env.variables.filter((v) => !v.secret)) };
+      const vars = clone(env.variables.filter((v) => !v.secret));
+      let varExtras = 0;
+      for (const v of vars) varExtras += unknownKeys(v, VARIABLE_SHAPE);
+      credentialFields += varExtras;
+      snapshot.environment = { name: env.name, variables: vars };
+      return {
+        snapshot,
+        preview: { name, requestCount, folderCount, secretVariablesRemoved, credentialsReplaced: credentialsReplaced + (replace ? varExtras : 0), credentialFields },
+      };
     }
     return {
       snapshot,
-      preview: {
-        name,
-        requestCount,
-        folderCount,
-        secretVariablesRemoved,
-        credentialsReplaced: includeCredentials ? 0 : credentialFields,
-        credentialFields,
-      },
+      preview: { name, requestCount, folderCount, secretVariablesRemoved, credentialsReplaced, credentialFields },
     };
   }
 
@@ -642,6 +936,7 @@ export class MockServer {
         sync: this.sync,
         platform,
         dataDir: "/mock/reqharbor",
+        appVersion: MOCK_APP_VERSION,
       });
     },
     get_settings: () => clone(this.settings),
@@ -666,11 +961,17 @@ export class MockServer {
     },
     rename_project: ({ projectId, name }) => {
       const p = this.project(projectId);
+      this.ensureContainer(p, "This project");
       p.name = this.name(name);
       return clone(this.touch(p));
     },
     duplicate_project: ({ projectId }) => {
       const src = this.project(projectId);
+      this.refuseReadOnlyContainers([src], "copy", "a project");
+      this.refuseReadOnlyContainers(this.collections.filter((c) => c.projectId === projectId), "copy", "a collection");
+      this.refuseReadOnlyContainers(this.foldersOfProject(projectId), "copy", "a folder");
+      this.refuseReadOnlyIn(this.requestsOfProject(projectId), "copy");
+      this.refuseReadOnlyContainers(this.environments.filter((e) => e.projectId === projectId), "copy", "an environment");
       const ts = this.now();
       const p: Project = { ...clone(src), id: ulid(ts), name: `${src.name} copy`, sortOrder: this.projects.length, createdAt: ts, updatedAt: ts };
       this.projects.push(p);
@@ -690,6 +991,10 @@ export class MockServer {
     delete_project: ({ projectId }) => {
       this.project(projectId);
       if (this.projects.length <= 1) fail("invalid", "Cannot delete the last project");
+      this.refuseReadOnlyContainers(this.collections.filter((c) => c.projectId === projectId), "delete", "a collection");
+      this.refuseReadOnlyContainers(this.foldersOfProject(projectId), "delete", "a folder");
+      this.refuseReadOnlyIn(this.requestsOfProject(projectId), "delete");
+      this.refuseReadOnlyContainers(this.environments.filter((e) => e.projectId === projectId), "delete", "an environment");
       const cols = new Set(this.collections.filter((c) => c.projectId === projectId).map((c) => c.id));
       this.requests = this.requests.filter((r) => !cols.has(r.collectionId));
       this.folders = this.folders.filter((f) => !cols.has(f.collectionId));
@@ -702,14 +1007,17 @@ export class MockServer {
     },
     move_project: ({ projectId, index }) => {
       const p = this.project(projectId);
+      this.ensureContainer(p, "This project");
       const list = [...this.projects].sort((a, b) => a.sortOrder - b.sortOrder).filter((x) => x.id !== projectId);
       list.splice(Math.max(0, Math.min(index, list.length)), 0, p);
-      list.forEach((x, i) => (x.sortOrder = i));
+      this.renumberContainers(list, "a project");
       this.touch(p);
       return this.sortedProjects();
     },
     set_active_environment: ({ projectId, environmentId }) => {
       const p = this.project(projectId);
+      if ((p.activeEnvironmentId ?? null) === (environmentId ?? null)) return clone(p);
+      this.ensureContainer(p, "This project");
       if (environmentId) {
         const e = this.env(environmentId);
         if (e.projectId !== projectId) fail("invalid", "The environment does not belong to this project");
@@ -760,13 +1068,22 @@ export class MockServer {
     },
     update_collection: ({ collection }) => {
       const c = this.collection(collection.id);
+      this.ensureContainer(c, "This collection");
+      const auth = keepUnknownKeys(clone(collection.auth), c.auth, AUTH_SHAPE);
+      // Mirrors core: auth from a newer ReqHarbor is read-only, and never written by this build.
+      if (!jsonEqual(auth, c.auth) && !(isKnownAuth(auth) && isKnownAuth(c.auth))) {
+        fail("read_only_newer", `The auth of “${c.name}” was set up with a newer version of ReqHarbor and is read-only here. Update ReqHarbor to edit it.`);
+      }
       c.name = this.name(collection.name);
       c.description = collection.description ?? "";
-      c.auth = clone(collection.auth);
+      c.auth = auth;
       return clone(this.touch(c));
     },
     duplicate_collection: ({ collectionId }) => {
       const c = this.collection(collectionId);
+      this.refuseReadOnlyContainers([c], "copy", "a collection");
+      this.refuseReadOnlyContainers(this.folders.filter((f) => f.collectionId === collectionId), "copy", "a folder");
+      this.refuseReadOnlyIn(this.requests.filter((r) => r.collectionId === collectionId), "copy");
       const sort = Math.max(...this.collections.filter((x) => x.projectId === c.projectId).map((x) => x.sortOrder)) + 1;
       this.copyCollectionTree(c, c.projectId, this.folders.filter((f) => f.collectionId === c.id), this.requests.filter((r) => r.collectionId === c.id), `${c.name} copy`, sort);
       this.markChanged();
@@ -774,6 +1091,8 @@ export class MockServer {
     },
     delete_collection: ({ collectionId }) => {
       const c = this.collection(collectionId);
+      this.refuseReadOnlyContainers(this.folders.filter((f) => f.collectionId === collectionId), "delete", "a folder");
+      this.refuseReadOnlyIn(this.requests.filter((r) => r.collectionId === collectionId), "delete");
       this.requests = this.requests.filter((r) => r.collectionId !== collectionId);
       this.folders = this.folders.filter((f) => f.collectionId !== collectionId);
       this.collections = this.collections.filter((x) => x.id !== collectionId);
@@ -795,11 +1114,14 @@ export class MockServer {
     },
     rename_folder: ({ folderId, name }) => {
       const f = this.folder(folderId);
+      this.ensureContainer(f, "This folder");
       f.name = this.name(name);
       return clone(this.touch(f));
     },
     duplicate_folder: ({ folderId }) => {
       const src = this.folder(folderId);
+      this.refuseReadOnlyContainers([src, ...this.descendantFolders(folderId)], "copy", "a folder");
+      this.refuseReadOnlyIn(this.requestsUnderFolder(folderId), "copy");
       const ts = this.now();
       const idMap = new Map<string, string>();
       const nf: Folder = { ...clone(src), id: ulid(ts), name: `${src.name} copy`, sortOrder: this.nextSort(src.collectionId, src.parentFolderId), createdAt: ts, updatedAt: ts };
@@ -816,6 +1138,8 @@ export class MockServer {
     },
     delete_folder: ({ folderId }) => {
       const f = this.folder(folderId);
+      this.refuseReadOnlyContainers(this.descendantFolders(folderId), "delete", "a folder");
+      this.refuseReadOnlyIn(this.requestsUnderFolder(folderId), "delete");
       const ids = new Set([folderId, ...this.descendantFolders(folderId).map((d) => d.id)]);
       this.folders = this.folders.filter((x) => !ids.has(x.id));
       this.requests = this.requests.filter((r) => !(r.folderId && ids.has(r.folderId)));
@@ -829,6 +1153,7 @@ export class MockServer {
         const f = this.folder(folderId);
         if (f.collectionId !== collectionId) fail("invalid", "Folder belongs to another collection");
       }
+      this.ensureEditable(request ?? undefined);
       if (request && !METHOD_RE.test(request.method)) fail("invalid", `Invalid method "${request.method}"`);
       const ts = this.now();
       const base: Request = request
@@ -841,19 +1166,23 @@ export class MockServer {
     },
     save_request: ({ request }) => {
       const r = this.request(request.id);
+      this.ensureEditable(r);
+      this.ensureEditable(request);
       if (!METHOD_RE.test(request.method)) fail("invalid", `Invalid method "${request.method}"`);
       const { collectionId, folderId, sortOrder, createdAt } = r;
-      Object.assign(r, clone(request), { collectionId, folderId, sortOrder, createdAt });
+      Object.assign(r, keepUnknownKeys(clone(request), r), { collectionId, folderId, sortOrder, createdAt });
       if (!r.name.trim()) r.name = "Untitled request";
       return clone(this.touch(r));
     },
     rename_request: ({ requestId, name }) => {
       const r = this.request(requestId);
+      this.ensureEditable(r);
       r.name = this.name(name);
       return clone(this.touch(r));
     },
     duplicate_request: ({ requestId }) => {
       const src = this.request(requestId);
+      this.ensureEditable(src);
       const ts = this.now();
       const r: Request = { ...clone(src), id: ulid(ts), name: `${src.name} copy`, sortOrder: this.nextSort(src.collectionId, src.folderId), createdAt: ts, updatedAt: ts };
       this.requests.push(r);
@@ -869,9 +1198,10 @@ export class MockServer {
     move_node: ({ kind, id, targetCollectionId, targetFolderId, index }) => {
       if (kind === "collection") {
         const c = this.collection(id);
+        this.ensureContainer(c, "This collection");
         const list = this.collections.filter((x) => x.projectId === c.projectId && x.id !== id).sort((a, b) => a.sortOrder - b.sortOrder);
         list.splice(Math.max(0, Math.min(index, list.length)), 0, c);
-        list.forEach((x, i) => (x.sortOrder = i));
+        this.renumberContainers(list, "a collection");
         this.touch(c);
         return this.tree(c.projectId);
       }
@@ -880,6 +1210,8 @@ export class MockServer {
       const tf = targetFolderId ? this.folder(targetFolderId) : null;
       if (tf && tf.collectionId !== target.id) fail("invalid", "Target folder belongs to another collection");
       const node = kind === "folder" ? this.folder(id) : this.request(id);
+      if (kind === "request") this.ensureEditable(node as Request);
+      else this.ensureContainer(node, "This folder");
       const srcCollection = this.collection(node.collectionId);
       if (srcCollection.projectId !== target.projectId) fail("invalid", "Cannot move across projects");
       if (kind === "folder") {
@@ -887,10 +1219,20 @@ export class MockServer {
           fail("invalid", "Cannot move a folder into itself");
         }
       }
+      // AC-FWD-3: never re-home a read-only request with its folder.
+      if (kind === "folder" && node.collectionId !== target.id) {
+        this.refuseReadOnlyContainers(this.descendantFolders(id), "move", "a folder");
+        this.refuseReadOnlyIn(this.requestsUnderFolder(id), "move");
+      }
       const parent = targetFolderId ?? null;
       const sib = this.siblingsOf(target.id, parent);
       const sameKind = (kind === "folder" ? sib.folders : sib.requests).filter((x) => x.id !== id) as (Folder | Request)[];
       sameKind.splice(Math.max(0, Math.min(index, sameKind.length)), 0, node);
+      // Read-only siblings keep their sort order (core numbers requests around them).
+      const reqOrder = kind === "request" ? (sameKind as Request[]) : sib.requests;
+      const fixed = new Set(reqOrder.filter((x) => isReadOnlyNewer(x, MOCK_APP_VERSION)));
+      const numbers = fixed.size ? renumberAround(reqOrder, fixed) : null;
+      if (fixed.size && !numbers) fail("read_only_newer", readOnlyNewerMessage([...fixed][0], "move"));
       if (kind === "folder") {
         const f = node as Folder;
         const moved = [f, ...this.descendantFolders(f.id)];
@@ -907,7 +1249,15 @@ export class MockServer {
       }
       const folders = kind === "folder" ? (sameKind as Folder[]) : sib.folders;
       const reqs = kind === "request" ? (sameKind as Request[]) : sib.requests;
-      [...folders, ...reqs].forEach((x, i) => (x.sortOrder = i));
+      // Read-only sibling folders (AC-FWD-4) keep their sort order too.
+      const folderFixed = new Set(folders.filter((x) => isContainerReadOnly(x, MOCK_APP_VERSION)));
+      if (numbers || folderFixed.size) {
+        const fnums = renumberAround(folders, folderFixed);
+        if (!fnums) return fail("read_only_newer", readOnlyNewerMessage([...folderFixed][0], "move", "a folder"));
+        for (const [x, n] of fnums) x.sortOrder = n;
+        if (numbers) for (const [x, n] of numbers) x.sortOrder = n;
+        else reqs.forEach((x, i) => (x.sortOrder = folders.length + i));
+      } else [...folders, ...reqs].forEach((x, i) => (x.sortOrder = i));
       this.touch(node);
       return this.tree(target.projectId);
     },
@@ -932,13 +1282,17 @@ export class MockServer {
     },
     update_environment: ({ environment }) => {
       const e = this.env(environment.id);
+      this.ensureContainer(e, "This environment");
       e.name = this.name(environment.name);
+      const reserved = environment.variables.find((v) => v.key.trimStart().startsWith("$"));
+      if (reserved) fail("invalid", `Variable names can't start with $ ("${reserved.key.trim()}"): {{$…}} is reserved for dynamic variables`);
       e.variables = clone(environment.variables);
       return clone(this.touch(e));
     },
     duplicate_environment: ({ environmentId }) => {
       const src = this.env(environmentId);
       if (src.projectId === null) fail("invalid", "The Global environment cannot be duplicated");
+      this.refuseReadOnlyContainers([src], "copy", "an environment");
       const ts = this.now();
       const e: Environment = { ...clone(src), id: ulid(ts), name: `${src.name} copy`, sortOrder: src.sortOrder + 0.5, createdAt: ts, updatedAt: ts };
       this.environments.push(e);
@@ -950,7 +1304,8 @@ export class MockServer {
       const e = this.env(environmentId);
       if (e.projectId === null) fail("invalid", "The Global environment cannot be deleted");
       this.environments = this.environments.filter((x) => x.id !== environmentId);
-      for (const p of this.projects) if (p.activeEnvironmentId === environmentId) this.touch(p).activeEnvironmentId = null;
+      // A read-only project (AC-FWD-4) keeps its dangling selection, like core.
+      for (const p of this.projects) if (p.activeEnvironmentId === environmentId && !isContainerReadOnly(p, MOCK_APP_VERSION)) this.touch(p).activeEnvironmentId = null;
       this.markChanged();
       return this.sortedEnvs();
     },
@@ -962,6 +1317,8 @@ export class MockServer {
         environmentId: env.id,
         environmentName: env.name,
       })),
+
+    get_dynamic_variables: () => dynamicCatalogue(),
 
     list_history: () => this.history.map((h) => this.summary(h)),
     open_history_entry: ({ historyId }): OpenedHistory => {
@@ -1001,6 +1358,9 @@ export class MockServer {
     },
 
     send_request: async ({ executionId, request, projectId }): Promise<SendResult> => {
+      if (isReadOnlyNewer(request, MOCK_APP_VERSION) || this.requests.some((r) => r.id === request.id && isReadOnlyNewer(r, MOCK_APP_VERSION))) {
+        fail("read_only_newer", "This request needs a newer version of ReqHarbor");
+      }
       const pid = projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
       const { prepared, displayUrl, unresolved } = this.prepare(request, pid);
       const ctrl = new AbortController();
@@ -1086,10 +1446,12 @@ export class MockServer {
     import_curl: ({ text }) => importCurl(text),
     looks_like_curl: ({ text }) => looksLikeCurl(text),
     export_curl: ({ request, projectId, keepVariables }) => {
+      if (isReadOnlyNewer(request, MOCK_APP_VERSION)) fail("read_only_newer", "This request needs a newer version of ReqHarbor");
       if (keepVariables) return exportCurl(request, true, this.inheritedAuth(request));
       const pid = projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
-      const res = this.resolveRequest({ ...request, params: [] }, pid, false);
-      const { resolve } = this.resolver(pid, false);
+      const dynamic = dynamicMemo();
+      const res = this.resolveRequest({ ...request, params: [] }, pid, false, dynamic);
+      const { resolve } = this.resolver(pid, false, dynamic);
       const r: Request = {
         ...request,
         url: res.url,
@@ -1192,7 +1554,7 @@ export class MockServer {
       return clone(this.sync);
     },
     sync_disconnect: () => {
-      this.sync = { ...this.sync, state: "disconnected", connected: false, workerUrl: null, remoteWorkspaceId: null, lastError: null, pendingChanges: 0, nextRetryAt: null, retryAttempt: 0, skippedEntities: [], warning: null };
+      this.sync = { ...this.sync, state: "disconnected", connected: false, workerUrl: null, remoteWorkspaceId: null, lastError: null, pendingChanges: 0, nextRetryAt: null, retryAttempt: 0, skippedEntities: [], unsupportedEntities: [], warning: null };
       this.syncToken = null;
       this.emit("sync://status", this.sync);
       return clone(this.sync);
@@ -1228,7 +1590,7 @@ export class MockServer {
       const ts = this.now();
       this.sync = { ...this.sync, state: "idle", lastSyncAt: ts, lastPullAt: ts, pendingChanges: 0, lastError: null, nextRetryAt: null, retryAttempt: 0 };
       this.emit("sync://status", this.sync);
-      return { pushed, pulled: 0, deleted: 0, conflicts: [], skipped: [], cursor: ts, tooLarge: clone(this.sync.skippedEntities) };
+      return { pushed, pulled: 0, deleted: 0, conflicts: [], skipped: [], cursor: ts, tooLarge: clone(this.sync.skippedEntities), unsupported: [], restored: false };
     },
     sync_workspace_info: async () => {
       this.requireSync();
@@ -1378,6 +1740,7 @@ export function getMockServer(): MockServer {
       empty: qs.get("seed") === "empty",
       platform: qs.get("platform") ?? undefined,
       corrupt: qs.get("corrupt") === "1",
+      newer: qs.get("newer") === "1",
     });
     if (typeof window !== "undefined") (window as unknown as { __mock?: MockServer }).__mock = singleton;
   }

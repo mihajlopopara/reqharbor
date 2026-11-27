@@ -6,10 +6,9 @@
 //! auth become headers / query params, Basic auth becomes `-u`.
 
 use super::shell::quote;
+use crate::dynamic::DynamicCtx;
 use crate::model::{Auth, AuthType, BodyType, FormFieldKind, Request};
-use crate::prepare::{
-    PrepareError, PreparedBody, effective_auth, form_urlencode, prepare_with_boundary,
-};
+use crate::prepare::{PrepareError, PreparedBody, effective_auth, form_urlencode, prepare_in};
 use crate::vars::{ResolveOptions, Unresolved, VarScope};
 use serde::Deserialize;
 
@@ -17,6 +16,8 @@ use serde::Deserialize;
 #[serde(rename_all = "camelCase")]
 pub struct ExportOptions {
     /// "Keep {{variables}}": export raw text without resolving (AC-CEXP-5).
+    /// Dynamic variables (`{{$uuid}}`) stay literal too; otherwise they are
+    /// generated once and reused everywhere in the command.
     pub keep_variables: bool,
 }
 
@@ -48,7 +49,12 @@ pub fn export_curl(
 ) -> Result<String, PrepareError> {
     let empty = VarScope::empty();
     let scope = if opts.keep_variables { &empty } else { scope };
-    let prepared = prepare_with_boundary(request, scope, collection_auth, "boundary")?;
+    let dynamic = if opts.keep_variables {
+        DynamicCtx::keep()
+    } else {
+        DynamicCtx::new()
+    };
+    let prepared = prepare_in(request, scope, collection_auth, "boundary", &dynamic)?;
 
     let explicit = |name: &str| {
         request
@@ -64,15 +70,17 @@ pub fn export_curl(
     {
         headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
         let mut u = Unresolved::default();
-        let user = scope.resolve(
+        let user = scope.resolve_in(
             auth.username.as_deref().unwrap_or(""),
             ResolveOptions::default(),
             &mut u,
+            &dynamic,
         );
-        let pass = scope.resolve(
+        let pass = scope.resolve_in(
             auth.password.as_deref().unwrap_or(""),
             ResolveOptions::default(),
             &mut u,
+            &dynamic,
         );
         basic = Some(format!("{user}:{pass}"));
     }
@@ -86,14 +94,16 @@ pub fn export_curl(
     }
 
     let mut body_parts: Vec<String> = Vec::new();
-    match (&prepared.body, request.body.body_type) {
+    match (&prepared.body, &request.body.body_type) {
         (None, _) => {}
         (Some(PreparedBody::File(path)), _) => {
             body_parts.push(format!("--data-binary {}", quote(&format!("@{path}"))));
         }
         (Some(PreparedBody::Multipart { parts, .. }), _) => {
             for p in parts {
-                match p.kind {
+                match &p.kind {
+                    // Never prepared: such a request is not editable.
+                    FormFieldKind::Other(_) => {}
                     FormFieldKind::File => {
                         let mut v = format!("{}=@{}", p.name, form_path(&p.value));
                         if let Some(ct) = &p.content_type {
@@ -130,8 +140,8 @@ pub fn export_curl(
                 .iter()
                 .filter(|f| f.enabled && !(f.key.is_empty() && f.value.is_empty()))
             {
-                let key = scope.resolve(&f.key, ResolveOptions::default(), &mut u);
-                let value = scope.resolve(&f.value, ResolveOptions::default(), &mut u);
+                let key = scope.resolve_in(&f.key, ResolveOptions::default(), &mut u, &dynamic);
+                let value = scope.resolve_in(&f.value, ResolveOptions::default(), &mut u, &dynamic);
                 if key.is_empty() {
                     // `--data-urlencode '=v'` would drop the `=`; send it verbatim.
                     body_parts.push(format!(

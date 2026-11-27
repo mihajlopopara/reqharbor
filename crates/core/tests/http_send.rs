@@ -385,6 +385,7 @@ async fn ac_hist_1_send_produces_history_with_masked_secrets() {
         sort_order: 0,
         created_at: 0,
         updated_at: 0,
+        extra: Default::default(),
     };
     let scope = VarScope::new(None, Some(&env));
     let mut r = req("GET", "{{base}}/a?k={{key}}");

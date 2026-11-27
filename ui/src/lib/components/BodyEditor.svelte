@@ -2,6 +2,8 @@
   import type { BodyType } from "../api/types";
   import type { EditorController } from "../cm/editor";
   import { app } from "../stores/app.svelte";
+  import { ui } from "../stores/ui.svelte";
+  import { dynamicVariables } from "../util/vars";
   import { pickFile, fileNameOf } from "../api/platform";
   import CodeEditor from "./CodeEditor.svelte";
   import KvTable from "./KvTable.svelte";
@@ -48,6 +50,20 @@
   export async function format() {
     const pos = await app.formatBody();
     if (pos) (body.type === "graphql" ? varsEditor : editor)?.goTo(pos.line, pos.column);
+  }
+
+  /** "Insert fake data": a {{$dynamic}} variable at the caret (AC-ENV-10). */
+  function insertFake(e: MouseEvent, target: EditorController | null) {
+    ui.openMenu(
+      dynamicVariables().map((d) => ({
+        label: d.description,
+        shortcut: d.name,
+        testid: `fake-${d.name.slice(1)}`,
+        action: () => target?.insert(`{{${d.name}}}`),
+      })),
+      e.currentTarget as HTMLElement,
+      { alignRight: true },
+    );
   }
 
   async function chooseBinary() {
@@ -98,13 +114,16 @@
     <div class="box">
     <div class="box-head">
       <span>{LABELS[body.type]}</span>
-      {#if body.type !== "text"}
-        <button class="link" type="button" title="Format  {app.mod}⇧F" onclick={format} data-testid="format-body">Format</button>
-      {/if}
+      <span class="head-actions">
+        <button class="link" type="button" aria-haspopup="menu" title="Insert a {'{{$…}}'} variable that generates a new value each send" onclick={(e) => insertFake(e, editor)} data-testid="insert-fake">Insert fake data</button>
+        {#if body.type !== "text"}
+          <button class="link" type="button" title="Format  {app.mod}⇧F" onclick={format} data-testid="format-body">Format</button>
+        {/if}
+      </span>
     </div>
     <CodeEditor
       value={body.text ?? ""}
-      language={body.type}
+      language={body.type as "json" | "xml" | "text"}
       lookup={app.lookup}
       ariaLabel="Request body"
       testid="body-editor"
@@ -117,7 +136,7 @@
     </div>
   {:else if body.type === "form" || body.type === "formEncoded"}
     <div class="pad scroll">
-      <KvTable rows={body.type === "form" ? (body.form ?? []) : (body.formEncoded ?? [])} kind={body.type} lookup={app.lookup} testid={body.type === "form" ? "form" : "form-encoded"} />
+      <KvTable rows={body.type === "form" ? (body.form ?? []) : (body.formEncoded ?? [])} kind={body.type as "form" | "formEncoded"} lookup={app.lookup} testid={body.type === "form" ? "form" : "form-encoded"} />
     </div>
   {:else if body.type === "graphql" && body.graphql}
     {@const gql = body.graphql}
@@ -128,7 +147,10 @@
     <div class="box gv">
       <div class="box-head">
         <span>Variables</span>
-        <button class="link" type="button" title="Format  {app.mod}⇧F" onclick={format}>Format</button>
+        <span class="head-actions">
+          <button class="link" type="button" aria-haspopup="menu" title="Insert a {'{{$…}}'} variable that generates a new value each send" onclick={(e) => insertFake(e, varsEditor)}>Insert fake data</button>
+          <button class="link" type="button" title="Format  {app.mod}⇧F" onclick={format}>Format</button>
+        </span>
       </div>
       <CodeEditor value={gql.variables} language="json" lookup={app.lookup} ariaLabel="GraphQL variables" testid="graphql-variables" placeholder={"{ }"} bind:controller={varsEditor} onchange={(v) => (gql.variables = v)} />
     </div>
@@ -198,6 +220,11 @@
     background: var(--bg-sidebar);
     border-bottom: 1px solid var(--border-subtle);
     flex: none;
+  }
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-5);
   }
   .box :global(.cm-editor) {
     padding-top: var(--sp-2);

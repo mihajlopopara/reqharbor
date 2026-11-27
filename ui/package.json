@@ -17,6 +17,7 @@
     "size": "node scripts/bundle-size.mjs"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "6.20.4",
     "@codemirror/commands": "6.11.2",
     "@codemirror/lang-html": "6.4.12",
     "@codemirror/lang-json": "6.0.2",

@@ -3,7 +3,7 @@
   import { app } from "../stores/app.svelte";
   import { ui } from "../stores/ui.svelte";
   import { shortcutText } from "../util/shortcuts";
-  import { looksLikeCurl } from "../util/request";
+  import { looksLikeCurl, NEEDS_NEWER_VERSION, readOnlyReason, REQUIRES_NEWER } from "../util/request";
   import type { EditorController } from "../cm/editor";
   import MethodSelect from "./MethodSelect.svelte";
   import VarInput from "./VarInput.svelte";
@@ -42,13 +42,19 @@
   const hasAuthHeader = $derived(r.headers.some((h) => h.enabled && h.key.trim().toLowerCase() === "authorization"));
   const queryHint = $derived(r.method === "QUERY" && r.body.type === "none");
   const inflight = $derived(app.currentInflight);
+  /** AC-FWD-3/4: a request from a newer ReqHarbor is view-only. */
+  const ro = $derived(app.readOnly);
+  /** Why (from the editor copy, else the saved copy), e.g. "This is a “grpc” request". */
+  const roReason = $derived(
+    ro ? (readOnlyReason(r, app.appVersion) ?? readOnlyReason(app.index?.requestById.get(r.id) ?? r, app.appVersion) ?? "It was made with a newer version of ReqHarbor") : null,
+  );
 
   // Pick a sensible tab when switching requests.
   $effect(() => {
     const id = r.id;
     if (id === lastId) return;
     lastId = id;
-    tab = r.body.type !== "none" ? "body" : "query";
+    tab = app.readOnly || r.body.type !== "none" ? "body" : "query";
   });
 
   $effect(() => {
@@ -56,7 +62,7 @@
   });
 
   $effect(() => {
-    if (ui.renameRequestTick) untrack(() => !app.isScratch && startRename());
+    if (ui.renameRequestTick) untrack(() => !app.isScratch && !app.readOnly && startRename());
   });
 
   $effect(() => {
@@ -79,6 +85,7 @@
   }
 
   function startRename() {
+    if (ro) return;
     nameDraft = r.name;
     renaming = true;
   }
@@ -103,13 +110,13 @@
     const saved = !app.isScratch;
     ui.openMenu(
       [
-        { label: "Copy as cURL", shortcut: shortcutText("Mod+Shift+C", app.platform), action: () => void app.copyCurl(), testid: "menu-copy-curl" },
-        { label: "Export as cURL…", action: () => (ui.exportCurl = { anchor: menuBtn ?? null }), testid: "menu-export-curl" },
-        { label: "Share…", disabled: !saved, action: () => (ui.shareDialog = { kind: "request", entityId: r.id, name: r.name }), testid: "menu-share" },
+        { label: "Copy as cURL", disabled: ro, shortcut: shortcutText("Mod+Shift+C", app.platform), action: () => void app.copyCurl(), testid: "menu-copy-curl" },
+        { label: "Export as cURL…", disabled: ro, action: () => (ui.exportCurl = { anchor: menuBtn ?? null }), testid: "menu-export-curl" },
+        { label: "Share…", disabled: !saved || ro, action: () => (ui.shareDialog = { kind: "request", entityId: r.id, name: r.name }), testid: "menu-share" },
         { separator: true },
-        { label: saved ? "Rename" : "Save to collection…", shortcut: saved ? "F2" : shortcutText("Mod+S", app.platform), action: () => (saved ? startRename() : (ui.picker = { kind: "saveRequest" })) },
-        { label: "Duplicate", disabled: !saved, action: () => void app.duplicate("request", r.id) },
-        { label: "Move to…", disabled: !saved, action: () => (ui.picker = { kind: "moveRequest", requestId: r.id }) },
+        { label: saved ? "Rename" : "Save to collection…", disabled: ro, shortcut: saved ? "F2" : shortcutText("Mod+S", app.platform), action: () => (saved ? startRename() : (ui.picker = { kind: "saveRequest" })) },
+        { label: "Duplicate", disabled: !saved || ro, action: () => void app.duplicate("request", r.id) },
+        { label: "Move to…", disabled: !saved || ro, action: () => (ui.picker = { kind: "moveRequest", requestId: r.id }) },
         { separator: true },
         { label: "Delete", danger: true, disabled: !saved, action: () => void app.deleteNode("request", r.id) },
       ],
@@ -161,7 +168,7 @@
             onblur={commitRename}
           />
         {:else}
-          <button class="name-btn" type="button" ondblclick={startRename} title="Double-click to rename">{r.name}</button>
+          <button class="name-btn" type="button" ondblclick={startRename} title={ro ? REQUIRES_NEWER : "Double-click to rename"}>{r.name}</button>
         {/if}
         {#if app.dirty}<span class="unsaved" title="Unsaved changes" data-testid="dirty-dot"></span>{/if}
       {/if}
@@ -169,16 +176,23 @@
     <button
       class="btn btn-ghost btn-sm"
       type="button"
-      disabled={!app.isScratch && !app.dirty}
+      disabled={ro || (!app.isScratch && !app.dirty)}
       onclick={() => void app.save()}
-      title={app.isScratch ? "Save to a collection" : "Save request"}
+      title={ro ? `${NEEDS_NEWER_VERSION}: it can't be saved here` : app.isScratch ? "Save to a collection" : "Save request"}
       data-testid="save-request">Save<span class="kbd-inline">{shortcutText("Mod+S", app.platform)}</span></button
     >
     <button class="icon-btn" type="button" aria-label="More actions" aria-haspopup="menu" bind:this={menuBtn} onclick={openMenu} data-testid="request-menu"><Icon name="more" /></button>
   </div>
 
+  {#if ro}
+    <div class="readonly" role="status" data-testid="read-only-banner">
+      <Icon name="alert" small /><b>{REQUIRES_NEWER}</b><span>{NEEDS_NEWER_VERSION}. You can view and delete it here; editing, saving and sending need an update.</span>
+    </div>
+  {/if}
+
   <div class="row2">
     <div class="reqbar" class:invalid={!!app.sendBlocked && app.sendBlocked === "Enter a URL"}>
+      <fieldset class="ro-fs" disabled={ro}>
       <MethodSelect method={r.method} onchange={(m) => (app.request.method = m)} />
       <VarInput
         variant="url"
@@ -187,6 +201,7 @@
         placeholder="Enter a URL or paste a cURL command"
         ariaLabel="URL"
         testid="url-input"
+        disabled={ro}
         bind:inputEl={urlEl}
         oninput={(v) => app.setUrl(v)}
         onpaste={onUrlPaste}
@@ -197,14 +212,15 @@
           }
         }}
       />
+      </fieldset>
     </div>
     <button
       class="btn send"
       class:btn-primary={!inflight}
       class:btn-secondary={!!inflight}
       type="button"
-      disabled={!inflight && !r.url.trim()}
-      title={app.sendBlocked ?? (inflight ? "Cancel request" : `Send  ${shortcutText("Mod+Enter", app.platform)}`)}
+      disabled={!inflight && (ro || !r.url.trim())}
+      title={ro ? NEEDS_NEWER_VERSION : (app.sendBlocked ?? (inflight ? "Cancel request" : `Send  ${shortcutText("Mod+Enter", app.platform)}`))}
       onclick={() => void app.sendOrCancel()}
       data-testid="send-button"
     >
@@ -250,6 +266,7 @@
       >
       {#if settingsOpen}
         <div class="settings menu pop" bind:this={settingsEl} role="dialog" aria-label="Request settings" data-testid="request-settings-popover">
+          <fieldset class="ro-fs" disabled={ro}>
           <label class="checkbox">
             <input type="checkbox" checked={r.settings.followRedirects} onchange={(e) => (app.request.settings.followRedirects = e.currentTarget.checked)} />Follow redirects
           </label>
@@ -272,13 +289,22 @@
           {#if !r.settings.verifyTls}
             <div class="hint warn"><Icon name="alert" />Self-signed and invalid certificates will be accepted.</div>
           {/if}
+          </fieldset>
         </div>
       {/if}
     </span>
   </div>
 
   <div class="panel" role="tabpanel" data-testid="req-panel-{tab}">
-    {#if tab === "query"}
+    <fieldset class="ro-fs" disabled={ro}>
+    {#if ro && tab === "body"}
+      <div class="empty newer" data-testid="body-needs-newer">
+        <h3>{NEEDS_NEWER_VERSION}</h3>
+        <p>
+          <span data-testid="read-only-reason">{roReason}</span>, which this version can’t edit. It’s kept intact and still syncs. Update ReqHarbor to open it.
+        </p>
+      </div>
+    {:else if tab === "query"}
       <div class="scroll">
         <KvTable rows={app.request.params} kind="query" lookup={app.lookup} testid="query" onchange={() => app.syncUrlFromParams()} />
       </div>
@@ -304,6 +330,7 @@
         <p>Scripts and assertions are on the roadmap.</p>
       </div>
     {/if}
+    </fieldset>
   </div>
 </main>
 
@@ -428,6 +455,35 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+  }
+  /* Disabling wrappers for view-only requests (AC-FWD-3): no box of their own. */
+  fieldset {
+    border: 0;
+    margin: 0;
+    padding: 0;
+    min-width: 0;
+  }
+  .ro-fs {
+    display: contents;
+  }
+  .readonly {
+    margin: 0 var(--sp-5) var(--sp-3);
+    padding: var(--sp-3) var(--sp-4);
+    border-radius: var(--r-sm);
+    background: var(--bg-input);
+    color: var(--text-2);
+    font-size: var(--fs-sm);
+    display: flex;
+    gap: var(--sp-3);
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .readonly b {
+    color: var(--warning);
+    font-weight: var(--fw-medium);
+  }
+  .newer {
+    flex: 1;
   }
   .scroll {
     flex: 1;

@@ -73,7 +73,7 @@ async fn live_two_devices_sync_conflict_delete_secrets_and_shares() {
     assert!(rep.pushed >= 4, "{rep:?}");
 
     // Server never stores the secret value.
-    let (changes, _) = ca.pull_all(0).await.unwrap();
+    let changes = ca.pull_all(0).await.unwrap().changes;
     let raw = serde_json::to_string(&changes).unwrap();
     assert!(!raw.contains("S3CRET-VALUE"));
 
@@ -191,7 +191,7 @@ async fn bug_qa_r1_005_one_oversized_entity_blocks_all_sync() {
     add_request(&mut s, &col.id, "big", &big);
     let res = sync::sync_now(&c, &mut s).await;
     // Whatever happens to the big one, the small one must reach the server.
-    let (changes, _) = c.pull_all(0).await.unwrap();
+    let changes = c.pull_all(0).await.unwrap().changes;
     let small_synced = changes.iter().any(|ch| ch.id == small.id);
     assert!(
         small_synced,

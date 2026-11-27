@@ -8,6 +8,7 @@ use reqharbor_core::curl::{self, CurlImport, ExportOptions};
 use reqharbor_core::history::HistorySummary;
 use reqharbor_core::model::*;
 use reqharbor_core::openapi::{self, ImportReport, SpecInfo};
+use reqharbor_core::prepare::PrepareError;
 use reqharbor_core::send::{ResponseMeta, send_request as core_send};
 use reqharbor_core::share::{self, ShareOptions, SharePreview};
 use reqharbor_core::storage::{ChildCounts, CorruptFile, NodeKind};
@@ -55,6 +56,9 @@ pub struct Bootstrap {
     pub sync: SyncStatus,
     pub platform: String,
     pub data_dir: String,
+    /// This build's version; requests whose `minClientVersion` is newer are
+    /// read-only (AC-FWD-4).
+    pub app_version: String,
 }
 
 #[tauri::command]
@@ -72,6 +76,7 @@ pub fn bootstrap(state: S<'_>) -> CmdResult<Bootstrap> {
         sync: state.sync_status(),
         platform: std::env::consts::OS.to_string(),
         data_dir: store.dir().to_string_lossy().into_owned(),
+        app_version: CLIENT_VERSION.to_string(),
     })
 }
 
@@ -315,6 +320,13 @@ pub fn get_variables(state: S<'_>, project_id: Option<String>) -> Vec<VariableIn
     state.store().var_scope(project_id.as_deref()).visible()
 }
 
+/// The dynamic-variable catalogue (`{{$uuid}}`, `{{$randomEmail}}`, …) for
+/// highlighting, hover and autocomplete (AC-ENV-8..10).
+#[tauri::command]
+pub fn get_dynamic_variables() -> Vec<reqharbor_core::dynamic::DynamicVariableInfo> {
+    reqharbor_core::dynamic::catalogue()
+}
+
 // -------------------------------------------------------------------- history
 
 #[tauri::command]
@@ -389,6 +401,11 @@ pub async fn send_request(
 ) -> CmdResult<SendResult> {
     let (scope, collection_auth) = {
         let store = state.store();
+        // AC-FWD-3/4: a stored request from a newer ReqHarbor is never sent,
+        // even if the webview dropped its `kind` / `body.type`.
+        if store.request(&request.id).is_some_and(|r| !r.is_editable()) {
+            return Err(PrepareError::NeedsNewerVersion.into());
+        }
         let pid = project_id.or_else(|| {
             store
                 .collection(&request.collection_id)

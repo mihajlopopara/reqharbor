@@ -23,6 +23,9 @@ flate2 = "1"
 brotli-decompressor = "6"
 serde_yaml_ng = "0.10"
 quick-xml = "0.42"
+# Dynamic variables ({{$uuid}}, {{$randomEmail}}, …); both already in Cargo.lock.
+rand = "0.10"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"

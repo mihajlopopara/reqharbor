@@ -9,6 +9,9 @@
  *   When sending objects back to Rust, omitted and `null` are both accepted for these.
  * - Rust accepts missing fields that have defaults (see API_CONTRACT.md §2), but the UI
  *   should send complete objects as received.
+ * - Forward compatibility (AC-FWD-1): data objects may carry keys not listed here, written by a
+ *   newer ReqHarbor. Rust keeps them on disk and on the sync wire; the UI must not drop them
+ *   (copy with spread / structuredClone instead of rebuilding objects field by field).
  */
 
 // ───────────────────────────── Data model (PRODUCT.md §3) ─────────────────────────────
@@ -27,6 +30,12 @@ export interface Project {
   activeEnvironmentId: string | null;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Oldest ReqHarbor allowed to change this item (AC-FWD-4); newer than `Bootstrap.appVersion` =
+   * read-only here (rename, edit, move, copy and cascading deletes fail with `read_only_newer`).
+   * Only a newer ReqHarbor writes it.
+   */
+  minClientVersion?: string;
 }
 
 export interface Collection {
@@ -39,6 +48,12 @@ export interface Collection {
   sortOrder: number;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Oldest ReqHarbor allowed to change this item (AC-FWD-4); newer than `Bootstrap.appVersion` =
+   * read-only here (rename, edit, move, copy and cascading deletes fail with `read_only_newer`).
+   * Only a newer ReqHarbor writes it.
+   */
+  minClientVersion?: string;
 }
 
 export interface Folder {
@@ -51,10 +66,26 @@ export interface Folder {
   sortOrder: number;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Oldest ReqHarbor allowed to change this item (AC-FWD-4); newer than `Bootstrap.appVersion` =
+   * read-only here (rename, edit, move, copy and cascading deletes fail with `read_only_newer`).
+   * Only a newer ReqHarbor writes it.
+   */
+  minClientVersion?: string;
 }
+
+/**
+ * What a request talks (AC-FWD-2). Only "http" is editable and sendable in this build; any other
+ * value (including ones this build doesn't know) makes the request read-only.
+ */
+export type RequestKind = "http" | "graphql" | "grpc" | "ws" | (string & {});
 
 export interface Request {
   id: string;
+  /** Omitted (= "http") for every request this build creates. */
+  kind?: RequestKind;
+  /** Oldest ReqHarbor allowed to edit this request (AC-FWD-4); newer than `Bootstrap.appVersion` = read-only. */
+  minClientVersion?: string;
   /** Owning collection; "" (empty string) for an unsaved scratch request. */
   collectionId: string;
   folderId: string | null;
@@ -80,7 +111,9 @@ export interface KeyValue {
   description?: string;
 }
 
-export type AuthType = "none" | "inherit" | "basic" | "bearer" | "apikey";
+export type KnownAuthType = "none" | "inherit" | "basic" | "bearer" | "apikey";
+/** Any other string comes from a newer ReqHarbor (e.g. "oauth2"): kept as is; such auth is read-only (AC-FWD-3). */
+export type AuthType = KnownAuthType | (string & {});
 
 export interface Auth {
   type: AuthType;
@@ -97,10 +130,13 @@ export interface Auth {
 export interface ApiKeyAuth {
   key: string;
   value: string;
-  in: "header" | "query";
+  /** Any other value comes from a newer ReqHarbor and makes the request read-only. */
+  in: "header" | "query" | (string & {});
 }
 
-export type BodyType = "none" | "json" | "xml" | "text" | "form" | "formEncoded" | "graphql" | "binary";
+export type KnownBodyType = "none" | "json" | "xml" | "text" | "form" | "formEncoded" | "graphql" | "binary";
+/** Any other string comes from a newer ReqHarbor: kept as is, and the request is read-only (AC-FWD-3). */
+export type BodyType = KnownBodyType | (string & {});
 
 export interface Body {
   type: BodyType;
@@ -125,7 +161,8 @@ export interface FormField {
   key: string;
   /** Text value, or the absolute file path when kind = "file". */
   value: string;
-  kind: "text" | "file";
+  /** Any other value comes from a newer ReqHarbor and makes the request read-only. */
+  kind: "text" | "file" | (string & {});
   enabled: boolean;
   /** Optional part Content-Type (e.g. from cURL `-F 'f=@a.png;type=image/png'`). */
   contentType?: string;
@@ -150,10 +187,16 @@ export interface Environment {
   sortOrder: number;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Oldest ReqHarbor allowed to change this item (AC-FWD-4); newer than `Bootstrap.appVersion` =
+   * read-only here (rename, edit, move, copy and cascading deletes fail with `read_only_newer`).
+   * Only a newer ReqHarbor writes it.
+   */
+  minClientVersion?: string;
 }
 
 export interface Variable {
-  /** Referenced as {{key}}; key should match [A-Za-z0-9_.-]+ */
+  /** Referenced as {{key}}; key should match [A-Za-z0-9_.-]+ and may not start with "$" ({{$name}} is a dynamic variable) */
   key: string;
   value: string;
   enabled: boolean;
@@ -256,12 +299,16 @@ export type CommandErrorCode =
   | "sync_quota_exceeded"
   | "sync_protocol"
   | "share_gone"
+  /** The request was made by a newer ReqHarbor: it can't be edited or sent here (AC-FWD-3/4). */
+  | "read_only_newer"
   | "internal";
 
 export type PrepareErrorDetails =
   | { kind: "invalidMethod"; message: string }
   | { kind: "invalidGraphqlVariables"; message: string }
-  | { kind: "emptyUrl" };
+  | { kind: "emptyUrl" }
+  /** The request inherits a collection auth from a newer ReqHarbor (unknown scheme). */
+  | { kind: "inheritedAuthNeedsNewerVersion" };
 
 export interface FormatErrorDetails {
   message: string;
@@ -291,6 +338,8 @@ export interface Bootstrap {
   /** "macos" | "windows" | "linux" — for ⌘ vs Ctrl (AC-KEY-2). */
   platform: string;
   dataDir: string;
+  /** This build's version, e.g. "0.1.0"; compared with `Request.minClientVersion`. */
+  appVersion: string;
 }
 
 export interface ChildCounts {
@@ -308,6 +357,16 @@ export interface VariableInfo {
   secret: boolean;
   environmentId: string;
   environmentName: string;
+}
+
+/** One dynamic variable: `{{$name}}` is replaced by a generated value at send time (AC-ENV-8). */
+export interface DynamicVariableInfo {
+  /** Including the leading "$", e.g. "$randomEmail". */
+  name: string;
+  /** e.g. "Random email" */
+  description: string;
+  /** e.g. "jane.doe@example.com" */
+  example: string;
 }
 
 export interface HistorySummary {
@@ -460,9 +519,16 @@ export interface SyncStatus {
   /** When offline: time of the next automatic retry ("Retrying in 30 s"). */
   nextRetryAt: number | null;
   retryAttempt: number;
+  /** Local changes a push can clear; items in `unsupportedEntities` are not counted (they wait for a server update). */
   pendingChanges: number;
   /** Local items not synced because they exceed 512 KB (never retried until edited). */
   skippedEntities: SkippedEntity[];
+  /**
+   * Local items of a type the server doesn't accept (`reason: "unsupported_type"`): they stay
+   * local-only until the server is updated. `warning` then carries "3 items aren't synced because
+   * this server is older than your app. Ask its admin to update reqharbor-server."
+   */
+  unsupportedEntities: SkippedEntity[];
   /** Non-fatal warning for the sync indicator, e.g. "1 item is too large to sync (over 512 KB): Big upload". */
   warning: string | null;
 }
@@ -471,7 +537,11 @@ export interface SkippedEntity {
   type: EntityType;
   id: string;
   name: string;
-  /** "too_large" */
+  /**
+   * "too_large" (over 512 KB), "unsupported_type" (the server doesn't take this type yet), or the
+   * reason the server rejected the change with, e.g. "invalid_json_value" or "forbidden_role" (any
+   * other string may appear). The UI words it with `skippedReasonText` (ui/src/lib/util/format.ts).
+   */
   reason: string;
 }
 
@@ -514,6 +584,10 @@ export interface SyncReport {
   skipped: string[];
   /** Local entities currently excluded from sync because they exceed 512 KB. */
   tooLarge: SkippedEntity[];
+  /** Local entities of a type this server doesn't accept; they stay local-only. */
+  unsupported: SkippedEntity[];
+  /** The server was restored from a backup: the pull restarted from 0 and everything was re-sent. */
+  restored: boolean;
   cursor: number;
 }
 
@@ -541,7 +615,10 @@ export interface SharePreview {
   folderCount: number;
   /** Secret variables removed from the attached environment (always). */
   secretVariablesRemoved: number;
-  /** Authorization / Proxy-Authorization / Cookie headers and auth values replaced by {{placeholders}}. */
+  /**
+   * Authorization / Proxy-Authorization / Cookie headers and auth values replaced by {{placeholders}},
+   * plus each block of fields this build doesn't know (left out, as they may hold secrets).
+   */
   credentialsReplaced: number;
   /** Same count regardless of the "Include credentials" choice. */
   credentialFields: number;
@@ -617,6 +694,7 @@ export interface Commands {
   duplicate_environment: { args: { environmentId: string }; result: Environment };
   delete_environment: { args: { environmentId: string }; result: Environment[] };
   get_variables: { args: { projectId?: string | null }; result: VariableInfo[] };
+  get_dynamic_variables: { args: {}; result: DynamicVariableInfo[] };
 
   list_history: { args: {}; result: HistorySummary[] };
   open_history_entry: { args: { historyId: string }; result: OpenedHistory };

@@ -668,6 +668,7 @@ fn parse_form(st: &mut State, v: &str, literal: bool) {
             kind: FormFieldKind::File,
             enabled: true,
             content_type,
+            extra: Default::default(),
         }
     } else {
         FormField {
@@ -676,6 +677,7 @@ fn parse_form(st: &mut State, v: &str, literal: bool) {
             kind: FormFieldKind::Text,
             enabled: true,
             content_type,
+            extra: Default::default(),
         }
     };
     st.form.push(field);
@@ -814,6 +816,7 @@ fn parse_multipart(
                     kind: FormFieldKind::File,
                     enabled: true,
                     content_type: ctype,
+                    extra: Default::default(),
                 });
             }
             None => fields.push(FormField {
@@ -822,6 +825,7 @@ fn parse_multipart(
                 kind: FormFieldKind::Text,
                 enabled: true,
                 content_type: ctype,
+                extra: Default::default(),
             }),
         }
     }

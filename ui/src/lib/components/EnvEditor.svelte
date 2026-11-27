@@ -2,6 +2,7 @@
   import type { Environment } from "../api/types";
   import { app } from "../stores/app.svelte";
   import KvTable from "./KvTable.svelte";
+  import { isReservedVarName } from "../util/vars";
   import Icon from "./Icon.svelte";
 
   /** Environment editor (AC-ENV-6): inline name, enabled + secret toggles, autosave. */
@@ -11,6 +12,8 @@
   let loadedId = "";
   let timer: ReturnType<typeof setTimeout> | null = null;
   let nameError = $state(false);
+  /** AC-ENV-8: `{{$name}}` is reserved for dynamic variables. */
+  const reserved = $derived(draft?.variables.find((v) => isReservedVarName(v.key))?.key.trim() ?? null);
 
   $effect(() => {
     const e = app.environments.find((x) => x.id === id);
@@ -26,7 +29,7 @@
   function changed() {
     if (!draft) return;
     nameError = !draft.name.trim();
-    if (nameError) return;
+    if (nameError || draft.variables.some((v) => isReservedVarName(v.key))) return;
     if (timer) clearTimeout(timer);
     const snap = $state.snapshot(draft) as Environment;
     timer = setTimeout(() => void app.updateEnvironment(snap), 400);
@@ -61,6 +64,11 @@
     <div class="body">
       {#if isGlobal}
         <p class="faint note">Global variables apply to every project, after the active project environment.</p>
+      {/if}
+      {#if reserved}
+        <div class="hint danger" role="alert" data-testid="env-reserved-name">
+          <Icon name="alert" />Variable names can't start with $ — {"{{"}{reserved}{"}}"} is a dynamic variable. Rename it to save.
+        </div>
       {/if}
       <KvTable rows={draft.variables} kind="env" lookup={app.lookup} testid="env-vars" onchange={changed} />
       <p class="faint note"><Icon name="lock" small /> Secret values stay on this device: never synced, shared, or written to history.</p>

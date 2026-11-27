@@ -1,7 +1,8 @@
 /**
  * CodeMirror 6 setup (lazy chunk). Language packages are loaded on demand,
  * the theme maps to design tokens so it follows theme switches without reload,
- * and `{{var}}` decorations mirror the URL bar.
+ * and `{{var}}` decorations mirror the URL bar. Typing `{{` offers the
+ * environment's variables and the `{{$dynamic}}` catalogue.
  */
 import { Compartment, EditorSelection, EditorState, RangeSetBuilder, type Extension } from "@codemirror/state";
 import {
@@ -21,9 +22,10 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { HighlightStyle, bracketMatching, foldGutter, foldKeymap, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { highlightSelectionMatches, openSearchPanel, search, searchKeymap } from "@codemirror/search";
+import { autocompletion, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
 import { tags as t } from "@lezer/highlight";
 import type { VarLookup } from "../util/vars";
-import { VAR_RE } from "../util/vars";
+import { VAR_RE, completeVar, dynamicInfo, dynamicTip, isResolvable } from "../util/vars";
 
 export type EditorLanguage = "json" | "xml" | "html" | "text";
 
@@ -100,11 +102,18 @@ const theme = EditorView.theme({
     textDecoration: "underline wavy",
     textUnderlineOffset: "3px",
   },
+  ".cm-var-dyn": { color: "var(--var-dynamic-fg)", backgroundColor: "var(--var-dynamic-bg)", borderRadius: "var(--r-xs)" },
   ".cm-var-tip": { padding: "4px 8px", fontSize: "var(--fs-sm)", fontFamily: "var(--font-ui)", color: "var(--text-1)" },
   ".cm-var-val": { fontFamily: "var(--font-mono)", border: "0", background: "none", padding: "0", color: "inherit" },
   "button.cm-var-val": { color: "var(--accent-fg)", cursor: "pointer" },
   ".cm-var-src": { color: "var(--text-3)" },
   ".cm-tooltip": { backgroundColor: "var(--bg-raised)", border: "none", boxShadow: "var(--shadow-popover)", borderRadius: "var(--r-sm)" },
+  ".cm-tooltip.cm-tooltip-autocomplete > ul": { fontFamily: "var(--font-mono)", fontSize: "var(--fs-sm)", maxHeight: "14em", padding: "4px 0" },
+  ".cm-tooltip.cm-tooltip-autocomplete > ul > li": { padding: "2px 8px", color: "var(--text-1)" },
+  ".cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]": { backgroundColor: "var(--accent-soft)", color: "var(--text-1)" },
+  ".cm-completionLabel": { color: "var(--var-fg)" },
+  ".cm-completion-dynamic .cm-completionLabel": { color: "var(--var-dynamic-fg)" },
+  ".cm-completionDetail": { color: "var(--text-3)", fontStyle: "normal", fontFamily: "var(--font-ui)", marginLeft: "12px" },
 });
 
 const highlight = HighlightStyle.define([
@@ -123,6 +132,7 @@ const highlight = HighlightStyle.define([
 
 function varPlugin(getLookup: () => VarLookup | null): Extension {
   const varMark = Decoration.mark({ class: "cm-var" });
+  const dynMark = Decoration.mark({ class: "cm-var-dyn" });
   const badMark = Decoration.mark({ class: "cm-var-bad" });
   const build = (view: EditorView): DecorationSet => {
     const lookup = getLookup();
@@ -132,7 +142,7 @@ function varPlugin(getLookup: () => VarLookup | null): Extension {
       const text = view.state.doc.sliceString(from, to);
       for (const m of text.matchAll(VAR_RE)) {
         const s = from + m.index!;
-        b.add(s, s + m[0].length, lookup.has(m[1]) ? varMark : badMark);
+        b.add(s, s + m[0].length, !isResolvable(m[1], lookup) ? badMark : m[1].startsWith("$") ? dynMark : varMark);
       }
     }
     return b.finish();
@@ -146,7 +156,8 @@ function varPlugin(getLookup: () => VarLookup | null): Extension {
       const from = line.from + m.index!;
       const to = from + m[0].length;
       if (pos < from || pos > to) continue;
-      const info = lookup.get(m[1]);
+      const dyn = m[1].startsWith("$") ? dynamicInfo(m[1]) : undefined;
+      const info = m[1].startsWith("$") ? undefined : lookup.get(m[1]);
       return {
         pos: from,
         end: to,
@@ -154,7 +165,11 @@ function varPlugin(getLookup: () => VarLookup | null): Extension {
         create() {
           const dom = document.createElement("div");
           dom.className = "cm-var-tip";
-          if (!info) {
+          if (dyn) {
+            dom.textContent = dynamicTip(dyn);
+          } else if (m[1].startsWith("$")) {
+            dom.textContent = `Unknown dynamic variable ${m[0]} — sent as typed`;
+          } else if (!info) {
             dom.textContent = `Unresolved variable ${m[0]} — not defined in the active environment or Global`;
           } else {
             const val = document.createElement(info.secret ? "button" : "span");
@@ -186,6 +201,30 @@ function varPlugin(getLookup: () => VarLookup | null): Extension {
   )];
 }
 
+/** `{{` autocomplete: environment variables, then the `$` catalogue. */
+function varCompletion(getLookup: () => VarLookup | null): Extension {
+  const source = (ctx: CompletionContext): CompletionResult | null => {
+    const lookup = getLookup();
+    if (!lookup) return null;
+    const line = ctx.state.doc.lineAt(ctx.pos);
+    const col = ctx.pos - line.from;
+    const res = completeVar(line.text.slice(0, col), line.text.slice(col), lookup);
+    if (!res) return null;
+    return {
+      from: line.from + res.from,
+      to: line.from + res.to,
+      filter: false,
+      options: res.options.map((o) => ({
+        label: o.label,
+        detail: o.detail,
+        apply: o.insert,
+        type: o.kind === "dynamic" ? "dynamic" : "variable",
+      })),
+    };
+  };
+  return autocompletion({ override: [source], icons: false, optionClass: (c) => (c.type === "dynamic" ? "cm-completion-dynamic" : "") });
+}
+
 export interface EditorOptions {
   value: string;
   language: EditorLanguage;
@@ -206,6 +245,8 @@ export interface EditorController {
   setLanguage(l: EditorLanguage, plain?: boolean): Promise<void>;
   setWrap(w: boolean): void;
   setLookup(l: VarLookup | null): void;
+  /** Replace the selection with `text`, put the caret after it and focus. */
+  insert(text: string): void;
   focus(): void;
   goTo(line: number, column: number): void;
   openSearch(): void;
@@ -218,6 +259,7 @@ export async function createEditor(parent: HTMLElement, opts: EditorOptions): Pr
   const varC = new Compartment();
   let lookup = opts.lookup ?? null;
   let suppress = false;
+  const varExtensions = (): Extension => [varPlugin(() => lookup), opts.readOnly ? [] : varCompletion(() => lookup)];
   const lang = opts.plain ? [] : await loadLanguage(opts.language);
   const extensions: Extension[] = [
     lineNumbers(),
@@ -238,7 +280,7 @@ export async function createEditor(parent: HTMLElement, opts: EditorOptions): Pr
     keymap.of([...searchKeymap, ...foldKeymap, ...historyKeymap, ...defaultKeymap, ...(opts.readOnly ? [] : [indentWithTab])]),
     langC.of(lang),
     wrapC.of(opts.wrap ? EditorView.lineWrapping : []),
-    varC.of(lookup ? varPlugin(() => lookup) : []),
+    varC.of(lookup ? varExtensions() : []),
     EditorState.readOnly.of(!!opts.readOnly),
     EditorView.contentAttributes.of({ "aria-label": opts.ariaLabel ?? "Editor" }),
     EditorView.updateListener.of((u) => {
@@ -272,7 +314,11 @@ export async function createEditor(parent: HTMLElement, opts: EditorOptions): Pr
     },
     setLookup(l) {
       lookup = l;
-      view.dispatch({ effects: varC.reconfigure(l ? varPlugin(() => lookup) : []) });
+      view.dispatch({ effects: varC.reconfigure(l ? varExtensions() : []) });
+    },
+    insert(text) {
+      view.dispatch(view.state.replaceSelection(text));
+      view.focus();
     },
     focus: () => view.focus(),
     goTo(line, column) {

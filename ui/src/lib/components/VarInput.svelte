@@ -2,9 +2,10 @@
   /**
    * Single-line input with {{var}} highlighting (DESIGN §5.4): a transparent
    * <input> over a mirrored, decorated layer. Hover shows "value · from Env"
-   * (secrets masked until clicked).
+   * (secrets masked until clicked); a {{$dynamic}} variable shows what it
+   * generates. Typing `{{` opens a list of variables (AC-ENV-9).
    */
-  import { tokenizeVars, segmentAt, type VarLookup, type VarSegment } from "../util/vars";
+  import { completeVar, dynamicTip, tokenizeVars, segmentAt, type VarCompletionResult, type VarLookup, type VarSegment } from "../util/vars";
 
   let {
     value = "",
@@ -89,12 +90,67 @@
   function keepTip() {
     if (hideTimer) clearTimeout(hideTimer);
   }
+
+  // ───── {{ autocomplete ─────
+  const listId = `vi-ac-${Math.random().toString(36).slice(2, 10)}`;
+  let ac = $state<VarCompletionResult | null>(null);
+  let acIndex = $state(0);
+
+  function refreshCompletion() {
+    if (!inputEl || disabled || document.activeElement !== inputEl) return void (ac = null);
+    const pos = inputEl.selectionStart ?? 0;
+    if (pos !== inputEl.selectionEnd) return void (ac = null);
+    const v = inputEl.value;
+    const next = completeVar(v.slice(0, pos), v.slice(pos), lookup);
+    if (next && ac && next.from === ac.from) acIndex = Math.min(acIndex, next.options.length - 1);
+    else acIndex = 0;
+    ac = next;
+  }
+
+  function accept(i: number) {
+    if (!ac || !inputEl) return;
+    const o = ac.options[i];
+    if (!o) return;
+    const v = inputEl.value;
+    const next = v.slice(0, ac.from) + o.insert + v.slice(ac.to);
+    const caret = ac.from + o.insert.length;
+    ac = null;
+    inputEl.value = next;
+    inputEl.setSelectionRange(caret, caret);
+    oninput?.(next);
+    requestAnimationFrame(syncScroll);
+  }
+
+  function keydown(e: KeyboardEvent) {
+    if (ac && !e.isComposing) {
+      const n = ac.options.length;
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        acIndex = (acIndex + (e.key === "ArrowDown" ? 1 : -1) + n) % n;
+        document.getElementById(`${listId}-${acIndex}`)?.scrollIntoView({ block: "nearest" });
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        e.stopPropagation();
+        accept(acIndex);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        ac = null;
+        return;
+      }
+    }
+    onkeydown?.(e);
+  }
 </script>
 
 <div class="vi {variant}" class:invalid class:strike>
   {#if hasVars}
     <div class="overlay" aria-hidden="true" bind:this={overlay}>
-      {#each segs as s (s.start)}{#if s.kind === "text"}{s.text}{:else}<span class={s.kind === "var" ? "var" : "var-bad"}>{s.text}</span>{/if}{/each}
+      {#each segs as s (s.start)}{#if s.kind === "text"}{s.text}{:else}<span class={s.kind === "var" ? "var" : s.kind === "dynamic" ? "var-dyn" : "var-bad"}>{s.text}</span>{/if}{/each}
     </div>
   {/if}
   <input
@@ -110,25 +166,53 @@
     {list}
     aria-label={ariaLabel}
     aria-invalid={invalid || undefined}
+    aria-autocomplete={list ? undefined : "list"}
+    aria-controls={ac ? listId : undefined}
+    aria-activedescendant={ac ? `${listId}-${acIndex}` : undefined}
     data-testid={testid}
     oninput={(e) => {
       oninput?.(e.currentTarget.value);
+      refreshCompletion();
       requestAnimationFrame(syncScroll);
     }}
     onscroll={syncScroll}
-    onkeyup={syncScroll}
+    onkeyup={(e) => {
+      syncScroll();
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Home" || e.key === "End") refreshCompletion();
+    }}
     onselect={syncScroll}
-    {onkeydown}
+    onkeydown={keydown}
     {onpaste}
     {onfocus}
     onblur={(e) => {
+      ac = null;
       syncScroll();
       onblur?.(e);
     }}
     onmousemove={onmove}
     onmouseleave={scheduleHide}
   />
-  {#if tip}
+  {#if ac}
+    <ul class="ac" id={listId} role="listbox" aria-label="Variables" data-testid="var-autocomplete">
+      {#each ac.options as o, i (o.label)}
+        <li
+          id="{listId}-{i}"
+          role="option"
+          tabindex="-1"
+          aria-selected={i === acIndex}
+          class:dyn={o.kind === "dynamic"}
+          onmousedown={(e) => {
+            e.preventDefault();
+            accept(i);
+          }}
+          onmouseenter={() => (acIndex = i)}
+        >
+          <span class="mono name">{o.label}</span><span class="detail">{o.detail}</span>
+        </li>
+      {/each}
+    </ul>
+  {/if}
+  {#if tip && !ac}
     <div
       class="tip"
       style:left="{tip.x}px"
@@ -145,6 +229,10 @@
           <span class="mono val">{tip.seg.info.value || "(empty)"}</span>
         {/if}
         <span class="src">· from {tip.seg.info.environmentName}</span>
+      {:else if tip.seg.kind === "dynamic"}
+        <span data-testid="dynamic-tip">{dynamicTip(tip.seg.dyn)}</span>
+      {:else if tip.seg.kind === "unresolved" && tip.seg.name.startsWith("$")}
+        <span>Unknown dynamic variable <b class="mono">{tip.seg.text}</b> — sent as typed</span>
       {:else}
         <span>Unresolved variable <b class="mono">{tip.seg.text}</b> — not defined in the active environment or Global</span>
       {/if}
@@ -201,6 +289,12 @@
     background: var(--var-bg);
     border-radius: var(--r-xs);
     box-shadow: 0 0 0 1px var(--var-bg);
+  }
+  .var-dyn {
+    color: var(--var-dynamic-fg);
+    background: var(--var-dynamic-bg);
+    border-radius: var(--r-xs);
+    box-shadow: 0 0 0 1px var(--var-dynamic-bg);
   }
   .var-bad {
     color: var(--var-unresolved-fg);
@@ -267,6 +361,7 @@
   }
   /* DR-011: a disabled row isn't sent, so its vars raise no error */
   .strike .var,
+  .strike .var-dyn,
   .strike .var-bad {
     color: var(--text-3);
     background: none;
@@ -296,6 +391,46 @@
   }
   .tip .src {
     color: var(--text-3);
+  }
+  .ac {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: var(--z-tooltip);
+    min-width: 280px;
+    max-width: 480px;
+    max-height: 240px;
+    overflow-y: auto;
+    margin: 0;
+    padding: 4px 0;
+    list-style: none;
+    border-radius: var(--r-sm);
+    background: var(--bg-raised);
+    box-shadow: var(--shadow-popover);
+    font-size: var(--fs-sm);
+  }
+  .ac li {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-4);
+    padding: 3px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+    color: var(--text-1);
+  }
+  .ac li[aria-selected="true"] {
+    background: var(--accent-soft);
+  }
+  .ac .name {
+    color: var(--var-fg);
+  }
+  .ac .dyn .name {
+    color: var(--var-dynamic-fg);
+  }
+  .ac .detail {
+    color: var(--text-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .reveal {
     border: 0;

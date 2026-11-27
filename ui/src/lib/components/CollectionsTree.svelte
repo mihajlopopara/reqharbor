@@ -3,8 +3,9 @@
   import { app } from "../stores/app.svelte";
   import { ui, type MenuItem } from "../stores/ui.svelte";
   import { flattenTree, childFolders, childRequests, isInside, type TreeRow } from "../util/tree";
-  import { methodClass, methodLabel } from "../util/format";
+  import { methodClass, methodLabel, skippedReasonText } from "../util/format";
   import { shortcutText } from "../util/shortcuts";
+  import { newerKindLabel, REQUIRES_NEWER } from "../util/request";
   import VirtualList from "./VirtualList.svelte";
   import Hl from "./Hl.svelte";
   import Icon from "./Icon.svelte";
@@ -23,6 +24,10 @@
     const r = ui.renaming;
     if (!r || r.kind === "environment" || r.kind === "project") return;
     const row = rows.find((x) => x.id === r.id);
+    if (row && newer(row)) {
+      ui.renaming = null; // F2 on a view-only request (AC-FWD-3)
+      return;
+    }
     if (row) {
       renameValue = row.name;
       renameInvalid = false;
@@ -91,7 +96,14 @@
     ui.selectedNode = { kind: row.kind, id: row.id, collectionId: row.collectionId };
   }
 
+  /** AC-FWD-3: a request from a newer ReqHarbor (view only). */
+  function newer(row: TreeRow): boolean {
+    if (row.kind === "request") return app.isReadOnly(row.id);
+    return app.isContainerReadOnly(row.kind, row.id);
+  }
+
   function startRename(row: TreeRow) {
+    if (newer(row)) return;
     select(row);
     ui.renaming = { kind: row.kind, id: row.id };
   }
@@ -110,6 +122,25 @@
   function menuFor(row: TreeRow): MenuItem[] {
     const f2 = "F2";
     const ix = app.index!;
+    if (row.kind === "collection" && newer(row)) {
+      // AC-FWD-4: a collection from a newer ReqHarbor can't be renamed, set up, copied or moved here.
+      return [
+        { label: "New request", action: () => void app.createRequestIn(row.id, null), testid: "tree-new-request" },
+        { label: "New folder", action: () => void app.createFolder(row.id, null), testid: "tree-new-folder" },
+        { separator: true },
+        { label: "Share…", action: () => (ui.shareDialog = { kind: "collection", entityId: row.id, name: row.name }), testid: "tree-share" },
+        { separator: true },
+        { label: "Delete", danger: true, action: () => void app.deleteNode("collection", row.id), testid: "tree-delete" },
+      ];
+    }
+    if (row.kind === "folder" && newer(row)) {
+      return [
+        { label: "New request", action: () => void app.createRequestIn(row.collectionId, row.id), testid: "tree-new-request" },
+        { label: "New folder", action: () => void app.createFolder(row.collectionId, row.id), testid: "tree-new-folder" },
+        { separator: true },
+        { label: "Delete", danger: true, action: () => void app.deleteNode("folder", row.id), testid: "tree-delete" },
+      ];
+    }
     if (row.kind === "collection") {
       return [
         { label: "New request", action: () => void app.createRequestIn(row.id, null), testid: "tree-new-request" },
@@ -137,6 +168,14 @@
       ];
     }
     const req = ix.requestById.get(row.id);
+    if (newer(row)) {
+      // UX §6.3: only Open and Delete for requests this build can't edit.
+      return [
+        { label: "Open", action: () => app.openRequest(row.id) },
+        { separator: true },
+        { label: "Delete", danger: true, action: () => void app.deleteNode("request", row.id), testid: "tree-delete" },
+      ];
+    }
     return [
       { label: "Open", action: () => app.openRequest(row.id) },
       { label: "Copy as cURL", shortcut: shortcutText("Mod+Shift+C", app.platform), action: () => req && void app.copyRequestCurl(row.id === app.request.id ? ($state.snapshot(app.request) as typeof req) : req) },
@@ -166,7 +205,7 @@
   let lastPointerY = 0;
 
   function pointerdown(e: PointerEvent, row: TreeRow) {
-    if (e.button !== 0 || ui.renaming || filter) return;
+    if (e.button !== 0 || ui.renaming || filter || newer(row)) return;
     if ((e.target as HTMLElement).closest("button, input, .chev, .more")) return;
     pending = { row, x: e.clientX, y: e.clientY, id: e.pointerId };
     window.addEventListener("pointermove", pointermove);
@@ -351,7 +390,12 @@
           >
           <span class="faint ic"><Icon name={r.kind === "collection" ? "stack" : "folder"} small /></span>
         {:else}
-          <span class="m {methodClass(r.method ?? 'GET')}" title={r.method}>{methodLabel(r.method ?? "GET")}</span>
+          {#if newer(r)}
+            {@const req = app.index?.requestById.get(r.id)}
+            <span class="m m-custom" title={req?.kind ?? "http"} data-testid="tree-kind">{newerKindLabel(req ?? {})}</span>
+          {:else}
+            <span class="m {methodClass(r.method ?? 'GET')}" title={r.method}>{methodLabel(r.method ?? "GET")}</span>
+          {/if}
         {/if}
         {#if ui.renaming?.id === r.id}
           <!-- svelte-ignore a11y_autofocus -->
@@ -380,8 +424,12 @@
         {:else}
           <span class="name"><Hl text={r.name} query={filter} /></span>
         {/if}
-        {#if r.kind === "request" && app.skippedIds.has(r.id)}
-          <span class="skipped" title="Not synced: too large (over 512 KB). Make it smaller to sync again." data-testid="not-synced-badge"><Icon name="cloud-off" small />too large</span>
+        {#if newer(r)}
+          <span class="newer" title={REQUIRES_NEWER} aria-label={REQUIRES_NEWER} role="img" data-testid="newer-badge"><Icon name="alert" small /></span>
+        {/if}
+        {#if r.kind === "request" && app.skippedReasons.has(r.id)}
+          {@const why = skippedReasonText(app.skippedReasons.get(r.id) ?? "too_large")}
+          <span class="skipped" title={why.title} data-testid="not-synced-badge"><Icon name="cloud-off" small />{why.label}</span>
         {/if}
         {#if r.kind === "request" && app.isDirty(r.id)}<span class="unsaved" title="Unsaved changes" data-testid="tree-dirty"></span>{/if}
         {#if r.kind === "collection"}<span class="cnt">{r.count}</span>{/if}
@@ -495,6 +543,15 @@
     height: 6px;
     border-radius: 50%;
     background: var(--text-2);
+    flex: none;
+  }
+  .newer {
+    display: inline-flex;
+    width: 14px;
+    height: 14px;
+    align-items: center;
+    justify-content: center;
+    color: var(--warning);
     flex: none;
   }
   .skipped {
