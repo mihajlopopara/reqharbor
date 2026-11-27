@@ -2,6 +2,10 @@
 #   docker compose run --rm dev <command>
 # e.g. docker compose run --rm dev cargo test --workspace
 #      docker compose run --rm -w /app/worker dev npm test
+# Go server (server/, docs/plans/accounts/06-go-server.md §7.4) runs in the `go` service:
+#   docker compose run --rm go go test ./...
+#   docker compose run --rm go go vet ./...
+#   docker compose run --rm --service-ports go go run ./cmd/reqharbor-server serve
 services:
   dev:
     build:
@@ -20,6 +24,25 @@ services:
     ports:
       - "5173:5173"   # ui vite dev server
       - "8787:8787"   # wrangler dev
+  go:
+    # Same Go release as server/Dockerfile; keep the tag and digest in step with it.
+    image: golang:1.27.4-bookworm@sha256:ce59b41415e2524ae99926fe1f37ce48ba8c194dcbd2a56a65436cdcefa2bd34
+    working_dir: /app/server
+    volumes:
+      - .:/app
+      - go-mod:/go/pkg/mod
+      - go-build:/root/.cache/go-build
+      - server-data:/data
+    environment:
+      CGO_ENABLED: "0"
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+      REQHARBOR_DATA_DIR: /data
+      REQHARBOR_PUBLIC_URL: http://localhost:8080
+      REQHARBOR_LEGACY_WORKSPACES: open
+      # No REQHARBOR_DEV_AUTH here: the dev provider needs a devauth build and a loopback listener.
+    ports:
+      - "127.0.0.1:8080:8080"   # loopback only: nobody else on the network may reach the dev server
 volumes:
   cargo-registry:
   cargo-git:
@@ -27,3 +50,6 @@ volumes:
   worker-node-modules:
   ui-node-modules:
   playwright-browsers:
+  go-mod:
+  go-build:
+  server-data:

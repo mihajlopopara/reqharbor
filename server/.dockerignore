@@ -1,0 +1,6 @@
+bin/
+.data/
+Dockerfile
+.dockerignore
+**/*_test.go
+**/testdata/

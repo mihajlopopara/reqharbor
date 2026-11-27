@@ -1,0 +1,6 @@
+{{- /* 404 and 410 pages of /s/{id} (worker/src/share-page.ts renderErrorPage). */ -}}
+{{define "error"}}<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow"><meta name="color-scheme" content="dark light">
+<title>{{.Title}} · ReqHarbor</title>{{.Style}}</head>
+<body><main class="gone"><div class="brand">{{.Logo}}<span>ReqHarbor</span></div><h1>{{.Title}}</h1><p class="meta">{{.Message}}</p></main></body></html>{{end}}

@@ -18,3 +18,7 @@ docs/qa/design/screens*/
 .claude/settings.local.json
 .DS_Store
 *.log
+
+# Go server (server/)
+server/bin/
+server/.data/

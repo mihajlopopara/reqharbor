@@ -1,0 +1,162 @@
+name: Server
+
+# Go server (server/, docs/plans/accounts/06-go-server.md §7.2).
+# - every push / PR touching server/: test, then build the multi-arch image (not pushed on PRs)
+# - push to main: also publish ghcr.io/mihajlopopara/reqharbor-server:edge
+# - tag server-vX.Y.Z[-pre]: publish X.Y.Z[-pre]; stable tags also get X.Y and latest, and X once X >= 1
+# Server tags use their own namespace because desktop-build.yml requires v* tags to match the
+# Tauri version. After the first push, set the GHCR package to Public (one-time manual step).
+
+on:
+  push:
+    branches: [main]
+    paths: ["server/**", ".github/workflows/server.yml"]
+    tags: ["server-v*"]
+  pull_request:
+    paths: ["server/**", ".github/workflows/server.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: server-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/mihajlopopara/reqharbor-server
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on: $unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./... && go vet -tags devauth ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...
+
+      - name: Tests (race)
+        run: CGO_ENABLED=1 go test -race -count=1 ./...
+
+      - name: Tests (race, devauth)
+        run: CGO_ENABLED=1 go test -race -count=1 -tags devauth ./...
+
+      - name: Default build has no dev sign-in provider
+        run: |
+          CGO_ENABLED=0 go build -o /tmp/rh ./cmd/reqharbor-server
+          if go version -m /tmp/rh | grep -q devauth; then
+            echo "::error::the default build contains the devauth tag"
+            exit 1
+          fi
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Classify the release tag
+        id: tag
+        if: startsWith(github.ref, 'refs/tags/server-v')
+        shell: bash
+        run: |
+          [[ $GITHUB_REF_NAME =~ ^server-v([0-9]+)\.([0-9]+)\.([0-9]+)(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "::error::tag $GITHUB_REF_NAME is not server-vX.Y.Z or server-vX.Y.Z-pre"
+            exit 1
+          }
+          version="${GITHUB_REF_NAME#server-v}"
+          default=$(sed -n 's/^const DefaultVersion = "\(.*\)"$/\1/p' server/internal/app/version.go)
+          if [ "$version" != "$default" ]; then
+            echo "::error::tag version $version does not match DefaultVersion $default in server/internal/app/version.go"
+            exit 1
+          fi
+          stable=false; [ -z "${BASH_REMATCH[4]}" ] && stable=true
+          major_zero=false; [ "${BASH_REMATCH[1]}" = "0" ] && major_zero=true
+          {
+            echo "version=$version"
+            echo "stable=$stable"
+            echo "major_zero=$major_zero"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build arguments
+        id: args
+        shell: bash
+        run: |
+          if [ -n "${{ steps.tag.outputs.version }}" ]; then
+            echo "version=${{ steps.tag.outputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=edge-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=match,pattern=^server-v(\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?)$,group=1
+            type=match,pattern=^server-v(\d+\.\d+)\.\d+$,group=1
+            type=match,pattern=^server-v([1-9]\d*)\.\d+\.\d+$,group=1
+            type=raw,value=latest,enable=${{ steps.tag.outputs.stable == 'true' }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: server
+          file: server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.args.outputs.version }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: startsWith(github.ref, 'refs/tags/server-v')
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

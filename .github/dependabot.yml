@@ -1,0 +1,22 @@
+# Keeps the pinned action SHAs, Go modules and base-image digests current
+# (docs/plans/accounts/06-go-server.md §7.2).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: gomod
+    directory: /server
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /server
+    schedule:
+      interval: weekly

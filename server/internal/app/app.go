@@ -1,0 +1,235 @@
+// Package app wires the HTTP surface (New) and runs the server lifecycle (Run).
+package app
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"sync/atomic"
+	"time"
+
+	"github.com/mihajlopopara/reqharbor/server/internal/clientip"
+	"github.com/mihajlopopara/reqharbor/server/internal/clock"
+	"github.com/mihajlopopara/reqharbor/server/internal/config"
+	"github.com/mihajlopopara/reqharbor/server/internal/db"
+	"github.com/mihajlopopara/reqharbor/server/internal/discovery"
+	"github.com/mihajlopopara/reqharbor/server/internal/httpx"
+	"github.com/mihajlopopara/reqharbor/server/internal/ids"
+	"github.com/mihajlopopara/reqharbor/server/internal/jobs"
+	"github.com/mihajlopopara/reqharbor/server/internal/legacy"
+	"github.com/mihajlopopara/reqharbor/server/internal/ratelimit"
+	"github.com/mihajlopopara/reqharbor/server/internal/shares"
+	"github.com/mihajlopopara/reqharbor/server/internal/store"
+)
+
+// Migration states reported by /readyz.
+const (
+	MigrationsPending = "pending"
+	MigrationsRunning = "running"
+	MigrationsOK      = "ok"
+	MigrationsFailed  = "failed"
+)
+
+// server_state keys.
+const (
+	StateInstanceID = "instance_id"
+	StateSyncEpoch  = "sync_epoch"
+)
+
+// Deps are the inputs of New.
+type Deps struct {
+	Config  *config.Config
+	Clock   clock.Clock
+	Store   store.Store
+	Logger  *slog.Logger
+	Version string
+	// DB enables the /readyz database and disk checks and the breaker's size checks; it may be
+	// nil when Store is a stub.
+	DB *db.DB
+	// Breaker may be nil; New then builds one from Config and DB.
+	Breaker *jobs.Breaker
+}
+
+// App is the HTTP application.
+type App struct {
+	cfg     *config.Config
+	clock   clock.Clock
+	store   store.Store
+	logger  *slog.Logger
+	version string
+	db      *db.DB
+
+	Breaker       *jobs.Breaker
+	Resolver      *clientip.Resolver
+	CreateLimiter *ratelimit.Limiter
+	ShareLimiter  *ratelimit.Limiter
+
+	ready      atomic.Bool
+	migrations atomic.Value // string
+	epoch      atomic.Pointer[string]
+	instanceID string
+	discovery  discovery.Handler
+	handler    http.Handler
+}
+
+// New builds the application. Every route except /healthz and /readyz answers 503 starting
+// until Init has succeeded.
+func New(d Deps) *App {
+	if d.Clock == nil {
+		d.Clock = clock.System{}
+	}
+	if d.Logger == nil {
+		d.Logger = slog.Default()
+	}
+	a := &App{cfg: d.Config, clock: d.Clock, store: d.Store, logger: d.Logger, version: d.Version, db: d.DB, Breaker: d.Breaker}
+	a.migrations.Store(MigrationsPending)
+	if a.Breaker == nil {
+		var sizes jobs.Sizes
+		if d.DB != nil {
+			sizes = d.DB
+		}
+		a.Breaker = jobs.NewBreaker(jobs.BreakerLimits{
+			MaxDBBytes:       d.Config.MaxDBBytes,
+			MinFreeDiskBytes: d.Config.MinFreeDiskBytes,
+			LegacyTotalBytes: d.Config.LegacyTotalBytes,
+		}, sizes, d.Store, d.Logger)
+	}
+	a.Resolver = clientip.New(d.Config.TrustedProxies, d.Config.ClientIPHeader, d.Logger, d.Config.LogClientIP)
+	a.CreateLimiter = ratelimit.New(d.Clock, d.Config.RateLegacyCreatePerHour, time.Hour)
+	a.ShareLimiter = ratelimit.New(d.Clock, d.Config.RateShareCreatePerHour, time.Hour)
+
+	shareSvc := &shares.Service{Store: d.Store, Clock: d.Clock, PublicURL: d.Config.PublicURL}
+	mux := http.NewServeMux()
+	mux.Handle("/healthz", httpx.Methods{{Name: "GET", Handler: http.HandlerFunc(a.healthz)}})
+	mux.Handle("/readyz", httpx.Methods{{Name: "GET", Handler: http.HandlerFunc(a.readyz)}})
+	mux.Handle("/v1/server", a.discovery.Routes())
+	legacy.Register(mux, &legacy.Deps{
+		Store:         d.Store,
+		Clock:         d.Clock,
+		Config:        d.Config,
+		Breaker:       a.Breaker,
+		ClientIP:      a.Resolver,
+		CreateLimiter: a.CreateLimiter,
+		ShareLimiter:  a.ShareLimiter,
+		Shares:        shareSvc,
+		Epoch:         a.SyncEpoch,
+	})
+	mux.Handle("/s/{file}", shareSvc.PublicHandler())
+	mux.Handle("/", httpx.NotFoundHandler)
+
+	gated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !a.ready.Load() && r.URL.Path != "/healthz" && r.URL.Path != "/readyz" {
+			httpx.WriteError(w, httpx.NewError(503, "starting", "Server is starting; try again shortly").WithHeader("Retry-After", "5"))
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	a.handler = httpx.Wrap(httpx.CapturePattern(gated), d.Logger, httpx.SecurityOptions{HSTS: d.Config.HSTS})
+	return a
+}
+
+// ForceReady opens the routes without Init. Tests use it with a stub store.
+func (a *App) ForceReady() {
+	a.migrations.Store(MigrationsOK)
+	a.ready.Store(true)
+}
+
+// Handler returns the root handler.
+func (a *App) Handler() http.Handler { return a.handler }
+
+// SetMigrations records the migration state shown by /readyz.
+func (a *App) SetMigrations(state string) { a.migrations.Store(state) }
+
+// Ready reports whether Init has completed.
+func (a *App) Ready() bool { return a.ready.Load() }
+
+// SyncEpoch is the current sync epoch (see restore, §6).
+func (a *App) SyncEpoch() string {
+	if p := a.epoch.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// InstanceID is the server's permanent instance id.
+func (a *App) InstanceID() string { return a.instanceID }
+
+// Sweepers returns the in-memory limiters for the sweeper job.
+func (a *App) Sweepers() []jobs.Sweeper { return []jobs.Sweeper{a.CreateLimiter, a.ShareLimiter} }
+
+// Init runs after the migrations: it creates the instance id and sync epoch if absent, samples
+// the breaker, builds the discovery document and opens the routes.
+func (a *App) Init(ctx context.Context) error {
+	var instanceID, epoch string
+	err := a.store.Write(ctx, func(tx store.WriteTx) error {
+		get := func(key string) (string, error) {
+			v, err := tx.ServerState(key)
+			if errors.Is(err, store.ErrNotFound) {
+				v = ids.ULID(a.clock.Now())
+				err = tx.SetServerState(key, v)
+			}
+			return v, err
+		}
+		var err error
+		if instanceID, err = get(StateInstanceID); err != nil {
+			return err
+		}
+		epoch, err = get(StateSyncEpoch)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	a.instanceID = instanceID
+	a.epoch.Store(&epoch)
+	if err := a.Breaker.Sample(ctx); err != nil {
+		a.logger.Warn("initial breaker sample failed", "err", err.Error())
+	}
+	if err := a.discovery.Set(discovery.Build(a.cfg, a.version, instanceID, epoch)); err != nil {
+		return err
+	}
+	a.migrations.Store(MigrationsOK)
+	a.ready.Store(true)
+	return nil
+}
+
+func (a *App) healthz(w http.ResponseWriter, _ *http.Request) {
+	_ = httpx.WriteJSON(w, http.StatusOK, struct {
+		Status string `json:"status"`
+	}{"ok"}, nil)
+}
+
+type readyChecks struct {
+	DB         string `json:"db"`
+	Migrations string `json:"migrations"`
+	Disk       string `json:"disk"`
+}
+
+func (a *App) readyz(w http.ResponseWriter, r *http.Request) {
+	checks := readyChecks{DB: "ok", Migrations: a.migrations.Load().(string), Disk: "ok"}
+	if a.db != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		if err := a.db.Ping(ctx); err != nil {
+			checks.DB = "error"
+		}
+		cancel()
+		if minFree := a.Breaker.Limits().MinFreeDiskBytes; minFree > 0 {
+			if free, err := a.db.FreeDiskBytes(); err != nil || free < minFree {
+				checks.Disk = "low"
+			}
+		}
+	} else if a.store != nil {
+		if err := a.store.Read(r.Context(), func(store.ReadTx) error { return nil }); err != nil {
+			checks.DB = "error"
+		}
+	}
+	status, code := "ok", http.StatusOK
+	if checks.DB != "ok" || checks.Migrations != MigrationsOK || checks.Disk != "ok" || !a.ready.Load() {
+		status, code = "unavailable", http.StatusServiceUnavailable
+	}
+	_ = httpx.WriteJSON(w, code, struct {
+		Status string      `json:"status"`
+		Checks readyChecks `json:"checks"`
+	}{status, checks}, nil)
+}

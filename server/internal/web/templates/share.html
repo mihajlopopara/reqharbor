@@ -1,0 +1,71 @@
+{{- /* Public share page (worker/src/share-page.ts renderSharePage). User content is escaped by
+html/template; it never enters <script>, <style> or URL attributes. The only inline <style> and
+<script> are the static, hash-allowed assets (web.ShareCSP). */ -}}
+
+{{define "v"}}{{range segs .}}{{if .IsVar}}<span class="var">{{.Text}}</span>{{else}}{{.Text}}{{end}}{{end}}{{end}}
+
+{{define "badge"}}{{if .Known}}<span class="m m-{{.Class}}">{{.Label}}</span>{{else}}<span class="m m-custom" title="{{.Title}}">{{.Label}}</span>{{end}}{{end}}
+
+{{define "kv"}}{{if .}}<table class="kv"><caption>{{.Label}} <span class="cnt">{{.Count}}</span></caption>
+<thead><tr><th scope="col">Key</th><th scope="col">Value</th>{{if .ExtraHead}}<th scope="col">{{.ExtraHead}}</th>{{end}}</tr></thead><tbody>
+{{- range .Rows}}<tr{{if not .Enabled}} class="off"{{end}}><td>{{template "v" .Key}}</td><td>{{template "v" .Value}}</td>{{if $.ExtraHead}}<td class="ui">{{.Extra}}</td>{{end}}</tr>{{end -}}
+</tbody></table>{{end}}{{end}}
+
+{{define "nav"}}{{if .Open}}<li><span class="trow folder depth-{{.Depth}}"><span class="name">{{.Name}}</span></span><ul>
+{{- else if .Close}}</ul></li>
+{{- else}}<li><a class="trow depth-{{.Depth}}" href="#{{.Key}}">{{template "badge" .Badge}}<span class="name">{{.Name}}</span></a></li>{{end}}{{end}}
+
+{{define "req"}}<section class="req" id="{{.Key}}" aria-labelledby="{{.Key}}-h">
+<div class="crumbs">{{range $i, $c := .Crumbs}}{{if $i}} <span aria-hidden="true">›</span> {{end}}{{$c}}{{end}}</div>
+<h2 id="{{.Key}}-h">{{.Name}}</h2>
+<div class="reqbar">{{template "badge" .Badge}}<code class="url">{{template "v" .URL}}</code></div>
+{{if .HTTP -}}
+<div class="actions">
+{{- if .CanCopy}}<button type="button" class="btn btn-primary" data-copy="{{.Key}}">Copy as cURL</button>
+{{- else}}<span class="hint">Can't export as cURL: {{.ExportError}}</span>{{end -}}
+{{if .Notes}}<span class="meta">{{range $i, $n := .Notes}}{{if $i}} · {{end}}{{$n}}{{end}}</span>{{end}}</div>
+{{template "kv" .Params}}
+{{template "kv" .Headers}}
+{{with .Auth}}<div class="block"><h3>Auth</h3><p class="meta">{{.Meta}}</p>
+{{- range .Fields}}<div class="field"><span class="label">{{.Label}}</span><code>{{template "v" .Value}}</code></div>{{end}}</div>{{end}}
+<div class="block"><h3>Body</h3>{{if .QueryHint}}<p class="hint">QUERY requests normally carry a body</p>{{end}}
+{{- with .Body}}{{range .Codes}}<div class="sublabel">{{.Label}}</div><pre class="code">{{template "v" .Text}}</pre>{{end}}{{template "kv" .Table}}
+{{- else}}<p class="meta">This request has no body.</p>{{end}}</div>
+{{if .CanCopy}}<details class="curl"><summary>cURL</summary><pre class="code curl-resolved" id="{{.Key}}-curl">{{.Resolved}}</pre>
+{{- if .HasEnv}}<pre class="code curl-raw" id="{{.Key}}-curl-raw">{{.Raw}}</pre>{{end}}</details>{{end}}
+{{else -}}
+<div class="block"><p class="hint">This request type can't be previewed on the web. Import it into ReqHarbor.</p></div>
+{{end -}}
+</section>{{end}}
+
+{{define "page"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark light">
+<title>{{.Title}} · ReqHarbor</title>
+{{.Style}}
+</head>
+<body>
+<header class="top">
+<div class="brand">{{.Logo}}<span>ReqHarbor</span></div>
+<div class="title"><h1>{{.Title}}</h1>
+<p class="meta">{{.Meta}}</p></div>
+</header>
+<div class="layout{{if not .IsCollection}} single{{end}}">
+{{if .IsCollection}}<nav class="tree" aria-label="Requests"><ul>{{range .Nav}}{{template "nav" .}}{{end}}</ul></nav>{{end}}
+<main>
+{{if .Description}}<p class="desc">{{.Description}}</p>{{end}}
+{{with .Env}}<section class="env"><h2>Environment <span class="meta">{{.Name}}</span></h2>{{template "kv" .Table}}
+<label class="toggle"><input type="checkbox" id="keep-vars"> Keep {{"{{"}}variables}} in copied cURL</label></section>{{end}}
+{{range $i, $s := .Sections}}{{if $i}}
+{{end}}{{template "req" $s}}{{else}}<p class="empty">This collection has no requests.</p>{{end}}
+</main>
+</div>
+<div id="live" class="sr" role="status" aria-live="polite"></div>
+{{.Script}}
+</body>
+</html>{{end}}

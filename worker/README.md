@@ -1,5 +1,13 @@
 # ReqHarbor Worker
 
+> **Frozen.** The Go server in [`server/`](../server/README.md) has replaced this Worker. It
+> reached wire parity with it in phase S3 of `docs/plans/accounts/06-go-server.md`: the same
+> routes, status codes, error messages, limits and share page, with the differences listed in
+> §1.3 of that document. Do not add features or fixes here; make them in `server/`. The tests and
+> `test/fixtures/curl_parity.json` stay as the parity reference until the Worker is deleted
+> (phase S8, after the first public Go release and the M1 client pass the live suite). Nothing
+> was ever deployed from this directory, so there is no data to migrate.
+
 The optional Cloudflare Worker behind ReqHarbor's sync and read-only share links (PRODUCT.md §8).
 It is TypeScript with no framework, uses D1 for storage, and the bundle is about 17 KB gzipped.
 
