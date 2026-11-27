@@ -31,7 +31,7 @@ func TestBackupCommand(t *testing.T) {
 	}
 
 	custom := filepath.Join(t.TempDir(), "sub", "b.db")
-	if got := expect(t, env, 0, "schema v4", "backup", "--out", custom); !strings.HasPrefix(got, custom+"\n") {
+	if got := expect(t, env, 0, "schema v5", "backup", "--out", custom); !strings.HasPrefix(got, custom+"\n") {
 		t.Fatalf("--out printed %q", got)
 	}
 	expect(t, env, 1, "already exists", "backup", "--out", custom)
@@ -70,9 +70,10 @@ func TestRestoreCommand(t *testing.T) {
 	expect(t, env, 1, "the server is running on this data directory; stop it first", "restore", backupPath)
 	serving.Close()
 
-	out := expect(t, env, 0, "Restored b.db (schema v4)", "restore", backupPath)
+	out := expect(t, env, 0, "Restored b.db (schema v5)", "restore", backupPath)
 	for _, want := range []string{"Workspaces shifted: 1 (every rev moved up by 2 to 2", "New sync epoch: ", "reqharbor.db.pre-restore-", "must sign in again",
-		"Revocations made after this backup are undone", "invite revoke"} {
+		"Revocations made after this backup are undone", "invite revoke",
+		"removed members are members again", "Tell team admins to\n  repeat those removals"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary lacks %q:\n%s", want, out)
 		}

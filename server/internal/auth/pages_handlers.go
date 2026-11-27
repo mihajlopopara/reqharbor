@@ -29,6 +29,9 @@ var (
 	deviceRe    = regexp.MustCompile(`^[\p{L}\p{N} ()._-]*$`)
 	methodRe    = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 	arIDRe      = regexp.MustCompile(`^[A-Za-z0-9_-]{22}$`)
+	// TicketRe matches a team-invite signup ticket (POST /v1/invites/ticket, M2): rht_ + base64url
+	// of 32 random bytes.
+	TicketRe = regexp.MustCompile(`^rht_[A-Za-z0-9_-]{43}$`)
 )
 
 func random16() string {
@@ -66,6 +69,9 @@ func validateAuthorize(q url.Values) string {
 	if m := q.Get("method"); m != "" && !methodRe.MatchString(m) {
 		return "method is not a sign-in method id."
 	}
+	if t := q.Get("ticket"); t != "" && !TicketRe.MatchString(t) {
+		return "ticket is not a team invite ticket."
+	}
 	return ""
 }
 
@@ -97,6 +103,11 @@ func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 	}
 	if m := q.Get("method"); m != "" {
 		ar.MethodHint = &m
+	}
+	if t := q.Get("ticket"); t != "" {
+		// Only its hash is kept; whether it is still usable is decided when an account is created.
+		h := ids.SHA256Hex(t)
+		ar.TicketHash = &h
 	}
 	var users int64
 	err := s.Store.Write(r.Context(), func(tx store.WriteTx) error {
@@ -211,12 +222,39 @@ func (s *Service) renderSignup(w http.ResponseWriter, r *http.Request, status in
 		s.renderError(w, r, http.StatusForbidden, errSignupClosed)
 		return
 	}
+	ticket, err := s.ticketUsable(r.Context(), ar)
+	if err != nil {
+		s.internal(w, r, err)
+		return
+	}
 	d := s.arPage("Create account", ar)
 	d.Setup = setup
-	d.NeedInvite = users > 0 && grant == nil && s.Config.Signup == config.SignupInvite
+	d.NeedInvite = users > 0 && grant == nil && !ticket && s.Config.Signup == config.SignupInvite
 	d.Name, d.Email, d.Error = name, email, msg
 	d.Providers = links
 	s.render(w, r, status, "signup", d)
+}
+
+// ticketUsable reports whether the auth request carries a usable team-invite signup ticket (M2);
+// the signup form then needs no invite code.
+func (s *Service) ticketUsable(ctx context.Context, ar *store.AuthRequest) (bool, error) {
+	if ar.TicketHash == nil {
+		return false, nil
+	}
+	var ok bool
+	err := s.Store.Read(ctx, func(tx store.ReadTx) error {
+		var err error
+		ok, err = tx.SignupTicketUsable(*ar.TicketHash, clock.Millis(s.Clock.Now()))
+		return err
+	})
+	return ok, err
+}
+
+func ticketOf(ar *store.AuthRequest) string {
+	if ar.TicketHash == nil {
+		return ""
+	}
+	return *ar.TicketHash
 }
 
 func (s *Service) grantOf(ctx context.Context, ar *store.AuthRequest) (*store.OneTimeToken, error) {
@@ -548,7 +586,7 @@ func (s *Service) passwordSignup(w http.ResponseWriter, r *http.Request) {
 	var target string
 	err = s.Store.Write(r.Context(), func(tx store.WriteTx) error {
 		created, err := accounts.Create(tx, accounts.CreateParams{
-			Email: email, Name: name, EmailTrusted: false, PHC: phc, GrantHash: grant,
+			Email: email, Name: name, EmailTrusted: false, PHC: phc, GrantHash: grant, TicketHash: ticketOf(ar),
 			SignupMode: s.Config.Signup, AdminEmail: s.Config.AdminEmail, MaxUsers: s.Config.MaxUsers, OpenSignupFull: s.openSignupFull(), Now: s.Clock.Now(),
 		})
 		if err != nil {

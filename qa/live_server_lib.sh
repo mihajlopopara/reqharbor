@@ -8,7 +8,8 @@ PORT=${PORT:-8080}
 BASE="http://127.0.0.1:$PORT"
 LOG="$QA_LIVE_DATA/server.log"
 PIDFILE="$QA_LIVE_DATA/server.pid"
-# Exactly the §7.5 settings, for serve and for the CLI next to it (rh <command>).
+# Exactly the §7.5 settings, plus REQHARBOR_TEAMS=true for the M2 teams case, for serve and for
+# the CLI next to it (rh <command>).
 RH_ENV=(
   PATH="$PATH" HOME="${HOME:-/root}"
   REQHARBOR_LISTEN="127.0.0.1:$PORT"
@@ -16,6 +17,7 @@ RH_ENV=(
   REQHARBOR_DATA_DIR="$QA_LIVE_DATA/data"
   REQHARBOR_DEV_AUTH=true
   REQHARBOR_LEGACY_WORKSPACES=open
+  REQHARBOR_TEAMS=true
   REQHARBOR_TRUSTED_PROXIES=127.0.0.1/32
   REQHARBOR_CLIENT_IP_HEADER=CF-Connecting-IP
   REQHARBOR_LOG_FORMAT=json

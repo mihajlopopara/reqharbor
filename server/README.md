@@ -11,12 +11,14 @@ What it serves:
   under `/auth/*`. The desktop app always signs in through the system browser. Signup is by invite
   by default.
 - **Personal sync.** Every account has a personal space that the app keeps in sync.
+- **Teams** (off by default, `REQHARBOR_TEAMS=true`). Team spaces shared by their members with
+  owner, admin, editor and viewer roles, joined through invite links (`/i#…`).
 - **Share links.** Read-only pages for a request or a collection (`/s/{id}`), with a cURL export.
 - **Token sync (legacy).** The anonymous `rh_` workspace tokens of older app versions, wire
   compatible with the retired Cloudflare Worker. **Off by default.**
 
 Contents: [Quick start](#quick-start) · [First run](#first-run) ·
-[Sign-in methods](#sign-in-methods) · [Behind a reverse proxy](#behind-a-reverse-proxy) ·
+[Sign-in methods](#sign-in-methods) · [Teams](#teams) · [Behind a reverse proxy](#behind-a-reverse-proxy) ·
 [Token sync](#token-sync-legacy-workspaces) · [Backups and restore](#backups-and-restore) ·
 [Upgrading](#upgrading) · [Configuration reference](#configuration-reference) ·
 [Operations](#operations) · [Privacy](#privacy) · [API](#api) · [Development](#development)
@@ -100,7 +102,7 @@ accounts, `--ttl 168h` is the default lifetime). They enter it on the sign-up pa
 
 | `REQHARBOR_SIGNUP` | Effect |
 |---|---|
-| `invite` (default) | A new account needs an invite code (or the setup code, on a fresh server). |
+| `invite` (default) | A new account needs an invite code (or the setup code, on a fresh server), or a team invite link (see Teams). |
 | `open` | Anyone who can reach the server can create an account. |
 | `closed` | Only the CLI creates accounts. |
 
@@ -139,6 +141,40 @@ that pair for 1, 2, 4, … up to 60 minutes; other networks are unaffected, so n
 owner out. After 20 failures for an email within an hour, the sign-in form asks the browser for a
 few seconds of proof of work. `user unlock --email E` clears both. The database keeps only keyed
 hashes of (email, network), for 24 hours after the last failure.
+
+## Teams
+
+Teams are off until you set `REQHARBOR_TEAMS=true` (`GET /v1/server` reports it as
+`features.teams`). Anyone with an account can then create teams; each team has one shared space
+that its members' apps sync.
+
+- **Roles.** Viewers read and send; editors also change, create and delete collections, folders,
+  requests and environments, create and rename projects, and create share links (and change their
+  own); admins also delete projects, change anyone's share links, rename the team, invite and
+  remove members and change roles up to admin; owners also create admin invite links, grant or
+  revoke owner and transfer ownership. The team's **billing owner** (its creator, until a
+  transfer) is the only one who can delete it, and must transfer ownership before leaving or being
+  demoted. Editors can delete any content of a team project; admin-only applies to deleting the
+  project itself.
+- **Invite links** look like `https://rh.example.com/i#rhi_…`. The token sits in the URL fragment,
+  so it never reaches a server or proxy log; only its hash is stored. Opening the link in a
+  browser shows who invited you and the role, and says to paste it into ReqHarbor (Teams › Join
+  team). Admin links are single-use; links last 1 to 30 days. Removing a member revokes the links
+  they created, and links created before the removal no longer let that account back in.
+- **Signup through an invite.** While `REQHARBOR_SIGNUP=invite`, a person without an account who
+  holds a team invite link can sign up without a server invite code: the app trades the link for a
+  10-minute, single-use signup ticket. A link limited to N uses opens at most N signups. Tickets
+  have no effect in `open` mode (those accounts stay open signups) or `closed` mode.
+- **Limits** (`0` means no cap): `REQHARBOR_MAX_OWNED_TEAMS` (default 10 teams per billing owner;
+  personal spaces do not count), `REQHARBOR_MAX_TEAM_MEMBERS` (100), `REQHARBOR_MAX_TEAM_INVITES`
+  (20 active links per team; plus 30 new links per team per day), `REQHARBOR_QUOTA_TEAM_BYTES`
+  (250 MiB per team space) and `REQHARBOR_QUOTA_OWNER_BYTES` (off: when set, the personal space
+  plus every team a user is billing owner of share it).
+- **Privacy.** Team data, including literal credentials typed into requests, is visible to every
+  member. Secret variable values never leave the devices, and local file paths (binary bodies,
+  multipart file fields) are blanked before they reach a team space.
+- **Turning teams off again** hides the team routes (403 `teams_disabled`) but keeps existing team
+  spaces syncing for their members.
 
 ## Sign-in methods
 
@@ -326,7 +362,10 @@ sign in again, and workspaces and accounts created after it no longer exist.
 **A restore also undoes every revocation made after the backup was taken:** sessions signed out
 come back, disabled accounts are enabled again, reset passwords return to the old ones, and revoked
 invites work again. Repeat those runs after the restore: `user disable`, `user sessions revoke`,
-`user set-password` or `user reset-link`, and `invite revoke`.
+`user set-password` or `user reset-link`, and `invite revoke`. The same goes for teams: member
+removals, role demotions and revoked team invite links made after the backup are undone, so removed
+members are back in their teams with their old roles. Tell team admins to repeat those removals,
+demotions and revocations in the app.
 
 If the data volume itself was lost, start from an empty volume and run `restore`: without a
 current database, revisions move up by 2³² above the backup's highest one, which is above any
@@ -417,7 +456,7 @@ per share snapshot, 5 MiB per request body, 500 changes per push or pull.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `REQHARBOR_RATE_AUTH_PER_MIN` | `120` | Sign-in page requests |
+| `REQHARBOR_RATE_AUTH_PER_MIN` | `120` | Sign-in page requests; also `POST /v1/invites/preview` and `/v1/invites/ticket` |
 | `REQHARBOR_RATE_LOGIN_PER_MIN` | `30` | Password attempts |
 | `REQHARBOR_RATE_SIGNUP_PER_HOUR` | `30` | Account creations |
 | `REQHARBOR_RATE_TOKEN_PER_MIN` | `60` | `POST /v1/auth/token` |
@@ -425,14 +464,23 @@ per share snapshot, 5 MiB per request body, 500 changes per push or pull.
 | `REQHARBOR_RATE_SHARE_CREATE_PER_HOUR` | `30` | Share creations per space or workspace |
 | `REQHARBOR_RATE_LEGACY_CREATE_PER_HOUR` | `10` | Legacy workspace creations |
 
+**Teams**
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REQHARBOR_TEAMS` | `false` | Team routes and invite links (`features.teams` in `/v1/server`) |
+| `REQHARBOR_QUOTA_TEAM_BYTES` | `262144000` (250 MiB) | Per team space; `0` means unlimited |
+| `REQHARBOR_QUOTA_OWNER_BYTES` | `0` (off) | A billing owner's personal space plus owned team spaces together |
+| `REQHARBOR_MAX_OWNED_TEAMS` | `10` | Teams one account may be billing owner of; `0` means no cap |
+| `REQHARBOR_MAX_TEAM_MEMBERS` | `100` | Members per team (at least 1) |
+| `REQHARBOR_MAX_TEAM_INVITES` | `20` | Active invite links per team; `0` means no cap |
+
 **Accepted for later releases, no effect yet:** `REQHARBOR_GOOGLE_CLIENT_ID`/`_SECRET`,
 `REQHARBOR_OIDC_ISSUER`/`_CLIENT_ID`/`_CLIENT_SECRET`/`_NAME`/`_SCOPES`/`_REQUIRE_VERIFIED_EMAIL`,
 `REQHARBOR_SMTP_HOST`/`_PORT`/`_USERNAME`/`_PASSWORD`/`_FROM`/`_TLS`,
 `REQHARBOR_RATE_EMAIL_PER_HOUR`, `REQHARBOR_RATE_EMAIL_PER_RECIPIENT_PER_HOUR`,
-`REQHARBOR_BACKUP_INTERVAL`, `REQHARBOR_BACKUP_KEEP` (scheduled backups), `REQHARBOR_TEAMS`,
-`REQHARBOR_QUOTA_TEAM_BYTES`, `REQHARBOR_QUOTA_OWNER_BYTES`, `REQHARBOR_MAX_OWNED_TEAMS`,
-`REQHARBOR_MAX_TEAM_MEMBERS`, `REQHARBOR_MAX_TEAM_INVITES`. `REQHARBOR_DEV_AUTH` exists only in
-test builds and is refused by the image.
+`REQHARBOR_BACKUP_INTERVAL`, `REQHARBOR_BACKUP_KEEP` (scheduled backups). `REQHARBOR_DEV_AUTH`
+exists only in test builds and is refused by the image.
 
 ## Operations
 
@@ -444,8 +492,9 @@ test builds and is refused by the image.
   id; every response carries `X-Request-Id`. Query strings, `Authorization`, cookies and form bodies
   are never logged.
 - **Background jobs:** the storage breaker every 10 seconds; expired sign-in requests, sessions and
-  codes are deleted every 10 minutes (revoked or expired ones after 7 days); `PRAGMA optimize`
-  and `PRAGMA incremental_vacuum` once a day.
+  codes are deleted every 10 minutes (revoked or expired ones after 7 days), as are team invite
+  links 30 days after they expired or were revoked, team departure records (removal notices) after
+  31 days and expired signup tickets; `PRAGMA optimize` and `PRAGMA incremental_vacuum` once a day.
 - **Single instance:** one process per data directory (see above). Scale up, not out.
 - **Version:** `docker compose exec reqharbor /reqharbor-server version`; `GET /v1/server` reports
   it too.
@@ -463,8 +512,8 @@ long as you keep the backup files**, including the automatic `pre-migrate-…` a
 
 ## API
 
-This section is the wire reference for the account routes (since 0.2) (06-go-server.md §4 is
-the design). Every error is `{"error":{"code","message"}}`; every response is JSON with
+This section is the wire reference for the account routes (since 0.2) and the team routes (M2)
+(06-go-server.md §4 and §10 "M2 as built" are the design). Every error is `{"error":{"code","message"}}`; every response is JSON with
 `Cache-Control: no-store` unless stated. The legacy token routes (`/v1/workspaces`, `/v1/sync`,
 `/v1/shares*`, …) are unchanged from the Worker; see `docs/API_CONTRACT.md`.
 
@@ -481,12 +530,14 @@ legacy `rh_` token is never accepted here, and an `rha_` token is never accepted
 | 401 | `session_expired` | The access token expired: refresh it |
 | 404 | `space_not_found` | Unknown space id, or the id of a legacy token workspace |
 | 403 | `not_a_member` | The account is not a member of the space |
-| 426 | `client_too_old` | `/v1/spaces/*` only, when `REQHARBOR_MIN_CLIENT_VERSION` is set and `X-ReqHarbor-Version` is missing or lower; checked before auth |
+| 403 | `forbidden_role` | The caller's role in a team space does not allow it (a viewer's push or share create; another member's share for an editor) |
+| 426 | `client_too_old` | `/v1/spaces/*` only, when `REQHARBOR_MIN_CLIENT_VERSION` is set and `X-ReqHarbor-Version` is missing or lower; checked before auth. Also on **every** `/v1/spaces/{id}*` call to a **team** space when `X-ReqHarbor-Version` is missing or below `0.1.0` (the fixed team-space gate: apps older than M0 send no header and would drop fields of newer request kinds), checked after the space (404/403) |
 | 429 | `rate_limited` | With `Retry-After`; `/v1/spaces/{id}/sync` allows `REQHARBOR_RATE_SYNC_PER_MIN` per session |
 | 507 | `server_full` | A growing write while the storage breaker is open, or an open-signup account's write once `REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES` is reached |
 
 Order on `/v1/spaces/*`: route (404), method (405), version gate (426), token (401), space (404,
-then 403), then the body (415, 413, 400).
+then 403), the team-space version gate (426), the role (403 `forbidden_role`), then the body (415,
+413, 400).
 
 ### `GET /v1/me`
 
@@ -516,14 +567,26 @@ Revoking the current session is allowed (it is logout).
 
 ```json
 {"spaces":[{"spaceId":"01J…","kind":"personal","teamId":null,"teamName":null,"role":"owner",
-            "bytesUsed":1234,"quotaBytes":104857600}],
- "departed":[]}
+            "bytesUsed":1234,"quotaBytes":104857600,"memberCount":1,"ownerUserId":"01J…me"},
+           {"spaceId":"01J…","kind":"team","teamId":"01J…","teamName":"Acme","role":"editor",
+            "bytesUsed":5678,"quotaBytes":262144000,"memberCount":3,"ownerUserId":"01J…"}],
+ "owner":{"bytesUsed":1234,"quotaBytes":null},
+ "departed":[{"spaceId":"01J…","teamId":"01J…","teamName":"Globex","reason":"removed","at":1795435200000}]}
 ```
 
-The authoritative list of the account's spaces; in 0.2 it holds exactly the personal space, and the
-shape is final. `quotaBytes` is `null` when unlimited. `bytesUsed` counts entity data plus active
-share snapshots. `departed` stays empty until teams (M2), when its entries are
-`{spaceId, teamId, teamName, reason, at}`.
+The authoritative list of the account's spaces (04 §6.7): the personal space first, then every
+team space the account is a member of, oldest first. Team spaces are listed whatever
+`REQHARBOR_TEAMS` says. `quotaBytes` is `null` when unlimited. `bytesUsed` counts entity data plus
+active share snapshots. `memberCount` is 1 for the personal space. `ownerUserId` is the space's
+billing owner (the caller for the personal space).
+
+`owner` is the caller's own aggregate: their personal space plus every team they are billing owner
+of, against `REQHARBOR_QUOTA_OWNER_BYTES` (`null` when off).
+
+`departed` lists, per team, the latest departure from a team the account is **not** a member of now,
+newest first, kept 31 days: `reason` is `removed` (by an admin or owner), `left`, or `deleted` (the
+team was deleted; the deleter gets one too). Rejoining a team drops its entry. A space that is
+missing from `spaces` and has no entry here was lost for another reason; treat it as removed.
 
 ### `GET /v1/spaces/{id}`
 
@@ -531,6 +594,9 @@ share snapshots. `departed` stays empty until teams (M2), when its entries are
 {"spaceId":"01J…","kind":"personal","name":"Personal","createdAt":1795435200000,"entityCount":3,
  "bytesUsed":1234,"quotaBytes":104857600,"role":"owner"}
 ```
+
+For a team space `kind` is `team`, `name` the team name and `role` the caller's role. Any member,
+viewers included, may read the space, pull and list its shares.
 
 ### `GET /v1/spaces/{id}/sync?since=&limit=`
 
@@ -557,10 +623,22 @@ and revs in push order. Differences from `/v1/sync`:
   400 `unsupported_type`). It takes no rev and is not counted against the quota.
 - A change whose `updatedAt` is more than 5 minutes (300000 ms) ahead of the server's clock is
   `{"status":"rejected","reason":"clock_skew"}`, tombstones included; exactly +5 min is accepted.
-- Precedence when several apply: `unsupported_type`, then `clock_skew`, then `invalid_json_value`
-  and `entity_too_large`.
 - Applied changes record the caller as the author (`updatedBy`); a `stale` change keeps the stored
   author.
+- **Roles (team spaces).** A viewer's push is 403 `forbidden_role` before the body is read, and
+  nothing is stored. A `project` tombstone from an editor is the per-change result
+  `{"status":"rejected","reason":"forbidden_role"}` while the rest of the push applies; admins and
+  owners delete projects. Editors may delete every other type. The role is read again inside the
+  push transaction and decides there: a member removed since the request was authorised gets 403
+  `not_a_member`, one demoted to viewer 403 `forbidden_role`, and project tombstones follow the
+  role at that moment.
+- **Team spaces only.** An `environment` upsert whose `data.projectId` is not a non-empty string
+  (the Global environment) is the per-change `global_env_not_allowed`; tombstones are not checked.
+  For a `request`, `data.body.binaryPath` and the `value` of every `data.body.form[]` entry with
+  `"kind":"file"` are blanked (`""`) before the size is measured and stored; keep the local values
+  on pull, as for secrets. Personal spaces keep both.
+- Precedence when several apply: `unsupported_type`, `clock_skew`, `forbidden_role`,
+  `global_env_not_allowed`, then `invalid_json_value` and `entity_too_large`.
 - The response adds `serverTime` (the server's clock, Unix ms):
 
 ```json
@@ -570,8 +648,11 @@ and revs in push order. Differences from `/v1/sync`:
  "cursor":8,"serverTime":1795435201234}
 ```
 
-Quota: 413 `quota_exceeded` when the push grows the space past `REQHARBOR_QUOTA_PERSONAL_BYTES`;
-deletes and shrinking pushes always pass, also while 507 applies.
+Quota: 413 `quota_exceeded` when the push grows the space past its quota
+(`REQHARBOR_QUOTA_PERSONAL_BYTES` or `REQHARBOR_QUOTA_TEAM_BYTES`; message "Workspace storage quota
+of N bytes exceeded …"), or grows the billing owner's aggregate past `REQHARBOR_QUOTA_OWNER_BYTES`
+(message "Storage limit of N bytes for the spaces <owner name> owns exceeded …"). Deletes and
+shrinking pushes always pass, also while 507 applies.
 
 ### `GET`/`POST /v1/spaces/{id}/shares`, `PUT`/`DELETE /v1/spaces/{id}/shares/{shareId}`
 
@@ -595,8 +676,208 @@ The legacy share routes scoped to the space, plus `createdBy` and `options`:
   share of this space (404 "Share not found"), revoked (410), then the body. Response as for
   create, `200`.
 - **Revoke** (`DELETE`) never reads a body: `{"shareId","revokedAt"}`, idempotent.
+- **Roles (team spaces).** Every member lists. Create needs editor or above (403
+  `forbidden_role` for a viewer, before the body). Update and revoke: editors their own shares
+  (`createdBy` is them), admins and owners anyone's. The order is share id (404), the role (403),
+  then revoked (410) and the body. The role is checked again inside the write transaction, so a
+  removal or demotion that lands meanwhile refuses the write (403). Share writes count against the team and owner quotas like
+  pushes.
 
-The public `/s/{id}` and `/s/{id}.json` pages serve space shares exactly like legacy ones.
+The public `/s/{id}` and `/s/{id}.json` pages serve space shares exactly like legacy ones. Deleting
+a team deletes its shares, so their pages answer 404.
+
+### Teams: errors and conventions
+
+Every `/v1/teams*` and `/v1/invites/*` route answers 403 `teams_disabled` while
+`REQHARBOR_TEAMS=false`, before auth and before the body. Then the access token (401), then the
+team (404 `team_not_found` for an unknown id **and** for any personal team id, which is never
+addressable; 403 `not_a_member` when the caller is not in the team). After that each route has its
+own order, given with it below: a minimum role that does not depend on the body (403
+`forbidden_role`) comes before the body (415, 413, 400 `validation_failed`); checks that depend on
+the body or on another member come after it, inside the write transaction, which also re-reads the
+team and the caller's own role. These routes have no version gate. Roles rank viewer < editor < admin < owner; the team's **billing owner**
+(`ownerUserId`) is always an owner.
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `validation_failed` | A malformed body (name, role, `maxUses`, …); an admin link that is not single-use; transfer to yourself |
+| 403 | `teams_disabled` | `REQHARBOR_TEAMS=false` |
+| 403 | `not_a_member` | The caller is not a member of this (existing, non-personal) team |
+| 403 | `forbidden_role` | The caller's role does not allow it |
+| 404 | `team_not_found` | Unknown team id, or a personal team's id |
+| 404 | `member_not_found` | `{uid}` (or a transfer's `userId`) is not a member of this team |
+| 404 | `invite_not_found` | `{iid}` is not an invite of this team |
+| 409 | `last_owner` | The change would leave the team without an owner |
+| 409 | `transfer_required` | The target is the billing owner: transfer ownership first |
+| 409 | `limit_teams` | `REQHARBOR_MAX_OWNED_TEAMS` reached (the caller's on create, the receiver's on transfer; the message says which) |
+| 409 | `limit_members` | `REQHARBOR_MAX_TEAM_MEMBERS` reached on accept |
+| 409 | `limit_invites` | `REQHARBOR_MAX_TEAM_INVITES` active links reached |
+| 410 | `invite_invalid` | Any unusable invite link (unknown, malformed, expired, revoked, used up, or created before the caller was removed from the team); always the same message |
+| 413 | `quota_exceeded` | Transfer: the receiver's aggregate plus the team exceeds `REQHARBOR_QUOTA_OWNER_BYTES` ("Max doesn't have room for Acme: they need N more bytes") |
+| 429 | `rate_limited` | More than 30 invite links created for a team in 24 hours; `/v1/invites/preview` and `/ticket` beyond `REQHARBOR_RATE_AUTH_PER_MIN` per client IP. With `Retry-After` |
+
+The shapes used below:
+
+```json
+Team    {"teamId":"01J…","name":"Acme","spaceId":"01J…","role":"owner","ownerUserId":"01J…",
+         "memberCount":3,"bytesUsed":5678,"quotaBytes":262144000,"createdAt":1795435200000}
+Member  {"userId":"01J…","name":"Sam Lee","email":"sam@acme.dev","avatarUrl":null,"role":"editor",
+         "joinedAt":1795435200000,"isBillingOwner":false}
+Invite  {"inviteId":"01J…","role":"editor","createdAt":1795435200000,"expiresAt":1796040000000,
+         "maxUses":1,"uses":0,"createdBy":{"userId":"01J…","name":"Priya Shah"}}
+```
+
+`Team.role` is the caller's role; `quotaBytes` is `null` when unlimited. `Invite.maxUses` is `null`
+for an unlimited link; `createdBy` is `null` once that account is deleted, and its `name` is the
+creator's current name.
+
+### `GET`/`POST /v1/teams`
+
+`GET` lists the non-personal teams the caller belongs to, by name:
+
+```json
+{"teams":[Team…],"ownedCount":1,
+ "limits":{"ownedTeams":10,"teamMembers":100,"teamInvites":20},
+ "owner":{"bytesUsed":6912,"quotaBytes":null}}
+```
+
+`ownedCount` is how many teams the caller is billing owner of; a `limits` value is `null` when that
+limit is off (`0`); `owner` is the caller's aggregate as in `/v1/me/spaces`.
+
+`POST {"name":"Acme"}` creates a team, the caller's owner membership and the empty team space in
+one transaction: `201 Team`. `name` is 1–80 characters (UTF-16 code units) after trimming, without
+control characters. 409 `limit_teams` ("You can own up to 10 teams on this server") once the
+caller owns `REQHARBOR_MAX_OWNED_TEAMS` teams.
+
+### `GET`/`PATCH`/`DELETE /v1/teams/{id}`
+
+- `GET`: any member, `200 Team`.
+- `PATCH {"name"}`: admin or above (403), then the body (400); renames the team and its space.
+  `200 Team`. Names are 1–80 characters with no control or format characters (such as the bidi
+  override U+202E).
+- `DELETE` (no body): the billing owner only (403 for everyone else, co-owners included). Every
+  member, the caller too, gets a `deleted` departure; the memberships, invite links, signup
+  tickets, the space, its entities and its shares are deleted (share pages answer 404). `204`.
+
+### `GET /v1/teams/{id}/members`, `PATCH`/`DELETE /v1/teams/{id}/members/{uid}`
+
+`GET`: any member. `{"members":[Member…]}`, owners first, then admins, editors, viewers, each by
+join time.
+
+`PATCH {"role":"owner"|"admin"|"editor"|"viewer"}` changes a member's role. Rule (AC-TEAM-3, 04
+§5.4): **owners** change anyone to any role; **admins** change only editors and viewers and grant at
+most admin; **anyone** may lower their own role. Checked in order: the body (400 for a missing or
+unknown role), then inside the transaction the member (404 `member_not_found`), the rule (403), an
+unchanged role (`200`, nothing written), the last owner (409 `last_owner`), the billing owner (409
+`transfer_required`, whoever asks, the billing owner too). A
+demotion from admin or owner to editor or viewer revokes every invite link that member created in
+this team, in the same transaction. `200 Member` (the new role).
+
+`DELETE` removes a member; the body is optional: `{"revokeInvites": true|false}` (default false;
+no body or `Content-Length: 0` is fine). Rule: owners remove anyone else; admins only editors and
+viewers. Checked in order: your own id (403, use leave), a caller below admin (403), the body (400),
+then inside the transaction the member (404), the rule (403), the last owner (409), the billing
+owner (409 `transfer_required`). One transaction records a `removed` departure
+(the member's next request to the space is 403 `not_a_member`; invite links created before now no
+longer let that account join), deletes the membership, revokes **every link the member created**
+in this team whatever the body says, and with `revokeInvites:true` every other active link too.
+Response `200 {"userId":"01J…","revokedInvites":2}`.
+
+### `POST /v1/teams/{id}/transfer`
+
+`{"userId":"01J…"}`: the billing owner hands the team to another member, who becomes owner and
+billing owner; the caller becomes admin. Checks: the caller is the billing owner (403), the body
+(400, also for your own id), then inside the transaction the member (404 `member_not_found`), the receiver's owned teams (409 `limit_teams`,
+"Max already owns 10 teams, the most this server allows"), the receiver's aggregate (413
+`quota_exceeded` with the shortfall). Atomic with every other team write, so a removal racing it
+either runs first (the transfer is 404) or finds the caller no longer owner (403). `200 Team` (from
+the caller's side: `role` is `admin`).
+
+### `POST /v1/teams/{id}/leave`
+
+No body. Any member except the last owner (409 `last_owner`) and the billing owner (409
+`transfer_required`). Records a `left` departure (it does not block rejoining with any valid link)
+and revokes the links the leaver created in this team. `204`.
+
+### `GET`/`POST /v1/teams/{id}/invites`, `DELETE /v1/teams/{id}/invites/{iid}`
+
+Admin or above (403 for editors and viewers, for all three).
+
+`GET`: the active links (not revoked, not expired, not used up), newest first:
+`{"invites":[Invite…]}`. Tokens are never listed.
+
+`POST {"role","maxUses","expiresInDays"}`, every member optional: `role` `admin`, `editor` (default)
+or `viewer`; `maxUses` 1 (default) to 10000, or `null` for unlimited; `expiresInDays` 1 to 30
+(default 7). Order: a caller below admin (403), the body (400, including "Admin links are
+single-use" for an `admin` link without `maxUses: 1`; a database CHECK is the backstop), then
+inside the transaction an `admin` link from a non-owner (403). 409 `limit_invites` at `REQHARBOR_MAX_TEAM_INVITES`
+active links, 429 after 30 creates for the team in 24 hours. Response `201`, the only time the
+token is shown:
+
+```json
+{"inviteId":"01J…","role":"editor","createdAt":1795435200000,"expiresAt":1796040000000,"maxUses":1,
+ "uses":0,"createdBy":{"userId":"01J…","name":"Priya Shah"},
+ "token":"rhi_…43 chars","url":"https://rh.example.com/i#rhi_…"}
+```
+
+`url` is `REQHARBOR_PUBLIC_URL + "/i#" + token`. Tokens are `rhi_` + 43 base64url characters; only
+their SHA-256 is stored.
+
+`DELETE` (no body) revokes a link of this team: `200 {"inviteId","revokedAt"}`, idempotent (an
+already revoked link returns its original `revokedAt`). Another team's invite id is 404
+`invite_not_found`.
+
+### `POST /v1/invites/preview`
+
+No auth. `{"token":"rhi_…"}` → `200 {"teamName":"Acme","inviterName":"Priya Shah","role":"editor","expiresAt":1796040000000}`
+(`inviterName` is `null` when the creator's account is gone). Nothing else about the team is
+revealed. Any unusable link is 410 `invite_invalid`. Rate-limited per client IP.
+
+### `POST /v1/invites/accept`
+
+Access token. `{"token":"rhi_…"}`:
+
+```json
+{"alreadyMember":false,"teamId":"01J…","teamName":"Acme","spaceId":"01J…","role":"editor"}
+```
+
+A member of the link's team gets `200` with `"alreadyMember":true` and their **current** role,
+unchanged (even for an expired link). Otherwise, in one transaction: the link must be usable and
+must not predate a removal of this account from the team (both 410 `invite_invalid`), the team must
+have room (409 `limit_members`, "Acme has reached 100 members"); then the membership with the link's
+role and one use. Concurrent accepts of a single-use link: exactly one wins, the others get 410.
+The team space then appears in `/v1/me/spaces`.
+
+### `POST /v1/invites/ticket`
+
+No auth. `{"token":"rhi_…"}` → `200 {"ticket":"rht_…43 chars","expiresAt":1795435800000}` for a
+usable link (410 `invite_invalid` otherwise); rate-limited per client IP. A link with `maxUses`
+opens at most that many signups: a ticket is minted, and later accepted at signup, only while the
+link's uses plus the tickets already spent on signups are below `maxUses` (accepting the link
+after such a signup still works, as it only needs a use). The ticket lets a person
+without an account sign up while `REQHARBOR_SIGNUP=invite`: add it to the sign-in URL,
+`/auth/authorize?…&ticket=rht_…`, so the invite token itself never appears in a URL. While the
+ticket is unused, unexpired (10 minutes) and its link still usable, the signup form asks for no
+invite code, and provider sign-ins (GitHub, dev) of new identities need none; the account is
+created as invited (`signup_via` `invite`) and the ticket is spent. An invite code entered anyway
+takes precedence. A used, expired or revoked ticket is ignored (the page then asks for a code, as
+without one); a malformed `ticket` makes the authorize page refuse the request. Tickets count in
+`invite` mode only: in `open` mode the ticket is ignored and not spent (the account is an ordinary
+open signup, counted in `REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES` and refused while that is full), and
+`closed` signup stays closed. The ticket only opens signup: joining is still `POST /v1/invites/accept` after
+sign-in.
+
+### `GET /i`
+
+The hosted invite page for `https://rh.example.com/i#rhi_…`, served whatever `REQHARBOR_TEAMS`
+says. It is static: an inline script (allowed by its hash) reads the token from the fragment and
+calls `POST /v1/invites/preview` on the same origin, then shows "<inviter> invited you to join
+<team> as <role> · expires <date>", "Open ReqHarbor › Teams › Join team and paste this link." and
+a Copy link button; an invalid link shows "This invite link is no longer valid. Ask the person who
+sent it for a new one." Without JavaScript only the instructions show, with no team details.
+Headers: `Content-Security-Policy: default-src 'none'; style-src 'sha256-…'; script-src
+'sha256-…'; connect-src 'self'; img-src data:; form-action 'none'; frame-ancestors 'none';
+base-uri 'none'`, `X-Robots-Tag: noindex, nofollow`, `Cache-Control: no-store`, no cookies.
 
 ## Development
 

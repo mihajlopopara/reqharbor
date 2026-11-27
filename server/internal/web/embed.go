@@ -68,3 +68,20 @@ var AuthCSP = strings.Join([]string{
 	"frame-ancestors 'none'",
 	"base-uri 'none'",
 }, "; ")
+
+// InviteJS is the hosted invite page's inline script (/i, M2): it reads the token from the URL
+// fragment and calls POST /v1/invites/preview on the same origin.
+var InviteJS = mustRead("static/invite.js")
+
+// InviteCSP is the Content-Security-Policy of /i: the auth stylesheet and the invite script by
+// hash, and fetch only to this origin (the preview call). No forms, no frames, nothing else loads.
+var InviteCSP = strings.Join([]string{
+	"default-src 'none'",
+	"style-src 'sha256-" + HashBase64(AuthCSS) + "'",
+	"script-src 'sha256-" + HashBase64(InviteJS) + "'",
+	"connect-src 'self'",
+	"img-src data:",
+	"form-action 'none'",
+	"frame-ancestors 'none'",
+	"base-uri 'none'",
+}, "; ")

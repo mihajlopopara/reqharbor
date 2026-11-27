@@ -299,7 +299,7 @@ func (d *Deps) updateShare(w http.ResponseWriter, r *http.Request, ws *store.Wor
 }
 
 func (d *Deps) revokeShare(w http.ResponseWriter, r *http.Request, ws *store.Workspace) error {
-	revoked, err := d.Shares.Revoke(r.Context(), ws.ID, r.PathValue("id"))
+	revoked, err := d.Shares.Revoke(r.Context(), d.scope(ws), r.PathValue("id"))
 	if err != nil {
 		return err
 	}

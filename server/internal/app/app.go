@@ -25,6 +25,7 @@ import (
 	"github.com/mihajlopopara/reqharbor/server/internal/shares"
 	"github.com/mihajlopopara/reqharbor/server/internal/spaces"
 	"github.com/mihajlopopara/reqharbor/server/internal/store"
+	"github.com/mihajlopopara/reqharbor/server/internal/teams"
 )
 
 // Migration states reported by /readyz.
@@ -72,6 +73,7 @@ type App struct {
 	CreateLimiter *ratelimit.Limiter
 	ShareLimiter  *ratelimit.Limiter
 	SyncLimiter   *ratelimit.Limiter // /v1/spaces/*/sync per session
+	InviteLimiter *ratelimit.Limiter // POST /v1/invites/{preview,ticket} per IP
 	Auth          *auth.Service
 	Hasher        *auth.Hasher
 	Throttle      *throttle.Throttle
@@ -112,6 +114,7 @@ func New(d Deps) *App {
 	a.CreateLimiter = ratelimit.New(d.Clock, d.Config.RateLegacyCreatePerHour, time.Hour)
 	a.ShareLimiter = ratelimit.New(d.Clock, d.Config.RateShareCreatePerHour, time.Hour)
 	a.SyncLimiter = ratelimit.New(d.Clock, d.Config.RateSyncPerMin, time.Minute)
+	a.InviteLimiter = ratelimit.New(d.Clock, d.Config.RateAuthPerMin, time.Minute)
 
 	shareSvc := &shares.Service{Store: d.Store, Clock: d.Clock, PublicURL: d.Config.PublicURL}
 	a.Hasher = auth.NewHasher(d.Config.Argon2MemoryKiB)
@@ -149,6 +152,15 @@ func New(d Deps) *App {
 		SyncLimiter:  a.SyncLimiter,
 		ShareLimiter: a.ShareLimiter,
 		Epoch:        a.SyncEpoch,
+	})
+	teams.Register(mux, &teams.Deps{
+		Store:         d.Store,
+		Clock:         d.Clock,
+		Config:        d.Config,
+		Auth:          a.Auth,
+		ClientIP:      a.Resolver,
+		Logger:        d.Logger,
+		InviteLimiter: a.InviteLimiter,
 	})
 	mux.Handle("/s/{file}", shareSvc.PublicHandler())
 	mux.Handle("/", httpx.NotFoundHandler)
@@ -193,7 +205,7 @@ func (a *App) InstanceID() string { return a.instanceID }
 // Sweepers returns the in-memory limiters and the throttle's account-wide state for the
 // sweeper job.
 func (a *App) Sweepers() []jobs.Sweeper {
-	out := []jobs.Sweeper{a.CreateLimiter, a.ShareLimiter, a.SyncLimiter, a.Throttle}
+	out := []jobs.Sweeper{a.CreateLimiter, a.ShareLimiter, a.SyncLimiter, a.InviteLimiter, a.Throttle}
 	for _, l := range a.Auth.Limiters() {
 		out = append(out, l)
 	}

@@ -67,7 +67,8 @@ func TestSpaces_PersonalSpaceIsCreatedAtSignup(t *testing.T) {
 	res := h.Call(t, "/v1/me/spaces", tu.Req{Token: tk.Access})
 	tu.JSONEq(t, res.Body, map[string]any{
 		"spaces": []any{map[string]any{"spaceId": space, "kind": "personal", "teamId": nil, "teamName": nil,
-			"role": "owner", "bytesUsed": 0, "quotaBytes": 104857600}},
+			"role": "owner", "bytesUsed": 0, "quotaBytes": 104857600, "memberCount": 1, "ownerUserId": tk.User.ID}},
+		"owner":    map[string]any{"bytesUsed": 0, "quotaBytes": nil},
 		"departed": []any{},
 	})
 	got := spaceGet(t, h, tk.Access, space)

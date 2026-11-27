@@ -215,7 +215,7 @@ func TestRestore_ShiftsRevsAboveTheHeadRotatesTheEpochAndKeepsTheInstance(t *tes
 	if got := state(t, r, "restored_from"); got != "nightly.db" {
 		t.Errorf("restored_from %q", got)
 	}
-	if res.Workspaces != 3 || res.MinBase != 1 || res.MaxBase != 42 || res.Unrecorded != 0 || res.BackupVersion != 4 || res.Version != 4 {
+	if res.Workspaces != 3 || res.MinBase != 1 || res.MaxBase != 42 || res.Unrecorded != 0 || res.BackupVersion != 5 || res.Version != 5 {
 		t.Errorf("result %+v", res)
 	}
 	// The previous database is kept, complete (its WAL was checkpointed), and has W3.

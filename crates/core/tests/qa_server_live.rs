@@ -20,6 +20,10 @@
 //! cannot create the first account, so it relies on libtest's name order (with
 //! --test-threads=1): `live_password_…` runs before `live_provider_dev_…`.
 //!
+//! The teams case (M2, 06 §10 "M2 outline") needs `REQHARBOR_TEAMS=true`, which the script sets.
+//! It signs two accounts up with the invite (so the script's invite has 10 uses) and a third with
+//! a team-invite signup ticket and no server invite. It runs last (name order).
+//!
 //! The restore cases (S7, §6 "Restore") stop and restart the server through
 //! qa/live_server_ctl.sh, which the script passes as `REQHARBOR_LIVE_SERVER_CTL`: one restores a
 //! backup with `reqharbor-server restore`, the other copies it over the database by hand (the
@@ -313,14 +317,21 @@ impl Browser {
 
     /// Opens the sign-in page and returns the auth request id.
     async fn authorize(&mut self, state: &str) -> (String, String) {
-        let q = form(&[
+        self.authorize_with(state, &[]).await
+    }
+
+    /// `authorize` with extra query parameters (M2: `ticket`).
+    async fn authorize_with(&mut self, state: &str, extra: &[(&str, &str)]) -> (String, String) {
+        let mut pairs = vec![
             ("client_id", "reqharbor-desktop"),
             ("redirect_uri", REDIRECT),
             ("code_challenge", PKCE_CHALLENGE),
             ("code_challenge_method", "S256"),
             ("state", state),
             ("device_name", "QA live (Linux)"),
-        ]);
+        ];
+        pairs.extend_from_slice(extra);
+        let q = form(&pairs);
         let (status, headers, html) = self.get(&format!("/auth/authorize?{q}")).await;
         assert_eq!(status, 200, "{html}");
         let csp = headers["content-security-policy"].to_str().unwrap();
@@ -926,4 +937,251 @@ async fn live_restore_a_with_the_command_rotates_the_epoch_and_clients_re_push()
 #[ignore]
 async fn live_restore_b_by_hand_is_recovered_by_the_cursor_regression_rule() {
     restore_round_trip(true).await;
+}
+
+// --- M2 teams: team management, invites, signup tickets, roles in team-space sync ---
+
+/// A JSON call with an access token (or none) and the client's `X-ReqHarbor-Version`, which team
+/// spaces require.
+async fn api(
+    c: &reqwest::Client,
+    method: reqwest::Method,
+    path: &str,
+    access: Option<&str>,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let mut req = c
+        .request(method, format!("{}{path}", server_url()))
+        .header("X-ReqHarbor-Version", reqharbor_core::model::CLIENT_VERSION)
+        .header("CF-Connecting-IP", random_ip());
+    if let Some(a) = access {
+        req = req.bearer_auth(a);
+    }
+    if let Some(b) = body {
+        req = req
+            .header("Content-Type", "application/json")
+            .body(b.to_string());
+    }
+    let res = req.send().await.unwrap();
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap_or(Value::Null))
+}
+
+fn code(v: &Value) -> Value {
+    v["error"]["code"].clone()
+}
+
+/// Signs a new account up through the dev form with a team-invite signup ticket and no server
+/// invite code (REQHARBOR_SIGNUP=invite); returns the token response.
+async fn dev_sign_up_with_ticket(c: &reqwest::Client, ticket: &str, email: &str, state: &str) -> Value {
+    let mut b = Browser::new();
+    let (ar, _) = b.authorize_with(state, &[("ticket", ticket)]).await;
+    let (status, headers, body) = b
+        .post(
+            "/auth/dev",
+            form(&[("ar", &ar), ("email", email), ("name", "Ticket QA")]),
+        )
+        .await;
+    let auth_code = loopback_code(status, &headers, &body, state);
+    let (status, t) = token(
+        c,
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", "reqharbor-desktop"),
+            ("code", auth_code.as_str()),
+            ("code_verifier", PKCE_VERIFIER),
+            ("redirect_uri", REDIRECT),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{t}");
+    t
+}
+
+/// M2 teams against the real server: create a team, invite an editor (server invite + team link)
+/// and a viewer who has no account (team link → signup ticket → dev signup without a code), the
+/// hosted /i page, then team-space sync with roles: a viewer push is 403, an editor's project
+/// tombstone is a per-change forbidden_role, a Global environment is global_env_not_allowed,
+/// device-local paths are blanked, the page parses as the real client's PullPage, and a team space
+/// without X-ReqHarbor-Version is 426. Then removal (403 not_a_member, departed, the used link
+/// stays invalid) and team deletion (departed `deleted`, share page 404).
+#[tokio::test]
+#[ignore]
+async fn live_teams_invites_ticket_roles_and_team_sync() {
+    use reqwest::Method;
+    let invite = std::env::var("REQHARBOR_LIVE_INVITE_CODE")
+        .expect("REQHARBOR_LIVE_INVITE_CODE: an invite from `invite create` (qa/run_live_server_tests.sh sets it)");
+    let c = http();
+    let info: Value = c
+        .get(format!("{}/v1/server", server_url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        info["features"]["teams"],
+        json!(true),
+        "the live script sets REQHARBOR_TEAMS=true"
+    );
+    let tag = random_ip().replace('.', "-");
+    let owner = dev_sign_up(&c, &invite, &format!("team-owner-{tag}@example.test"), "st-team-o").await;
+    let o = owner["access_token"].as_str().unwrap().to_string();
+    let editor = dev_sign_up(&c, &invite, &format!("team-editor-{tag}@example.test"), "st-team-e").await;
+    let e = editor["access_token"].as_str().unwrap().to_string();
+
+    // Create the team.
+    let (status, team) = api(&c, Method::POST, "/v1/teams", Some(&o), Some(json!({"name": "Live QA team"}))).await;
+    assert_eq!(status, 201, "{team}");
+    assert_eq!(team["role"], json!("owner"));
+    let tid = team["teamId"].as_str().unwrap().to_string();
+    let space = team["spaceId"].as_str().unwrap().to_string();
+
+    // Invite links: the token is only in the URL fragment.
+    let (status, ed_link) = api(&c, Method::POST, &format!("/v1/teams/{tid}/invites"), Some(&o),
+        Some(json!({"role": "editor", "maxUses": 5, "expiresInDays": 7}))).await;
+    assert_eq!(status, 201, "{ed_link}");
+    let ed_token = ed_link["token"].as_str().unwrap().to_string();
+    assert_eq!(ed_link["url"], json!(format!("{}/i#{ed_token}", server_url())));
+    let (status, vw_link) = api(&c, Method::POST, &format!("/v1/teams/{tid}/invites"), Some(&o),
+        Some(json!({"role": "viewer", "maxUses": 1}))).await;
+    assert_eq!(status, 201, "{vw_link}");
+    let vw_token = vw_link["token"].as_str().unwrap().to_string();
+    let (status, err) = api(&c, Method::POST, &format!("/v1/teams/{tid}/invites"), Some(&o),
+        Some(json!({"role": "admin", "maxUses": 5}))).await;
+    assert_eq!((status, code(&err)), (400, json!("validation_failed")), "admin links are single-use");
+
+    // The hosted page: strict CSP, no team details in the static HTML.
+    let page = c.get(format!("{}/i", server_url())).send().await.unwrap();
+    assert_eq!(page.status().as_u16(), 200);
+    let csp = page.headers()["content-security-policy"].to_str().unwrap().to_string();
+    assert!(csp.starts_with("default-src 'none'"), "{csp}");
+    assert!(csp.contains("connect-src 'self'") && csp.contains("script-src 'sha256-"), "{csp}");
+    let html = page.text().await.unwrap();
+    assert!(!html.contains("Live QA team") && html.contains("Join team"), "{html}");
+
+    // Preview needs no auth.
+    let (status, pv) = api(&c, Method::POST, "/v1/invites/preview", None, Some(json!({"token": ed_token}))).await;
+    assert_eq!(status, 200, "{pv}");
+    assert_eq!(pv["teamName"], json!("Live QA team"));
+    assert_eq!(pv["role"], json!("editor"));
+    assert_eq!(pv["inviterName"], json!("Space QA"));
+
+    // The editor joins with the link.
+    let (status, acc) = api(&c, Method::POST, "/v1/invites/accept", Some(&e), Some(json!({"token": ed_token}))).await;
+    assert_eq!(status, 200, "{acc}");
+    assert_eq!(acc["role"], json!("editor"));
+    assert_eq!(acc["spaceId"], json!(space));
+
+    // The viewer has no account: a signup ticket lets them sign up without a server invite.
+    let (status, tk) = api(&c, Method::POST, "/v1/invites/ticket", None, Some(json!({"token": vw_token}))).await;
+    assert_eq!(status, 200, "{tk}");
+    let ticket = tk["ticket"].as_str().unwrap().to_string();
+    assert!(ticket.starts_with("rht_"), "{tk}");
+    let viewer = dev_sign_up_with_ticket(&c, &ticket, &format!("team-viewer-{tag}@example.test"), "st-team-v").await;
+    let v = viewer["access_token"].as_str().unwrap().to_string();
+    let (status, acc) = api(&c, Method::POST, "/v1/invites/accept", Some(&v), Some(json!({"token": vw_token}))).await;
+    assert_eq!(status, 200, "{acc}");
+    assert_eq!(acc["role"], json!("viewer"));
+    let (status, spaces) = api(&c, Method::GET, "/v1/me/spaces", Some(&v), None).await;
+    assert_eq!(status, 200, "{spaces}");
+    assert_eq!(spaces["spaces"][1]["spaceId"], json!(space));
+    assert_eq!(spaces["spaces"][1]["kind"], json!("team"));
+    assert_eq!(spaces["spaces"][1]["role"], json!("viewer"));
+    let (status, members) = api(&c, Method::GET, &format!("/v1/teams/{tid}/members"), Some(&v), None).await;
+    assert_eq!(status, 200, "{members}");
+    assert_eq!(members["members"].as_array().unwrap().len(), 3);
+
+    // Team-space sync with roles.
+    let sync = format!("/v1/spaces/{space}/sync");
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    let push = json!({"changes": [
+        {"type": "project", "id": "tp1", "updatedAt": now, "deleted": false, "deviceId": "01QA",
+         "data": {"id": "tp1", "name": "Team project"}},
+        {"type": "request", "id": "tr1", "updatedAt": now, "deleted": false, "deviceId": "01QA",
+         "data": {"id": "tr1", "name": "Upload", "method": "POST", "url": "https://example.com",
+                  "body": {"type": "binary", "binaryPath": "/home/qa/private.bin"}}},
+        {"type": "environment", "id": "tg", "updatedAt": now, "deleted": false,
+         "data": {"id": "tg", "projectId": null, "name": "Global"}},
+    ]});
+    let (status, resp) = api(&c, Method::POST, &sync, Some(&o), Some(push)).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(resp["results"][0]["status"], json!("applied"));
+    assert_eq!(resp["results"][1]["status"], json!("applied"));
+    assert_eq!(
+        resp["results"][2],
+        json!({"type": "environment", "id": "tg", "status": "rejected", "reason": "global_env_not_allowed"})
+    );
+    let tomb = json!({"changes": [
+        {"type": "project", "id": "tp1", "updatedAt": now + 1, "deleted": true, "data": null},
+        {"type": "request", "id": "tr2", "updatedAt": now + 1, "deleted": false, "data": {"id": "tr2", "name": "Editor's"}},
+    ]});
+    let (status, resp) = api(&c, Method::POST, &sync, Some(&e), Some(tomb.clone())).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(
+        resp["results"][0],
+        json!({"type": "project", "id": "tp1", "status": "rejected", "reason": "forbidden_role"})
+    );
+    assert_eq!(resp["results"][1]["status"], json!("applied"));
+    let (status, err) = api(&c, Method::POST, &sync, Some(&v), Some(tomb)).await;
+    assert_eq!((status, code(&err)), (403, json!("forbidden_role")));
+
+    // The viewer pulls: binaryPath is blank, authors are named, and the real client parses it.
+    let res = c
+        .get(format!("{}{sync}?since=0", server_url()))
+        .header("X-ReqHarbor-Version", reqharbor_core::model::CLIENT_VERSION)
+        .bearer_auth(&v)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let text = res.text().await.unwrap();
+    let page: Value = serde_json::from_str(&text).unwrap();
+    let upload = page["changes"].as_array().unwrap().iter().find(|ch| ch["id"] == json!("tr1")).unwrap();
+    assert_eq!(upload["data"]["body"]["binaryPath"], json!(""));
+    assert_eq!(upload["updatedBy"]["name"], json!("Space QA"));
+    let parsed: reqharbor_core::sync::PullPage = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed.changes.len(), 3, "tp1, tr1 and tr2");
+    // A team space needs the version header.
+    let res = c.get(format!("{}{sync}", server_url())).bearer_auth(&v).send().await.unwrap();
+    assert_eq!(res.status().as_u16(), 426);
+
+    // A share in the team space, for the delete check below.
+    let snapshot = json!({"schemaVersion": 1, "request": {"id": "tr2", "name": "Editor's", "method": "GET",
+        "url": "https://example.com", "params": [], "headers": [], "auth": {"type": "none"},
+        "body": {"type": "none"}}, "environment": null});
+    let (status, err) = api(&c, Method::POST, &format!("/v1/spaces/{space}/shares"), Some(&v),
+        Some(json!({"kind": "request", "entityId": "tr2", "snapshot": snapshot.clone()}))).await;
+    assert_eq!((status, code(&err)), (403, json!("forbidden_role")), "viewers can't share");
+    let (status, share) = api(&c, Method::POST, &format!("/v1/spaces/{space}/shares"), Some(&e),
+        Some(json!({"kind": "request", "entityId": "tr2", "snapshot": snapshot}))).await;
+    assert_eq!(status, 201, "{share}");
+    let share_url = share["url"].as_str().unwrap().to_string();
+
+    // Removal: immediate 403, a `removed` departure, and the used single-use link stays invalid.
+    let vid = viewer["user"]["id"].as_str().unwrap();
+    let (status, removed) = api(&c, Method::DELETE, &format!("/v1/teams/{tid}/members/{vid}"), Some(&o),
+        Some(json!({"revokeInvites": false}))).await;
+    assert_eq!(status, 200, "{removed}");
+    let (status, err) = api(&c, Method::GET, &sync, Some(&v), None).await;
+    assert_eq!((status, code(&err)), (403, json!("not_a_member")));
+    let (_, spaces) = api(&c, Method::GET, "/v1/me/spaces", Some(&v), None).await;
+    assert_eq!(spaces["departed"][0]["reason"], json!("removed"));
+    assert_eq!(spaces["departed"][0]["spaceId"], json!(space));
+    let (status, err) = api(&c, Method::POST, "/v1/invites/accept", Some(&v), Some(json!({"token": ed_token}))).await;
+    assert_eq!((status, code(&err)), (410, json!("invite_invalid")), "a link from before the removal");
+
+    // The billing owner can't leave; deleting the team cascades.
+    let (status, err) = api(&c, Method::POST, &format!("/v1/teams/{tid}/leave"), Some(&o), None).await;
+    assert_eq!((status, code(&err)), (409, json!("last_owner")));
+    let (status, _) = api(&c, Method::DELETE, &format!("/v1/teams/{tid}"), Some(&e), None).await;
+    assert_eq!(status, 403);
+    let (status, _) = api(&c, Method::DELETE, &format!("/v1/teams/{tid}"), Some(&o), None).await;
+    assert_eq!(status, 204);
+    let (_, spaces) = api(&c, Method::GET, "/v1/me/spaces", Some(&e), None).await;
+    assert_eq!(spaces["departed"][0]["reason"], json!("deleted"), "{spaces}");
+    assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1, "{spaces}");
+    let res = c.get(&share_url).send().await.unwrap();
+    assert_eq!(res.status().as_u16(), 404, "the team's share page is gone");
 }

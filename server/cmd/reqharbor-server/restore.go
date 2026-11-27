@@ -79,6 +79,9 @@ func restore(args, environ []string, stdout, stderr io.Writer) int {
 - Revocations made after this backup are undone: signed-out sessions, disabled accounts, reset
   passwords and revoked invites are back as they were. Repeat those runs now (user disable,
   user sessions revoke, user set-password or user reset-link, invite revoke).
+- Team changes made after this backup are undone too: removed members are members again, demoted
+  members have their old roles back and revoked team invite links work again. Tell team admins to
+  repeat those removals, demotions and revocations.
 `)
 	return 0
 }

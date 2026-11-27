@@ -22,21 +22,21 @@ func (t *rtx) OpenSignupTotalBytes() (int64, error) {
 
 func (t *rtx) SpaceAccess(workspaceID, userID string) (*store.SpaceAccess, error) {
 	var a store.SpaceAccess
-	var teamID, teamName, owner, ownerVia, role sql.NullString
+	var teamID, teamName, owner, ownerVia, ownerName, role sql.NullString
 	var personal sql.NullInt64
 	w := &a.Workspace
-	err := t.row(`SELECT w.id, w.name, w.token_hash, w.rev, w.created_at, w.team_id, t.name, t.personal, t.owner_user_id, u.signup_via, m.role
+	err := t.row(`SELECT w.id, w.name, w.token_hash, w.rev, w.created_at, w.team_id, t.name, t.personal, t.owner_user_id, u.signup_via, u.name, m.role
 	      FROM workspaces w
 	      LEFT JOIN teams t        ON t.id = w.team_id
 	      LEFT JOIN users u        ON u.id = t.owner_user_id
 	      LEFT JOIN team_members m ON m.team_id = w.team_id AND m.user_id = ?2
 	     WHERE w.id = ?1`, workspaceID, userID).
-		Scan(&w.ID, &w.Name, &w.TokenHash, &w.Rev, &w.CreatedAt, &teamID, &teamName, &personal, &owner, &ownerVia, &role)
+		Scan(&w.ID, &w.Name, &w.TokenHash, &w.Rev, &w.CreatedAt, &teamID, &teamName, &personal, &owner, &ownerVia, &ownerName, &role)
 	if err != nil {
 		return nil, notFound(err)
 	}
 	a.TeamID, a.Role = nullStr(&teamID), nullStr(&role)
-	a.TeamName, a.OwnerUserID, a.OwnerSignupVia = teamName.String, owner.String, ownerVia.String
+	a.TeamName, a.OwnerUserID, a.OwnerSignupVia, a.OwnerName = teamName.String, owner.String, ownerVia.String, ownerName.String
 	a.Personal = personal.Valid && personal.Int64 == 1
 	return &a, nil
 }

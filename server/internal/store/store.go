@@ -90,9 +90,10 @@ type SpaceAccess struct {
 	TeamName string
 	Personal bool
 	// OwnerUserID is the team's billing owner; OwnerSignupVia is that user's users.signup_via
-	// (the REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES class of a personal space).
+	// (the REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES class of a personal space) and OwnerName its name.
 	OwnerUserID    string
 	OwnerSignupVia string
+	OwnerName      string
 	// Role is the user's membership role, nil when the user is not a member.
 	Role *string
 }
@@ -111,6 +112,7 @@ type SpaceRow struct {
 // ReadTx are the queries available in any transaction.
 type ReadTx interface {
 	AccountsReadTx
+	TeamsReadTx
 	WorkspaceByTokenHash(hash string) (*Workspace, error)
 	Workspace(id string) (*Workspace, error)
 	// WorkspaceUsage is entity data plus active share snapshots, in bytes (QA-R1-024).
@@ -137,6 +139,7 @@ type ReadTx interface {
 type WriteTx interface {
 	ReadTx
 	AccountsWriteTx
+	TeamsWriteTx
 	// LockWorkspace is a no-op on SQLite (the writer is serialised); Postgres would SELECT … FOR UPDATE.
 	LockWorkspace(id string) error
 	InsertWorkspace(w Workspace) error

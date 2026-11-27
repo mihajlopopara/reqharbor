@@ -16,6 +16,7 @@ import (
 	"github.com/mihajlopopara/reqharbor/server/internal/httpx"
 	"github.com/mihajlopopara/reqharbor/server/internal/jobs"
 	"github.com/mihajlopopara/reqharbor/server/internal/ratelimit"
+	"github.com/mihajlopopara/reqharbor/server/internal/roles"
 	"github.com/mihajlopopara/reqharbor/server/internal/shares"
 	"github.com/mihajlopopara/reqharbor/server/internal/store"
 	"github.com/mihajlopopara/reqharbor/server/internal/syncsvc"
@@ -42,11 +43,19 @@ type Deps struct {
 	Epoch func() string
 }
 
-// Space kinds and the M1 role names.
+// Space kinds.
 const (
 	KindPersonal = "personal"
 	KindTeam     = "team"
 )
+
+// TeamSpaceMinClientVersion is the fixed version gate of team spaces (06-go-server.md §10 "M2
+// outline"): every /v1/spaces/{id}* call to a team space needs X-ReqHarbor-Version at least this
+// (426 client_too_old), whatever REQHARBOR_MIN_CLIENT_VERSION says. Clients older than M0 send no
+// header and would drop the fields of newer request kinds that teammates sync (02 §13). The M0
+// client still reports 0.1.0, so in practice this requires the header; raise it to the first
+// release that ships M0.
+const TeamSpaceMinClientVersion = "0.1.0"
 
 const dayMillis = 24 * 60 * 60 * 1000
 
@@ -116,7 +125,8 @@ type spaceFunc func(w http.ResponseWriter, r *http.Request, a *Access) error
 
 // space applies, in order: the REQHARBOR_MIN_CLIENT_VERSION gate (426), the access token (401),
 // then space authorisation (§4): an unknown id or a legacy workspace is 404 space_not_found, no
-// membership is 403 not_a_member. Only then does the handler read a body.
+// membership is 403 not_a_member; then, for a team space, the fixed team-space version gate (426).
+// Only then does the handler check the role and read a body.
 func (d *Deps) space(h spaceFunc) httpx.Func {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		if err := httpx.CheckClientVersion(r, d.Config.MinClientVersion); err != nil {
@@ -141,6 +151,11 @@ func (d *Deps) space(h spaceFunc) httpx.Func {
 			return spaceNotFound() // legacy workspaces are never addressable through /v1/spaces
 		case acc.Role == nil:
 			return notAMember()
+		}
+		if !acc.Personal {
+			if err := httpx.CheckClientVersion(r, TeamSpaceMinClientVersion); err != nil {
+				return err
+			}
 		}
 		return h(w, r, &Access{Principal: p, Space: acc})
 	}
@@ -178,12 +193,33 @@ func (d *Deps) quota(personal bool) *int64 {
 	return &q
 }
 
+// limits are the storage rules of a write to the space: its quota, the billing owner's aggregate
+// (REQHARBOR_QUOTA_OWNER_BYTES), then the breaker.
 func (d *Deps) limits(acc *store.SpaceAccess) syncsvc.Limits {
 	var q int64
 	if p := d.quota(acc.Personal); p != nil {
 		q = *p
 	}
-	return syncsvc.Limits{QuotaBytes: q, Growth: d.growth(acc)}
+	return syncsvc.Limits{QuotaBytes: q, OwnerQuotaBytes: d.Config.QuotaOwnerBytes, OwnerUserID: acc.OwnerUserID,
+		OwnerName: acc.OwnerName, Growth: d.growth(acc)}
+}
+
+func (a *Access) role() string { return *a.Space.Role }
+
+// roleGuard returns the caller's role in the space as it is inside the given transaction: 403
+// not_a_member once the membership is gone. A personal space has only its owner.
+func (d *Deps) roleGuard(a *Access) func(tx store.ReadTx) (string, error) {
+	teamID, userID := *a.Space.TeamID, a.Principal.User.ID
+	return func(tx store.ReadTx) (string, error) {
+		m, err := tx.TeamMember(teamID, userID)
+		if errors.Is(err, store.ErrNotFound) {
+			return "", notAMember()
+		}
+		if err != nil {
+			return "", err
+		}
+		return m.Role, nil
+	}
 }
 
 // growth is the breaker check of a growing write to a space: the server-wide breaker, then the
@@ -298,34 +334,56 @@ func (d *Deps) revokeSession(w http.ResponseWriter, r *http.Request, p *auth.Pri
 }
 
 // MySpace is one entry of GET /v1/me/spaces. TeamID and TeamName are null for the personal
-// space; QuotaBytes is null when unlimited.
+// space; QuotaBytes is null when unlimited. OwnerUserID is the billing owner (the caller for the
+// personal space).
 type MySpace struct {
-	SpaceID    string  `json:"spaceId"`
-	Kind       string  `json:"kind"`
-	TeamID     *string `json:"teamId"`
-	TeamName   *string `json:"teamName"`
-	Role       string  `json:"role"`
-	BytesUsed  int64   `json:"bytesUsed"`
-	QuotaBytes *int64  `json:"quotaBytes"`
+	SpaceID     string  `json:"spaceId"`
+	Kind        string  `json:"kind"`
+	TeamID      *string `json:"teamId"`
+	TeamName    *string `json:"teamName"`
+	Role        string  `json:"role"`
+	BytesUsed   int64   `json:"bytesUsed"`
+	QuotaBytes  *int64  `json:"quotaBytes"`
+	MemberCount int64   `json:"memberCount"`
+	OwnerUserID string  `json:"ownerUserId"`
 }
 
-// Departed is a space the user left or lost (M2 fills it; always empty in M1).
+// Departed is a team space the user left or lost: the latest departure from each team the user is
+// not a member of now (M2), kept 31 days. Reason is removed, left or deleted.
 type Departed struct {
-	SpaceID  string  `json:"spaceId"`
-	TeamID   *string `json:"teamId"`
-	TeamName *string `json:"teamName"`
-	Reason   string  `json:"reason"`
-	At       int64   `json:"at"`
+	SpaceID  string `json:"spaceId"`
+	TeamID   string `json:"teamId"`
+	TeamName string `json:"teamName"`
+	Reason   string `json:"reason"`
+	At       int64  `json:"at"`
 }
 
-// MySpaces is GET /v1/me/spaces: the authoritative membership list (04 §6.7).
+// Usage is a storage figure; QuotaBytes is null when unlimited.
+type Usage struct {
+	BytesUsed  int64  `json:"bytesUsed"`
+	QuotaBytes *int64 `json:"quotaBytes"`
+}
+
+// MySpaces is GET /v1/me/spaces: the authoritative membership list (04 §6.7). Owner is the caller's
+// own aggregate: the personal space plus every team the caller is the billing owner of
+// (REQHARBOR_QUOTA_OWNER_BYTES).
 type MySpaces struct {
 	Spaces   []MySpace  `json:"spaces"`
+	Owner    Usage      `json:"owner"`
 	Departed []Departed `json:"departed"`
 }
 
+// OwnerQuota is REQHARBOR_QUOTA_OWNER_BYTES, nil when unlimited.
+func OwnerQuota(cfg *config.Config) *int64 {
+	if cfg.QuotaOwnerBytes <= 0 {
+		return nil
+	}
+	q := cfg.QuotaOwnerBytes
+	return &q
+}
+
 func (d *Deps) mySpaces(w http.ResponseWriter, r *http.Request, p *auth.Principal) error {
-	out := MySpaces{Spaces: []MySpace{}, Departed: []Departed{}}
+	out := MySpaces{Spaces: []MySpace{}, Departed: []Departed{}, Owner: Usage{QuotaBytes: OwnerQuota(d.Config)}}
 	err := d.Store.Read(r.Context(), func(tx store.ReadTx) error {
 		rows, err := tx.UserSpaces(p.User.ID)
 		if err != nil {
@@ -336,12 +394,31 @@ func (d *Deps) mySpaces(w http.ResponseWriter, r *http.Request, p *auth.Principa
 			if err != nil {
 				return err
 			}
-			m := MySpace{SpaceID: s.WorkspaceID, Kind: kind(s.Personal), Role: s.Role, BytesUsed: used, QuotaBytes: d.quota(s.Personal)}
+			m := MySpace{SpaceID: s.WorkspaceID, Kind: kind(s.Personal), Role: s.Role, BytesUsed: used, QuotaBytes: d.quota(s.Personal),
+				MemberCount: 1, OwnerUserID: p.User.ID}
 			if !s.Personal {
 				teamID, teamName := s.TeamID, s.TeamName
 				m.TeamID, m.TeamName = &teamID, &teamName
+				team, err := tx.Team(s.TeamID)
+				if err != nil {
+					return err
+				}
+				m.OwnerUserID = team.OwnerUserID
+				if m.MemberCount, err = tx.MemberCount(s.TeamID); err != nil {
+					return err
+				}
 			}
 			out.Spaces = append(out.Spaces, m)
+		}
+		if out.Owner.BytesUsed, err = tx.OwnerUsage(p.User.ID); err != nil {
+			return err
+		}
+		deps, err := tx.UserDepartures(p.User.ID)
+		if err != nil {
+			return err
+		}
+		for _, dep := range deps {
+			out.Departed = append(out.Departed, Departed{SpaceID: dep.SpaceID, TeamID: dep.TeamID, TeamName: dep.TeamName, Reason: dep.Reason, At: dep.At})
 		}
 		return nil
 	})
@@ -397,20 +474,43 @@ func (d *Deps) pull(w http.ResponseWriter, r *http.Request, a *Access) error {
 
 // push is the legacy push plus the account-space rules: an unknown type is a per-change
 // unsupported_type, an updatedAt more than 5 minutes ahead of the server is a per-change
-// clock_skew, applied changes record the author, and the response carries serverTime.
-// (M2 adds role enforcement here; a personal space has only its owner.)
+// clock_skew, applied changes record the author, and the response carries serverTime. Roles (M2):
+// a viewer's push is 403 forbidden_role before the body is read; a project tombstone from a member
+// below admin is a per-change forbidden_role. Team spaces also refuse a global environment per
+// change (global_env_not_allowed) and blank device-local paths before sizing. A personal space has
+// only its owner, so none of this applies there.
 func (d *Deps) push(w http.ResponseWriter, r *http.Request, a *Access) error {
+	if !roles.AtLeast(a.role(), roles.Editor) {
+		return roles.Forbidden("Viewers can't change this space")
+	}
 	body, err := httpx.ReadJSONObject(w, r, httpx.MaxBodyBytes)
 	if err != nil {
 		return err
 	}
 	now := clock.Millis(d.Clock.Now())
-	changes, err := syncsvc.ParsePush(body, syncsvc.ParseOptions{UnknownTypePerChange: true, MaxUpdatedAt: now + syncsvc.MaxClockAheadMillis})
+	team := !a.Space.Personal
+	changes, err := syncsvc.ParsePush(body, syncsvc.ParseOptions{UnknownTypePerChange: true, MaxUpdatedAt: now + syncsvc.MaxClockAheadMillis,
+		TeamSpace: team})
 	if err != nil {
 		return err
 	}
-	resp, err := syncsvc.Push(r.Context(), d.Store, a.id(), changes, d.limits(a.Space),
-		&syncsvc.Actor{UserID: a.Principal.User.ID, Now: now})
+	actor := &syncsvc.Actor{UserID: a.Principal.User.ID, Now: now}
+	if team {
+		// The membership and role may have changed since the request was authorised: both are
+		// decided again from the role current inside the push transaction.
+		guard := d.roleGuard(a)
+		actor.Recheck = func(tx store.ReadTx) (syncsvc.Policy, error) {
+			role, err := guard(tx)
+			if err != nil {
+				return syncsvc.Policy{}, err
+			}
+			if !roles.AtLeast(role, roles.Editor) {
+				return syncsvc.Policy{}, roles.Forbidden("Viewers can't change this space")
+			}
+			return syncsvc.Policy{ForbidProjectDelete: !roles.AtLeast(role, roles.Admin)}, nil
+		}
+	}
+	resp, err := syncsvc.Push(r.Context(), d.Store, a.id(), changes, d.limits(a.Space), actor)
 	if err != nil {
 		return err
 	}
@@ -419,8 +519,28 @@ func (d *Deps) push(w http.ResponseWriter, r *http.Request, a *Access) error {
 
 // ---------------------------------------------------------------- shares
 
+// scope is the share scope of the space. In a team space its Guard re-checks the caller's role
+// inside each share write transaction (create: editor or above; update and revoke: mayChangeShare).
 func (d *Deps) scope(a *Access) shares.Scope {
-	return shares.Scope{WorkspaceID: a.id(), Limits: d.limits(a.Space)}
+	sc := shares.Scope{WorkspaceID: a.id(), Limits: d.limits(a.Space)}
+	if !a.Space.Personal {
+		guard := d.roleGuard(a)
+		uid := a.Principal.User.ID
+		sc.Guard = func(tx store.ReadTx, sh *store.Share) error {
+			role, err := guard(tx)
+			if err != nil {
+				return err
+			}
+			if sh == nil {
+				if !roles.AtLeast(role, roles.Editor) {
+					return roles.Forbidden("Viewers can't create share links")
+				}
+				return nil
+			}
+			return mayChangeShareAs(role, uid, sh)
+		}
+	}
+	return sc
 }
 
 func (d *Deps) listShares(w http.ResponseWriter, r *http.Request, a *Access) error {
@@ -433,7 +553,28 @@ func (d *Deps) listShares(w http.ResponseWriter, r *http.Request, a *Access) err
 	}{list}, nil)
 }
 
+// mayChangeShare is the share rule of a space (02 §6.6): editors update and revoke their own
+// shares, admins and owners anyone's; viewers none.
+func mayChangeShare(a *Access, sh *store.Share) error {
+	return mayChangeShareAs(a.role(), a.Principal.User.ID, sh)
+}
+
+func mayChangeShareAs(role, userID string, sh *store.Share) error {
+	switch {
+	case roles.AtLeast(role, roles.Admin):
+		return nil
+	case roles.AtLeast(role, roles.Editor) && sh.CreatedBy != nil && *sh.CreatedBy == userID:
+		return nil
+	case roles.AtLeast(role, roles.Editor):
+		return roles.Forbidden("Only admins can change share links that other members created")
+	}
+	return roles.Forbidden("Viewers can't change share links")
+}
+
 func (d *Deps) createShare(w http.ResponseWriter, r *http.Request, a *Access) error {
+	if !roles.AtLeast(a.role(), roles.Editor) {
+		return roles.Forbidden("Viewers can't create share links")
+	}
 	body, err := httpx.ReadJSONObject(w, r, httpx.MaxBodyBytes)
 	if err != nil {
 		return err
@@ -472,12 +613,18 @@ func writeShare(w http.ResponseWriter, status int, c *shares.Created, by *shares
 	}{*c, by, shares.RawOrNull(options)}, nil)
 }
 
-// updateShare checks, in order: the share id and that it belongs to this space (404), revoked
-// (410), and only then the body; `options` absent or null keeps the stored options.
+// updateShare checks, in order: the share id and that it belongs to this space (404), the role
+// (403), revoked (410), and only then the body; `options` absent or null keeps the stored options.
 func (d *Deps) updateShare(w http.ResponseWriter, r *http.Request, a *Access) error {
-	sh, err := d.Shares.CheckUpdatable(r.Context(), a.id(), r.PathValue("sid"))
+	sh, err := d.Shares.Owned(r.Context(), a.id(), r.PathValue("sid"))
 	if err != nil {
 		return err
+	}
+	if err := mayChangeShare(a, sh); err != nil {
+		return err
+	}
+	if sh.RevokedAt != nil {
+		return httpx.Gone()
 	}
 	body, err := httpx.ReadJSONObject(w, r, httpx.MaxBodyBytes)
 	if err != nil {
@@ -501,9 +648,17 @@ func (d *Deps) updateShare(w http.ResponseWriter, r *http.Request, a *Access) er
 	return writeShare(w, http.StatusOK, updated, by, options)
 }
 
-// revokeShare never reads a body.
+// revokeShare never reads a body. Order: the share of this space (404), the role (403), then the
+// idempotent revoke.
 func (d *Deps) revokeShare(w http.ResponseWriter, r *http.Request, a *Access) error {
-	revoked, err := d.Shares.Revoke(r.Context(), a.id(), r.PathValue("sid"))
+	sh, err := d.Shares.Owned(r.Context(), a.id(), r.PathValue("sid"))
+	if err != nil {
+		return err
+	}
+	if err := mayChangeShare(a, sh); err != nil {
+		return err
+	}
+	revoked, err := d.Shares.Revoke(r.Context(), d.scope(a), r.PathValue("sid"))
 	if err != nil {
 		return err
 	}

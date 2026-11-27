@@ -1,0 +1,7 @@
+{{- /* GET /i#<token>: the hosted invite page (AC-INV-3, UX §13). invite.js reads the token from the fragment, which never reaches the server's logs, and asks POST /v1/invites/preview. Without JavaScript only the instructions show, with no team details. */ -}}
+{{define "content"}}<h1 id="title">You're invited to a team on ReqHarbor</h1>
+<p id="status" class="meta" role="status" hidden></p>
+<p id="howto">Open ReqHarbor › Teams › Join team and paste this link.</p>
+<div id="copy" class="invite-copy" hidden><input id="link" readonly aria-label="Invite link"><button id="copybtn" type="button">Copy link</button></div>
+<p class="meta">Don't have ReqHarbor yet? Install it, then sign in to {{.PublicURL}}.</p>
+{{end}}

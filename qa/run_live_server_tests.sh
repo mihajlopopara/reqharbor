@@ -14,9 +14,11 @@
 #      script reads from the log and passes as REQHARBOR_LIVE_SIGNUP_CODE; and the S5 dev-provider
 #      case, which signs up through the dev form with an invite made here with `invite create` and
 #      passed as REQHARBOR_LIVE_INVITE_CODE; and the S6 personal-spaces case, which signs two more
-#      accounts up with the same invite, so it has 5 uses; and the S7 restore cases, which stop the
-#      server, restore a backup with `restore` (or copy it over by hand) and start it again through
-#      qa/live_server_ctl.sh, passed as REQHARBOR_LIVE_SERVER_CTL)
+#      accounts up with the same invite; and the S7 restore cases, which stop the server, restore a
+#      backup with `restore` (or copy it over by hand) and start it again through
+#      qa/live_server_ctl.sh, passed as REQHARBOR_LIVE_SERVER_CTL; and the M2 teams case, which
+#      signs two more accounts up with the invite (so it has 10 uses) and a third with a team-invite
+#      signup ticket. The server runs with REQHARBOR_TEAMS=true for it (qa/live_server_lib.sh))
 #   4. cargo test --test qa_auth_live -- --ignored  (the client's sign-in, M1-client C1; §7.5 step 6)
 #      with REQHARBOR_LIVE_SIGNUP_CODE set to a multi-use invite made with `invite create`. It needs
 #      the S6 routes (GET /v1/me, sessions, personal spaces; §9, §10 S6), so by default
@@ -81,7 +83,7 @@ run_live qa_sync_live
 SYNC=$?
 # The dev-provider case needs an invite. The CLI works next to the running server (no lock, short
 # transactions); the invite is consumed only after the setup-code case created the first account.
-LIVE_INVITE=$(rh invite create --uses 5 --ttl 1h | head -1)
+LIVE_INVITE=$(rh invite create --uses 10 --ttl 1h | head -1)
 if [ -z "$LIVE_INVITE" ]; then
   echo "invite create printed no code" >&2
   exit 2

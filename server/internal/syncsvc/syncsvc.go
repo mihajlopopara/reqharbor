@@ -34,6 +34,10 @@ const (
 	ReasonInvalidJSONValue = "invalid_json_value"
 	ReasonUnsupportedType  = "unsupported_type"
 	ReasonClockSkew        = "clock_skew"
+	// ReasonForbiddenRole is a project tombstone pushed by a member below admin (AC-ROLE-2).
+	ReasonForbiddenRole = "forbidden_role"
+	// ReasonGlobalEnv is an environment without a projectId pushed to a team space (AC-TSYNC-6).
+	ReasonGlobalEnv = "global_env_not_allowed"
 )
 
 // MaxClockAheadMillis is how far a change's updatedAt may be ahead of the server's clock in an
@@ -75,6 +79,13 @@ type ParseOptions struct {
 	// MaxUpdatedAt, when positive, rejects a change whose updatedAt is greater with a per-change
 	// clock_skew (account spaces: server time + MaxClockAheadMillis).
 	MaxUpdatedAt int64
+	// ForbidProjectDelete rejects a `project` tombstone per change with forbidden_role (a team
+	// member below admin, AC-ROLE-2); the rest of the push applies.
+	ForbidProjectDelete bool
+	// TeamSpace applies the team-space rules: an environment whose data has no projectId string
+	// is rejected per change with global_env_not_allowed (AC-TSYNC-6), and device-local paths are
+	// blanked before the size is measured (StripDeviceLocalPaths, AC-TSYNC-8).
+	TeamSpace bool
 }
 
 // ParsePush validates a push body in the Worker's order. The first invalid change ends the
@@ -156,8 +167,8 @@ func validateChange(raw *jsonx.Value, i int, opts ParseOptions) (Change, error) 
 		return Change{}, httpx.BadRequest(at + ".data must be an object unless deleted is true")
 	}
 	// Every 400 check above applies to every change; only then the per-change rejections, in
-	// this order: unsupported_type, clock_skew, then the data checks (invalid_json_value,
-	// entity_too_large).
+	// this order: unsupported_type, clock_skew, forbidden_role, global_env_not_allowed, then the
+	// data checks (invalid_json_value, entity_too_large).
 	if c.Rejected != "" {
 		return c, nil
 	}
@@ -166,10 +177,22 @@ func validateChange(raw *jsonx.Value, i int, opts ParseOptions) (Change, error) 
 		return c, nil
 	}
 	if c.Deleted {
+		if opts.ForbidProjectDelete && c.Type == "project" {
+			c.Rejected = ReasonForbiddenRole
+		}
 		return c, nil
+	}
+	if opts.TeamSpace && c.Type == "environment" {
+		if pid, ok := data.Get("projectId").Str(); !ok || pid == "" {
+			c.Rejected = ReasonGlobalEnv
+			return c, nil
+		}
 	}
 	if c.Type == "environment" {
 		data = StripSecretValuesForSync(data)
+	}
+	if opts.TeamSpace && c.Type == "request" {
+		data = StripDeviceLocalPaths(data)
 	}
 	canon, err := jsonx.Canonical(data)
 	if err != nil {
@@ -211,6 +234,48 @@ func StripSecretValuesForSync(env *jsonx.Value) *jsonx.Value {
 	return out
 }
 
+// StripDeviceLocalPaths blanks the file paths of a request that only mean something on the device
+// that wrote them (AC-TSYNC-8, team spaces only): body.binaryPath, and the value of every
+// body.form entry whose kind is "file". The client keeps its local values on pull, as for secrets.
+func StripDeviceLocalPaths(req *jsonx.Value) *jsonx.Value {
+	body := req.Get("body")
+	if !body.IsObject() {
+		return req
+	}
+	var nb *jsonx.Value
+	if p := body.Get("binaryPath"); p != nil && p.Kind == jsonx.String && p.S != "" {
+		nb = body.ShallowCopy()
+		nb.Set("binaryPath", jsonx.NewString(""))
+	}
+	if form := body.Get("form"); form.IsArray() {
+		var nf *jsonx.Value
+		for i, f := range form.Arr {
+			kind, _ := f.Get("kind").Str()
+			if v := f.Get("value"); !f.IsObject() || kind != "file" || v == nil || (v.Kind == jsonx.String && v.S == "") {
+				continue
+			}
+			if nf == nil {
+				nf = &jsonx.Value{Kind: jsonx.Array, Arr: append([]*jsonx.Value(nil), form.Arr...)}
+			}
+			cp := f.ShallowCopy()
+			cp.Set("value", jsonx.NewString(""))
+			nf.Arr[i] = cp
+		}
+		if nf != nil {
+			if nb == nil {
+				nb = body.ShallowCopy()
+			}
+			nb.Set("form", nf)
+		}
+	}
+	if nb == nil {
+		return req
+	}
+	out := req.ShallowCopy()
+	out.Set("body", nb)
+	return out
+}
+
 // Wins is last-write-wins, contract C3: the incoming change wins when its updatedAt is greater,
 // or equal with a deviceId that is byte-wise greater than or equal to the stored one.
 func Wins(inUpdatedAt int64, inDevice string, storedUpdatedAt int64, storedDevice string) bool {
@@ -239,21 +304,76 @@ type Actor struct {
 	UserID string
 	// Now is the server time (Unix ms) reported as serverTime.
 	Now int64
+	// Recheck, when set, runs first inside the write transaction: the membership and role may
+	// have changed since the request was authorised. Its error refuses the push; the Policy it
+	// returns, decided from the role current inside the transaction, applies per change.
+	Recheck func(tx store.ReadTx) (Policy, error)
 }
 
-// Limits are the per-push storage rules.
+// Policy is what the pusher's current role allows, decided inside the push transaction.
+type Policy struct {
+	// ForbidProjectDelete rejects each `project` tombstone per change with forbidden_role (a team
+	// member below admin, AC-ROLE-2), after the parse-time rejections.
+	ForbidProjectDelete bool
+}
+
+// Limits are the per-write storage rules.
 type Limits struct {
 	// QuotaBytes caps the space's usage; 0 means unlimited.
 	QuotaBytes int64
-	// Growth, when non-nil, is called for a growing push after the quota check; an error (507
-	// server_full from the breaker) refuses the push.
+	// OwnerQuotaBytes caps the billing owner's aggregate (REQHARBOR_QUOTA_OWNER_BYTES: the
+	// personal space plus every team space OwnerUserID owns); 0 means unlimited. OwnerName names
+	// the owner in the error.
+	OwnerQuotaBytes int64
+	OwnerUserID     string
+	OwnerName       string
+	// Growth, when non-nil, is called for a growing write after the quota checks; an error (507
+	// server_full from the breaker) refuses the write.
 	Growth func() error
+}
+
+// CheckGrowth enforces the limits for a write that changes workspace wsID's usage by delta bytes:
+// nothing for a delta <= 0 (deletes and shrinking writes always pass), otherwise the space quota,
+// then the owner aggregate, then the breaker.
+func (l Limits) CheckGrowth(tx store.ReadTx, wsID string, delta int64) error {
+	if delta <= 0 {
+		return nil
+	}
+	if l.QuotaBytes > 0 {
+		used, err := tx.WorkspaceUsage(wsID)
+		if err != nil {
+			return err
+		}
+		if used+delta > l.QuotaBytes {
+			return QuotaExceeded(l.QuotaBytes, used, delta)
+		}
+	}
+	if l.OwnerQuotaBytes > 0 && l.OwnerUserID != "" {
+		used, err := tx.OwnerUsage(l.OwnerUserID)
+		if err != nil {
+			return err
+		}
+		if used+delta > l.OwnerQuotaBytes {
+			return OwnerQuotaExceeded(l.OwnerName, l.OwnerQuotaBytes, used, delta)
+		}
+	}
+	if l.Growth != nil {
+		return l.Growth()
+	}
+	return nil
 }
 
 // QuotaExceeded is the Worker's 413 quota_exceeded.
 func QuotaExceeded(quota, used, delta int64) *httpx.APIError {
 	return httpx.TooLarge("quota_exceeded",
 		fmt.Sprintf("Workspace storage quota of %d bytes exceeded (%d used, this write adds %d)", quota, used, delta))
+}
+
+// OwnerQuotaExceeded is 413 quota_exceeded for the billing owner's aggregate (AC-QUOTA-2): the
+// message names the owner.
+func OwnerQuotaExceeded(owner string, quota, used, delta int64) *httpx.APIError {
+	return httpx.TooLarge("quota_exceeded",
+		fmt.Sprintf("Storage limit of %d bytes for the spaces %s owns exceeded (%d used, this write adds %d)", quota, owner, used, delta))
 }
 
 // Push applies validated changes to workspace wsID in one write transaction. With an actor (an
@@ -268,6 +388,20 @@ func Push(ctx context.Context, st store.Store, wsID string, changes []Change, li
 		resp.ServerTime = &now
 	}
 	err := st.Write(ctx, func(tx store.WriteTx) error {
+		if actor != nil && actor.Recheck != nil {
+			pol, err := actor.Recheck(tx)
+			if err != nil {
+				return err
+			}
+			if pol.ForbidProjectDelete {
+				changes = append([]Change(nil), changes...)
+				for i := range changes {
+					if c := &changes[i]; c.Rejected == "" && c.Deleted && c.Type == "project" {
+						c.Rejected = ReasonForbiddenRole
+					}
+				}
+			}
+		}
 		if err := tx.LockWorkspace(wsID); err != nil {
 			return err
 		}
@@ -295,18 +429,9 @@ func Push(ctx context.Context, st store.Store, wsID string, changes []Change, li
 			delta += c.Size - prev
 			n++
 		}
-		if n > 0 && delta > 0 {
-			used, err := tx.WorkspaceUsage(wsID)
-			if err != nil {
+		if n > 0 {
+			if err := lim.CheckGrowth(tx, wsID, delta); err != nil {
 				return err
-			}
-			if lim.QuotaBytes > 0 && used+delta > lim.QuotaBytes {
-				return QuotaExceeded(lim.QuotaBytes, used, delta)
-			}
-			if lim.Growth != nil {
-				if err := lim.Growth(); err != nil {
-					return err
-				}
 			}
 		}
 		k := int64(0)

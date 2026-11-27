@@ -53,6 +53,7 @@ type options struct {
 	store   store.Store
 	config  []func(*config.Config)
 	client  *http.Client
+	wrap    func(store.Store) store.Store
 }
 
 // Option customises New.
@@ -73,6 +74,9 @@ func WithHTTPClient(c *http.Client) Option { return func(o *options) { o.client 
 // WithDataDir serves an existing data directory (for example a database seeded at an older
 // schema) instead of a fresh one; New migrates it like serve does.
 func WithDataDir(dir string) Option { return func(o *options) { o.dataDir = dir } }
+
+// WithStoreWrap wraps the real SQLite store (tests: a store that runs a hook before a write).
+func WithStoreWrap(f func(store.Store) store.Store) Option { return func(o *options) { o.wrap = f } }
 
 // WithStore serves from a stub store instead of a real database.
 func WithStore(s store.Store) Option { return func(o *options) { o.store = s } }
@@ -154,6 +158,9 @@ func New(t testing.TB, opts ...Option) *Harness {
 		}
 		h.DB = d
 		st = sqlite.New(d)
+		if o.wrap != nil {
+			st = o.wrap(st)
+		}
 	}
 	h.Store = st
 	deps := app.Deps{Config: cfg, Clock: clk, Store: st, Logger: logger, Version: app.DefaultVersion, DB: h.DB, HTTPClient: o.client}

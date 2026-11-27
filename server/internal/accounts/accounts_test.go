@@ -268,3 +268,32 @@ func TestCreate_OpenSignupFullRefusesOnlyOpenSignups(t *testing.T) {
 		t.Fatalf("open signup when not full: %+v %v", c, err)
 	}
 }
+
+// M2: a team-invite signup ticket counts only in invite mode. In open mode it is ignored, so a
+// full REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES still refuses the signup and the ticket stays unspent.
+func TestCreate_SignupTicketOnlyInInviteMode(t *testing.T) {
+	h := tu.New(t)
+	owner := h.QuickUser(t, "owner@example.test", "Owner")
+	now := h.Clock.Now().UnixMilli()
+	h.MustExec(t, "INSERT INTO teams (id, name, personal, owner_user_id, created_at) VALUES ('T','Acme',0,?,?)", owner.User.ID, now)
+	h.MustExec(t, "INSERT INTO team_invites (id, team_id, token_hash, role, created_at, expires_at, max_uses) VALUES ('I','T','hi','editor',?,?,NULL)", now, now+86_400_000)
+	h.MustExec(t, "INSERT INTO signup_tickets (ticket_hash, invite_id, expires_at) VALUES ('tk','I',?)", now+600_000)
+
+	if _, err := create(t, h, accounts.CreateParams{Email: "a@example.test", SignupMode: "open", TicketHash: "tk", OpenSignupFull: true}); !errors.Is(err, accounts.ErrUserLimit) {
+		t.Fatalf("open mode, cap reached, with a ticket: %v", err)
+	}
+	c, err := create(t, h, accounts.CreateParams{Email: "a@example.test", SignupMode: "open", TicketHash: "tk"})
+	if err != nil || c.User.SignupVia != accounts.ViaOpen || h.Count(t, "signup_tickets", "used_at IS NULL") != 1 {
+		t.Fatalf("open mode with a ticket: %+v %v", c, err)
+	}
+	if _, err := create(t, h, accounts.CreateParams{Email: "b@example.test", SignupMode: "closed", TicketHash: "tk"}); !errors.Is(err, accounts.ErrSignupClosed) {
+		t.Fatalf("closed: %v", err)
+	}
+	c, err = create(t, h, accounts.CreateParams{Email: "b@example.test", SignupMode: "invite", TicketHash: "tk"})
+	if err != nil || c.User.SignupVia != accounts.ViaInvite || h.Count(t, "signup_tickets", "used_at IS NOT NULL") != 1 {
+		t.Fatalf("invite mode with a ticket: %+v %v", c, err)
+	}
+	if _, err := create(t, h, accounts.CreateParams{Email: "c@example.test", SignupMode: "invite", TicketHash: "tk"}); !errors.Is(err, accounts.ErrInviteRequired) {
+		t.Fatalf("spent ticket: %v", err)
+	}
+}

@@ -41,6 +41,9 @@ func (s *Service) URL(id string) string { return s.PublicURL + "/s/" + id }
 type Scope struct {
 	WorkspaceID string
 	Limits      syncsvc.Limits
+	// Guard, when set, runs inside each write transaction before the write (team spaces: the
+	// caller's role as it is now, M2). sh is the share being updated or revoked, nil on create.
+	Guard func(tx store.ReadTx, sh *store.Share) error
 }
 
 func isKind(k string) bool { return k == "collection" || k == "request" }
@@ -186,6 +189,11 @@ func (s *Service) Insert(ctx context.Context, sc Scope, p *Prepared) (*Created, 
 	id := ids.ShareID()
 	now := clock.Millis(s.Clock.Now())
 	err := s.Store.Write(ctx, func(tx store.WriteTx) error {
+		if sc.Guard != nil {
+			if err := sc.Guard(tx, nil); err != nil {
+				return err
+			}
+		}
 		if err := checkGrowth(tx, sc, size); err != nil {
 			return err
 		}
@@ -212,20 +220,7 @@ func (s *Service) Create(ctx context.Context, sc Scope, body *jsonx.Value) (*Cre
 }
 
 func checkGrowth(tx store.WriteTx, sc Scope, delta int64) error {
-	if delta <= 0 {
-		return nil
-	}
-	used, err := tx.WorkspaceUsage(sc.WorkspaceID)
-	if err != nil {
-		return err
-	}
-	if q := sc.Limits.QuotaBytes; q > 0 && used+delta > q {
-		return syncsvc.QuotaExceeded(q, used, delta)
-	}
-	if sc.Limits.Growth != nil {
-		return sc.Limits.Growth()
-	}
-	return nil
+	return sc.Limits.CheckGrowth(tx, sc.WorkspaceID, delta)
 }
 
 // ListItem is one entry of GET /v1/shares.
@@ -370,6 +365,11 @@ func (s *Service) Update(ctx context.Context, sc Scope, sh *store.Share, body *j
 		if err != nil {
 			return err
 		}
+		if sc.Guard != nil {
+			if err := sc.Guard(tx, cur); err != nil {
+				return err
+			}
+		}
 		if cur.RevokedAt != nil {
 			return httpx.Gone()
 		}
@@ -400,13 +400,14 @@ type Revoked struct {
 	RevokedAt int64  `json:"revokedAt"`
 }
 
-// Revoke revokes a share (idempotent) and discards its snapshot. It never reads a body.
-func (s *Service) Revoke(ctx context.Context, wsID, id string) (*Revoked, error) {
-	sh, err := s.Owned(ctx, wsID, id)
+// Revoke revokes a share of sc's workspace (idempotent) and discards its snapshot. It never reads
+// a body. With a Guard, the guard runs inside the transaction, also for an already revoked share.
+func (s *Service) Revoke(ctx context.Context, sc Scope, id string) (*Revoked, error) {
+	sh, err := s.Owned(ctx, sc.WorkspaceID, id)
 	if err != nil {
 		return nil, err
 	}
-	if sh.RevokedAt != nil {
+	if sh.RevokedAt != nil && sc.Guard == nil {
 		return &Revoked{ShareID: id, RevokedAt: *sh.RevokedAt}, nil
 	}
 	revokedAt := clock.Millis(s.Clock.Now())
@@ -414,6 +415,11 @@ func (s *Service) Revoke(ctx context.Context, wsID, id string) (*Revoked, error)
 		cur, err := tx.Share(id)
 		if err != nil {
 			return err
+		}
+		if sc.Guard != nil {
+			if err := sc.Guard(tx, cur); err != nil {
+				return err
+			}
 		}
 		if cur.RevokedAt != nil {
 			revokedAt = *cur.RevokedAt

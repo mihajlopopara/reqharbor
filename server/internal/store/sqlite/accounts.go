@@ -125,19 +125,19 @@ func (t *rtx) PersonalSpace(userID string) (*store.Personal, error) {
 }
 
 const authRequestCols = `id, browser_hash, client_id, redirect_uri, code_challenge, client_state, device_name, method_hint,
-	grant_token_hash, provider, upstream_verifier, password_attempts, code_attempts, user_id, code_hash, code_expires_at, created_at, expires_at, consumed_at`
+	grant_token_hash, provider, upstream_verifier, password_attempts, code_attempts, user_id, code_hash, code_expires_at, created_at, expires_at, consumed_at, ticket_hash`
 
 func scanAuthRequest(r scanner) (*store.AuthRequest, error) {
 	var a store.AuthRequest
-	var hint, grant, provider, verifier, user, code sql.NullString
+	var hint, grant, provider, verifier, user, code, ticket sql.NullString
 	var codeExp, consumed sql.NullInt64
 	err := r.Scan(&a.ID, &a.BrowserHash, &a.ClientID, &a.RedirectURI, &a.CodeChallenge, &a.ClientState, &a.DeviceName, &hint,
-		&grant, &provider, &verifier, &a.PasswordAttempts, &a.CodeAttempts, &user, &code, &codeExp, &a.CreatedAt, &a.ExpiresAt, &consumed)
+		&grant, &provider, &verifier, &a.PasswordAttempts, &a.CodeAttempts, &user, &code, &codeExp, &a.CreatedAt, &a.ExpiresAt, &consumed, &ticket)
 	if err != nil {
 		return nil, notFound(err)
 	}
 	a.MethodHint, a.GrantTokenHash, a.Provider, a.UserID, a.CodeHash = nullStr(&hint), nullStr(&grant), nullStr(&provider), nullStr(&user), nullStr(&code)
-	a.UpstreamVerifier = nullStr(&verifier)
+	a.UpstreamVerifier, a.TicketHash = nullStr(&verifier), nullStr(&ticket)
 	a.CodeExpiresAt, a.ConsumedAt = nullInt(&codeExp), nullInt(&consumed)
 	return &a, nil
 }
@@ -352,8 +352,8 @@ func (t *wtx) InsertPersonal(userID string, p store.Personal) error {
 
 func (t *wtx) InsertAuthRequest(a store.AuthRequest) error {
 	_, err := t.exec(`INSERT INTO auth_requests (id, browser_hash, client_id, redirect_uri, code_challenge, client_state,
-	       device_name, method_hint, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.ID, a.BrowserHash, a.ClientID, a.RedirectURI, a.CodeChallenge, a.ClientState, a.DeviceName, a.MethodHint, a.CreatedAt, a.ExpiresAt)
+	       device_name, method_hint, created_at, expires_at, ticket_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.BrowserHash, a.ClientID, a.RedirectURI, a.CodeChallenge, a.ClientState, a.DeviceName, a.MethodHint, a.CreatedAt, a.ExpiresAt, a.TicketHash)
 	return err
 }
 

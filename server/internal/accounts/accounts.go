@@ -94,6 +94,11 @@ type CreateParams struct {
 	Identity *store.Identity
 	// GrantHash is the setup or invite code applied to the auth request (CodeHash), if any.
 	GrantHash string
+	// TicketHash is the team-invite signup ticket the auth request was started with (SHA-256 of
+	// the rht_ ticket), if any (M2). Without a code, a usable ticket counts as an invite in invite
+	// mode only and is consumed here; in open and closed mode, and when unusable, it is ignored
+	// (so open signup keeps its REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES class and cap).
+	TicketHash string
 
 	// SignupMode is REQHARBOR_SIGNUP for a page signup; CLI creations set CLI instead.
 	SignupMode string
@@ -188,7 +193,15 @@ func Create(tx store.WriteTx, p CreateParams) (*Created, error) {
 	case first:
 		return nil, ErrSetupRequired
 	default:
-		if grant != nil {
+		ticket := false
+		if grant == nil && p.TicketHash != "" && p.SignupMode == "invite" {
+			if ticket, err = tx.UseSignupTicket(p.TicketHash, now); err != nil {
+				return nil, err
+			}
+		}
+		if ticket {
+			via = ViaInvite
+		} else if grant != nil {
 			if p.SignupMode != "open" && p.SignupMode != "invite" {
 				return nil, ErrSignupClosed
 			}

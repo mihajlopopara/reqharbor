@@ -129,7 +129,7 @@ func TestRun_PreMigrationBackupAndSingleInstanceLock(t *testing.T) {
 
 	r := startRun(t, dir, nil)
 	waitFor(t, "readyz", func() bool { c, _, _ := get(t, r.base+"/readyz"); return c == 200 })
-	matches, _ := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v2-v4-*.db"))
+	matches, _ := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v2-v5-*.db"))
 	if len(matches) != 1 {
 		t.Fatalf("backups: %v", matches)
 	}

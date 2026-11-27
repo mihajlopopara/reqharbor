@@ -225,3 +225,65 @@ func TestParsePush_ClockSkew(t *testing.T) {
 		t.Fatalf("legacy skew: %+v %v", cs, err)
 	}
 }
+
+// M2: the team-space per-change rules and their precedence.
+func TestParsePush_TeamRulesAndPrecedence(t *testing.T) {
+	body, err := jsonx.Parse([]byte(`{"changes":[
+		{"type":"project","id":"p1","updatedAt":1,"deleted":true},
+		{"type":"project","id":"p2","updatedAt":999,"deleted":true},
+		{"type":"collection","id":"c1","updatedAt":1,"deleted":true},
+		{"type":"environment","id":"e1","updatedAt":1,"deleted":false,"data":{"projectId":null,"x":1e400}},
+		{"type":"environment","id":"e2","updatedAt":1,"deleted":false,"data":{"projectId":"p1","variables":[{"key":"k","value":"v","secret":true}]}},
+		{"type":"environment","id":"e3","updatedAt":1,"deleted":true},
+		{"type":"protoFile","id":"x1","updatedAt":999,"deleted":true}
+	]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := ParseOptions{UnknownTypePerChange: true, MaxUpdatedAt: 100, ForbidProjectDelete: true, TeamSpace: true}
+	changes, err := ParsePush(body, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{ReasonForbiddenRole, ReasonClockSkew, "", ReasonGlobalEnv, "", "", ReasonUnsupportedType}
+	for i, c := range changes {
+		if c.Rejected != want[i] {
+			t.Errorf("change %d (%s %s): %q, want %q", i, c.Type, c.ID, c.Rejected, want[i])
+		}
+	}
+	if strings.Contains(string(changes[4].Data), `"v"`) {
+		t.Errorf("secret kept: %s", changes[4].Data)
+	}
+	// Without the team options nothing of this applies.
+	changes, err = ParsePush(body, ParseOptions{UnknownTypePerChange: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes[0].Rejected != "" || changes[3].Rejected != ReasonInvalidJSONValue {
+		t.Errorf("personal: %q %q", changes[0].Rejected, changes[3].Rejected)
+	}
+}
+
+func TestStripDeviceLocalPaths(t *testing.T) {
+	in := `{"id":"r","body":{"type":"form","binaryPath":"/a/b","form":[{"key":"f","value":"/x.pdf","kind":"file"},{"key":"t","value":"keep","kind":"text"},{"key":"n","kind":"file"},"odd"]},"url":"u"}`
+	v, err := jsonx.Parse([]byte(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := jsonx.Canonical(StripDeviceLocalPaths(v))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOut := `{"id":"r","body":{"type":"form","binaryPath":"","form":[{"key":"f","value":"","kind":"file"},{"key":"t","value":"keep","kind":"text"},{"key":"n","kind":"file"},"odd"]},"url":"u"}`
+	if string(out) != wantOut {
+		t.Fatalf("got  %s\nwant %s", out, wantOut)
+	}
+	// The input is not modified, and a request without paths comes back as is.
+	if orig, _ := jsonx.Canonical(v); string(orig) != in {
+		t.Fatalf("input changed: %s", orig)
+	}
+	plain, _ := jsonx.Parse([]byte(`{"body":{"type":"json","text":"{}"}}`))
+	if StripDeviceLocalPaths(plain) != plain {
+		t.Fatal("copied a request without paths")
+	}
+}

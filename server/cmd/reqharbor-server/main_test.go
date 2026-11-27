@@ -52,7 +52,7 @@ func TestServeExits2OnConfigErrors(t *testing.T) {
 func TestMigrateStatusAndApply(t *testing.T) {
 	env := []string{"REQHARBOR_DATA_DIR=" + filepath.Join(t.TempDir(), "d")}
 	code, out, errs := runCLI(env, "migrate", "--status")
-	if code != 0 || !strings.Contains(out, "schema version 0 (latest 4)") || !strings.Contains(out, "pending 0001_init") {
+	if code != 0 || !strings.Contains(out, "schema version 0 (latest 5)") || !strings.Contains(out, "pending 0001_init") {
 		t.Fatalf("%d %q %q", code, out, errs)
 	}
 	if code, out, _ := runCLI(env, "migrate", "--to", "2"); code != 0 || !strings.Contains(out, "applied 0002_device_id_and_quota") || strings.Contains(out, "0003") {

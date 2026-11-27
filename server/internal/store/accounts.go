@@ -79,6 +79,7 @@ type AuthRequest struct {
 	GrantTokenHash   *string
 	Provider         *string
 	UpstreamVerifier *string // PKCE verifier of the provider round trip (S5)
+	TicketHash       *string // SHA-256 of the team-invite signup ticket it was started with (M2)
 	PasswordAttempts int64
 	CodeAttempts     int64
 	UserID           *string
@@ -218,4 +219,6 @@ type AccountsWriteTx interface {
 // GCStats counts the rows a GC pass deleted.
 type GCStats struct {
 	AuthRequests, Tokens, Sessions, Throttle int64
+	// M2 (GCTeams).
+	Invites, Departures, Tickets int64
 }

@@ -80,7 +80,7 @@ func TestMigrate_FreshDatabaseGoldenSchemas(t *testing.T) {
 		t.Fatalf("applied %v", applied)
 	}
 	golden(t, "schema_v3.sql", schemaDump(t, d))
-	applied, err = d.Migrate(ctx, 0, time.Now)
+	applied, err = d.Migrate(ctx, 4, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +88,14 @@ func TestMigrate_FreshDatabaseGoldenSchemas(t *testing.T) {
 		t.Fatalf("applied %v", applied)
 	}
 	golden(t, "schema_v4.sql", schemaDump(t, d))
+	applied, err = d.Migrate(ctx, 0, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != 1 || applied[0].Version != 5 {
+		t.Fatalf("applied %v", applied)
+	}
+	golden(t, "schema_v5.sql", schemaDump(t, d))
 
 	var av int
 	if err := d.Writer.QueryRow("PRAGMA auto_vacuum").Scan(&av); err != nil || av != 2 {
@@ -106,7 +114,7 @@ func TestMigrate_FreshDatabaseGoldenSchemas(t *testing.T) {
 		t.Fatalf("re-run applied %v (%v)", again, err)
 	}
 	st, err := d.MigrationStatus(ctx)
-	if err != nil || st.Current != 4 || st.Latest != 4 || len(st.Pending) != 0 {
+	if err != nil || st.Current != 5 || st.Latest != 5 || len(st.Pending) != 0 {
 		t.Fatalf("status %+v %v", st, err)
 	}
 }
@@ -194,7 +202,7 @@ func TestMigrate_DowngradeGuard(t *testing.T) {
 	d.Close()
 	_, err = Open(dir, Options{})
 	var tooNew *SchemaTooNewError
-	if !errors.As(err, &tooNew) || err.Error() != "database schema v99 is newer than this reqharbor-server (max v4); use a newer image" {
+	if !errors.As(err, &tooNew) || err.Error() != "database schema v99 is newer than this reqharbor-server (max v5); use a newer image" {
 		t.Fatalf("Open: %v", err)
 	}
 }
@@ -351,5 +359,56 @@ func TestReaderIsQueryOnly(t *testing.T) {
 	}
 	if _, err := d.Reader.Exec("INSERT INTO server_state (key, value) VALUES ('x', 'y')"); err == nil {
 		t.Fatal("reader pool can write")
+	}
+}
+
+// M2: 0005 on a populated v4 database keeps every account, session, personal team, space, entity,
+// share and auth request; existing auth requests get ticket_hash NULL; the new tables start empty.
+func TestMigrate_PopulatedV4DatabaseKeepsItsRowsThrough0005(t *testing.T) {
+	ctx := context.Background()
+	d := open(t)
+	if _, err := d.Migrate(ctx, 4, time.Now); err != nil {
+		t.Fatal(err)
+	}
+	seed := `INSERT INTO users (id, email, email_trusted, signup_via, name, created_at, updated_at) VALUES ('U1','a@x.test',1,'cli','Ada',1,1),('U2','b@x.test',0,'invite','Bo',1,1);
+INSERT INTO password_credentials (user_id, phc, updated_at) VALUES ('U1','$argon2id$x',1);
+INSERT INTO teams (id, name, personal, owner_user_id, created_at) VALUES ('T1','Personal',1,'U1',1),('T2','Acme',0,'U1',1);
+INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ('T1','U1','owner',1),('T2','U1','owner',1),('T2','U2','editor',2);
+INSERT INTO workspaces (id, name, token_hash, rev, created_at, team_id) VALUES ('W1','Personal','space:W1',1,1,'T1'),('W2','Acme','space:W2',1,1,'T2'),('W3','legacy','h3',0,1,NULL);
+INSERT INTO entities (workspace_id, type, id, rev, updated_at, deleted, data, device_id, size, updated_by) VALUES ('W2','request','r1',1,1,0,'{"id":"r1"}','D',11,'U2');
+INSERT INTO shares (id, workspace_id, kind, entity_id, snapshot, created_at, updated_at, size, created_by, options) VALUES ('S1','W2','request','r1','{}',1,1,2,'U2',NULL);
+INSERT INTO sessions (id, user_id, client_id, device_name, access_hash, access_expires_at, refresh_hash, created_at, last_used_day, idle_expires_at, expires_at) VALUES ('SE1','U1','reqharbor-desktop','Mac','ah',9,'rh',1,1,9,9);
+INSERT INTO auth_requests (id, browser_hash, client_id, redirect_uri, code_challenge, client_state, created_at, expires_at) VALUES ('AR1','bh','reqharbor-desktop','http://127.0.0.1:5000/cb','c','s',1,9);`
+	if _, err := d.Writer.Exec(seed); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := d.Migrate(ctx, 0, time.Now)
+	if err != nil || len(applied) != 1 || applied[0].Version != 5 {
+		t.Fatalf("applied %v (%v)", applied, err)
+	}
+	for table, want := range map[string]int{"users": 2, "password_credentials": 1, "teams": 2, "team_members": 3, "workspaces": 3,
+		"entities": 1, "shares": 1, "sessions": 1, "auth_requests": 1, "team_invites": 0, "team_departures": 0, "signup_tickets": 0} {
+		var n int
+		if err := d.Writer.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil || n != want {
+			t.Fatalf("%s: %d rows (%v), want %d", table, n, err, want)
+		}
+	}
+	var ticket *string
+	var challenge string
+	if err := d.Writer.QueryRow("SELECT ticket_hash, code_challenge FROM auth_requests WHERE id = 'AR1'").Scan(&ticket, &challenge); err != nil || ticket != nil || challenge != "c" {
+		t.Fatalf("auth request after 0005: ticket %v challenge %q (%v)", ticket, challenge, err)
+	}
+	var role, data, by string
+	if err := d.Writer.QueryRow("SELECT m.role, e.data, e.updated_by FROM team_members m, entities e WHERE m.team_id = 'T2' AND m.user_id = 'U2' AND e.id = 'r1'").
+		Scan(&role, &data, &by); err != nil || role != "editor" || data != `{"id":"r1"}` || by != "U2" {
+		t.Fatalf("rows changed: %q %q %q (%v)", role, data, by, err)
+	}
+	rows, err := d.Writer.Query("PRAGMA foreign_key_check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("foreign_key_check reports a violation")
 	}
 }

@@ -97,7 +97,7 @@ func Build(cfg *config.Config, version, instanceID, syncEpoch string, methods []
 			PasswordReset: "admin", // "email" with SMTP (M3)
 			SetupRequired: setupRequired,
 		},
-		Features: Features{Accounts: true, Teams: false, LegacyWorkspaces: cfg.LegacyWorkspaces},
+		Features: Features{Accounts: true, Teams: cfg.Teams, LegacyWorkspaces: cfg.LegacyWorkspaces},
 		Sync:     Sync{Types: append([]string(nil), syncsvc.Types...), RequestKinds: []string{"http"}},
 		Limits: Limits{
 			EntityBytes:   syncsvc.EntityDataBytes,

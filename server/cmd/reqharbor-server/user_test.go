@@ -214,6 +214,6 @@ func TestAccountCommandsNeedAMigratedDatabaseAndConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.Close()
-	expect(t, env, 1, "needs v4; start serve once", "user", "list")
+	expect(t, env, 1, "needs v5; start serve once", "user", "list")
 	expect(t, []string{"REQHARBOR_LISTEN=0.0.0.0:1"}, 2, "REQHARBOR_PUBLIC_URL is required", "invite", "list")
 }
