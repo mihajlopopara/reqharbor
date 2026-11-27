@@ -90,8 +90,9 @@ Other ways to create the first account:
   ```sh
   printf '%s\n' "$PW" | docker compose exec -T reqharbor /reqharbor-server user create --email you@example.com --password-stdin
   ```
-- `REQHARBOR_ADMIN_EMAIL`: a GitHub account whose primary verified email equals it becomes admin
-  when it signs up, as long as no admin exists yet. With [SMTP](#email-smtp) configured, so does a
+- `REQHARBOR_ADMIN_EMAIL`: a GitHub account whose primary verified email equals it (or a Google or
+  OIDC account whose verified email equals it) becomes admin when it signs up, as long as no admin
+  exists yet. OIDC with `REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL=false` never qualifies. With [SMTP](#email-smtp) configured, so does a
   password signup for that address once its emailed code is entered; the setup page then offers
   "Create the account with the admin email". A password signup without SMTP never qualifies,
   because nothing proves the address;
@@ -100,7 +101,10 @@ Other ways to create the first account:
 
 Then invite people: `docker compose exec reqharbor /reqharbor-server invite create` prints a code
 such as `K7Q4-ZX2P-8M3D-1R6T` (`--email E` restricts it to one address, `--uses N` lets it create N
-accounts, `--ttl 168h` is the default lifetime). They enter it on the sign-up page.
+accounts, `--ttl 168h` is the default lifetime). They enter it on the sign-up page. An invite
+restricted with `--email` works only where the server can confirm the address: a GitHub or Google
+sign-in, an OIDC sign-in with a verified email, or a password signup confirmed by an emailed code
+(SMTP). Without SMTP, give password users an invite without `--email`.
 
 ### Who may sign up
 
@@ -222,8 +226,149 @@ id, never by email. GitHub's token is used once to read the profile and then dro
 apply as for passwords. An email that already belongs to another account is refused, never merged:
 each account has exactly one sign-in method.
 
-Google and a generic OpenID Connect provider come in a later release. Their variables are already
-accepted (see the reference) but have no effect yet.
+The callback URL to register is always `{REQHARBOR_PUBLIC_URL}/auth/callback/{provider}`: `github`,
+`google` or `oidc`. The sign-in page lists the methods in the order email and password, GitHub,
+Google, then OIDC.
+
+### Google
+
+**Google** is on when both `REQHARBOR_GOOGLE_CLIENT_ID` and `REQHARBOR_GOOGLE_CLIENT_SECRET` (or
+`REQHARBOR_GOOGLE_CLIENT_SECRET_FILE`) are set; one without the other is a startup error.
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), pick or create a project, then
+   open **Google Auth Platform** (formerly "APIs & Services > OAuth consent screen") and configure
+   it: app name, support email, and the audience. **Internal** lets only accounts of your Google
+   Workspace organisation sign in; **External** lets any Google account in (your signup mode still
+   decides who gets an account). An External app in "Testing" only accepts the test users you list;
+   publish it to open it up. The scopes ReqHarbor asks for (`openid email profile`) need no Google
+   verification.
+2. **Clients > Create client**, application type **Web application**. Under "Authorized redirect
+   URIs" add exactly `https://rh.example.com/auth/callback/google` (your public URL). No JavaScript
+   origins are needed.
+3. Copy the client id (`….apps.googleusercontent.com`) and the client secret:
+
+   ```yaml
+   environment:
+     REQHARBOR_GOOGLE_CLIENT_ID: 1234567890-abc.apps.googleusercontent.com
+     REQHARBOR_GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_secret
+   ```
+
+The sign-in sends `prompt=select_account`, so Google always shows its account chooser, plus PKCE,
+state and a nonce. The server reads the ID token from Google's token response, checks its RS256
+signature against Google's published keys, its issuer, audience, expiry and nonce, and requires
+`email_verified`; that email is trusted (it can match `REQHARBOR_ADMIN_EMAIL`). Accounts are keyed by
+Google's `sub`, never by email. Google's tokens are used once and dropped.
+
+### OpenID Connect
+
+One generic OIDC provider (Keycloak, Authentik, Authelia, Microsoft Entra ID, Dex, Zitadel, …) is
+on when `REQHARBOR_OIDC_ISSUER`, `REQHARBOR_OIDC_CLIENT_ID` and `REQHARBOR_OIDC_CLIENT_SECRET` (or
+`_FILE`) are all set. Register a **confidential** client (it has
+a secret) for the **authorization code** flow with the redirect URI
+`https://rh.example.com/auth/callback/oidc`, then:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REQHARBOR_OIDC_ISSUER` | – | The issuer URL, **exactly** as the provider's discovery document states it (a trailing slash matters). https, or http only for a loopback host |
+| `REQHARBOR_OIDC_NAME` | `Single sign-on` | Button label ("Continue with Acme SSO"), at most 40 characters |
+| `REQHARBOR_OIDC_SCOPES` | `openid email profile` | Space- or comma-separated; must include `openid` |
+| `REQHARBOR_OIDC_EMAIL_CLAIM` | `email` | The claim holding the email, for example `upn` or `preferred_username` |
+| `REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL` | `true` | `false` accepts providers that never send `email_verified`; such emails are never trusted |
+
+How it works and what it needs from the provider:
+
+- **Discovery.** At start the server fetches `{issuer}/.well-known/openid-configuration`; the
+  method appears on the sign-in page and in the app once that succeeds ("OIDC sign-in enabled" in
+  the log). An unreachable provider is retried with backoff (1 s doubling to 5 min) without a
+  restart. A document that can never work disables OIDC with "OIDC sign-in disabled: …" in the log
+  and is not retried. That is the case when:
+  - its `issuer` differs from `REQHARBOR_OIDC_ISSUER`;
+  - it has no `authorization_endpoint`, `token_endpoint` or `jwks_uri`;
+  - an `authorization_endpoint`, `token_endpoint`, `userinfo_endpoint` or `jwks_uri` is not an
+    absolute https URL (plain http is allowed only for a loopback host);
+  - `id_token_signing_alg_values_supported` lists neither RS256 nor ES256;
+  - `token_endpoint_auth_methods_supported` lists neither `client_secret_basic` nor
+    `client_secret_post`;
+  - fetching it redirects to plain http.
+
+  Fix the setting (or the provider) and restart.
+- **Transport.** The server never follows a redirect from https to http (or to http on a
+  non-loopback host) when it calls the provider.
+- **ID token.** Read from the token response and verified: signed with **RS256 or ES256** by a key
+  from the provider's `jwks_uri` (`none` and HMAC algorithms are refused), `iss` equal to the
+  issuer, `aud` containing the client id (a string or an array; with several audiences `azp` must
+  equal the client id), not expired, and carrying the nonce of this sign-in. Up to 5 minutes of
+  clock difference are tolerated, so keep the server's clock synchronised. The key set is cached
+  (its `Cache-Control` max-age, 5 min to 24 h) and refetched when a token names a new key, so key
+  rotation needs nothing from you.
+- **Client authentication** at the token endpoint is `client_secret_basic`, or
+  `client_secret_post` when the provider supports only that. PKCE (S256) is always sent.
+- **Email.** Taken from the ID token's `REQHARBOR_OIDC_EMAIL_CLAIM`; when the ID token lacks it,
+  from the userinfo endpoint, whose `sub` must equal the ID token's. With verification required
+  (the default) only `email_verified: true` qualifies, and for a claim other than `email` only when
+  its value equals the verified `email`. Such an email is trusted. With
+  `REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL=false` any email is accepted but **never trusted**: it
+  never matches `REQHARBOR_ADMIN_EMAIL` and never changes an account's email later, because users
+  may be able to set it themselves at the provider. Bootstrap such a server with the setup code.
+- Accounts are keyed by the issuer and `sub`, never by email; changing `REQHARBOR_OIDC_ISSUER` makes
+  every OIDC user a new identity.
+
+**Keycloak.** Issuer `https://sso.example.com/realms/<realm>`. Clients > Create client: OpenID
+Connect, client id `reqharbor`; Client authentication **on**, only **Standard flow** checked; Valid
+redirect URIs `https://rh.example.com/auth/callback/oidc`. The secret is on the client's
+Credentials tab. Keycloak sends `email_verified` from the user's "Email verified" switch.
+
+```yaml
+REQHARBOR_OIDC_ISSUER: https://sso.example.com/realms/acme
+REQHARBOR_OIDC_CLIENT_ID: reqharbor
+REQHARBOR_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_secret
+REQHARBOR_OIDC_NAME: Acme SSO
+```
+
+**Authentik.** Applications > Providers > Create > OAuth2/OpenID Provider: client type
+**Confidential**, redirect URI (strict) `https://rh.example.com/auth/callback/oidc`, and pick a
+**Signing Key** (a certificate): without one Authentik signs with HS256, which ReqHarbor refuses.
+Create an Application for it with slug `reqharbor`. The issuer is
+`https://authentik.example.com/application/o/reqharbor/`, **with** the trailing slash. If new users
+get "has no verified email", check that the email scope mapping sends `email_verified: true`.
+
+**Authelia.** Issuer `https://auth.example.com`. Add a client to
+`identity_providers.oidc.clients`:
+
+```yaml
+- client_id: reqharbor
+  client_name: ReqHarbor
+  client_secret: '$pbkdf2-sha512$…'          # the digest of the secret you give ReqHarbor
+  public: false
+  authorization_policy: two_factor
+  redirect_uris: [https://rh.example.com/auth/callback/oidc]
+  scopes: [openid, email, profile]
+  response_types: [code]
+  grant_types: [authorization_code]
+  require_pkce: true
+  pkce_challenge_method: S256
+  token_endpoint_auth_method: client_secret_basic
+```
+
+Recent Authelia versions put `email` only in the userinfo response, which ReqHarbor then reads.
+
+**Microsoft Entra ID.** App registrations > New registration; Redirect URI platform **Web**,
+`https://rh.example.com/auth/callback/oidc`. Certificates & secrets > New client secret (copy the
+**Value**). The issuer is `https://login.microsoftonline.com/<tenant id>/v2.0` (the tenant id, not
+`common` or `organizations`, whose issuer does not match). Entra ID never sends `email_verified`,
+so set `REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL=false`; its `email` claim is optional and often
+empty, so either add it under Token configuration > Add optional claim (ID, `email`) or use
+`REQHARBOR_OIDC_EMAIL_CLAIM=preferred_username`. Emails are then untrusted: create the first admin
+with the setup code, not `REQHARBOR_ADMIN_EMAIL`.
+
+```yaml
+REQHARBOR_OIDC_ISSUER: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0
+REQHARBOR_OIDC_CLIENT_ID: 11111111-1111-1111-1111-111111111111
+REQHARBOR_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_secret
+REQHARBOR_OIDC_NAME: Microsoft
+REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL: "false"
+REQHARBOR_OIDC_EMAIL_CLAIM: preferred_username
+```
 
 ## Email (SMTP)
 
@@ -565,6 +710,12 @@ cap unless stated.
 | `REQHARBOR_PASSWORD_AUTH` | `true` | Email and password sign-in and signup |
 | `REQHARBOR_ARGON2_MEMORY_KIB` | `65536` | Memory per argon2id hash |
 | `REQHARBOR_GITHUB_CLIENT_ID`, `REQHARBOR_GITHUB_CLIENT_SECRET` | empty | Both set: GitHub sign-in |
+| `REQHARBOR_GOOGLE_CLIENT_ID`, `REQHARBOR_GOOGLE_CLIENT_SECRET` | empty | Both set: Google sign-in (see [Google](#google)) |
+| `REQHARBOR_OIDC_ISSUER`, `REQHARBOR_OIDC_CLIENT_ID`, `REQHARBOR_OIDC_CLIENT_SECRET` | empty | All three set: OpenID Connect sign-in, listed once discovery succeeds (see [OpenID Connect](#openid-connect)) |
+| `REQHARBOR_OIDC_NAME` | `Single sign-on` | OIDC button label, at most 40 characters |
+| `REQHARBOR_OIDC_SCOPES` | `openid email profile` | Must include `openid` |
+| `REQHARBOR_OIDC_EMAIL_CLAIM` | `email` | Claim holding the email |
+| `REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL` | `true` | `false` accepts emails without `email_verified`, never trusted |
 | `REQHARBOR_SESSION_MAX` | `20` | Signed-in devices per account; the oldest is signed out |
 | `REQHARBOR_MIN_CLIENT_VERSION` | empty | For example `0.3.0`: older apps get 426 on account sync and sign-in (token sync is never gated) |
 
@@ -626,8 +777,6 @@ per share snapshot, 5 MiB per request body, 500 changes per push or pull.
 | `REQHARBOR_BACKUP_INTERVAL` | `0` (off) | For example `24h` (at least `1m`): scheduled `VACUUM INTO` backups to `backups/reqharbor-YYYYMMDD-HHMMSS.db` |
 | `REQHARBOR_BACKUP_KEEP` | `7` | Scheduled backups to keep (at least 1); manual and pre-migrate files are never pruned |
 
-**Accepted for later releases, no effect yet:** `REQHARBOR_GOOGLE_CLIENT_ID`/`_SECRET`,
-`REQHARBOR_OIDC_ISSUER`/`_CLIENT_ID`/`_CLIENT_SECRET`/`_NAME`/`_SCOPES`/`_REQUIRE_VERIFIED_EMAIL`.
 `REQHARBOR_DEV_AUTH` exists only in test builds and is refused by the image.
 
 ## Operations

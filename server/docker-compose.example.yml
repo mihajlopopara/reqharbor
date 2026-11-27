@@ -20,8 +20,18 @@ services:
       REQHARBOR_SIGNUP: invite
       REQHARBOR_TRUSTED_PROXIES: 172.30.53.10/32      # Caddy's fixed address below, and nothing else
       # REQHARBOR_LEGACY_WORKSPACES: existing         # default off; see the README before enabling open
+      # Sign-in providers (README "Sign-in methods"). Register the callback {PUBLIC_URL}/auth/callback/<github|google|oidc>.
       # REQHARBOR_GITHUB_CLIENT_ID: Iv1.0123456789abcdef
       # REQHARBOR_GITHUB_CLIENT_SECRET_FILE: /run/secrets/github_secret
+      # REQHARBOR_GOOGLE_CLIENT_ID: 1234567890-abc.apps.googleusercontent.com
+      # REQHARBOR_GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google_secret
+      # REQHARBOR_OIDC_ISSUER: https://sso.example.com/realms/acme   # exactly the issuer in its discovery document
+      # REQHARBOR_OIDC_CLIENT_ID: reqharbor
+      # REQHARBOR_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_secret
+      # REQHARBOR_OIDC_NAME: Acme SSO                 # button label; default "Single sign-on"
+      # REQHARBOR_OIDC_SCOPES: openid email profile
+      # REQHARBOR_OIDC_EMAIL_CLAIM: email              # e.g. preferred_username for Entra ID
+      # REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL: "true"  # "false" for IdPs without email_verified; those emails are never trusted
       # Email (README "Email (SMTP)"): signup codes and self-service password reset.
       # REQHARBOR_SMTP_HOST: smtp.example.com
       # REQHARBOR_SMTP_PORT: "587"                  # 465 with REQHARBOR_SMTP_TLS: tls
@@ -31,7 +41,7 @@ services:
       # Scheduled backups into the data volume (README "Scheduled backups"); still copy them off-site.
       # REQHARBOR_BACKUP_INTERVAL: 24h
       # REQHARBOR_BACKUP_KEEP: "7"
-    # secrets: [github_secret, smtp_password]
+    # secrets: [github_secret, google_secret, oidc_secret, smtp_password]
     volumes:
       - reqharbor-data:/data
     networks:
@@ -66,5 +76,9 @@ volumes:
 # secrets:                       # the server runs as uid 65532 and the files keep their host owner and mode:
 #   github_secret:                #   sudo chown 65532 github_client_secret.txt smtp_password.txt && sudo chmod 600 ...
 #     file: ./github_client_secret.txt
+#   google_secret:
+#     file: ./google_client_secret.txt
+#   oidc_secret:
+#     file: ./oidc_client_secret.txt
 #   smtp_password:
 #     file: ./smtp_password.txt

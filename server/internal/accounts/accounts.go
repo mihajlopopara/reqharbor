@@ -17,12 +17,15 @@ import (
 
 // Errors of Create. The hosted pages map each to its page code (§4).
 var (
-	ErrEmailInUse     = errors.New("accounts: email already has an account")           // email_in_use
-	ErrUserLimit      = errors.New("accounts: REQHARBOR_MAX_USERS reached")            // server_user_limit
-	ErrSignupClosed   = errors.New("accounts: signup is closed")                       // signup_closed
-	ErrInviteInvalid  = errors.New("accounts: invite or setup code is not valid")      // invite_invalid
-	ErrInviteRequired = errors.New("accounts: signup on this server needs an invite")  // invite_invalid
-	ErrSetupRequired  = errors.New("accounts: the first account needs the setup code") // setup_required
+	ErrEmailInUse    = errors.New("accounts: email already has an account")      // email_in_use
+	ErrUserLimit     = errors.New("accounts: REQHARBOR_MAX_USERS reached")       // server_user_limit
+	ErrSignupClosed  = errors.New("accounts: signup is closed")                  // signup_closed
+	ErrInviteInvalid = errors.New("accounts: invite or setup code is not valid") // invite_invalid
+	// ErrInviteEmailUnconfirmed is an invite bound to an email (invite create --email) used with
+	// an email this server has not confirmed (email_trusted = 0). It is also ErrInviteInvalid.
+	ErrInviteEmailUnconfirmed = fmt.Errorf("%w: the invite is for an email address this sign-in does not confirm", ErrInviteInvalid)
+	ErrInviteRequired         = errors.New("accounts: signup on this server needs an invite")  // invite_invalid
+	ErrSetupRequired          = errors.New("accounts: the first account needs the setup code") // setup_required
 )
 
 // Signup sources stored in users.signup_via.
@@ -164,6 +167,10 @@ func Create(tx store.WriteTx, p CreateParams) (*Created, error) {
 			return nil, ErrInviteInvalid
 		case grant.Email != nil && *grant.Email != "" && NormalizeEmail(*grant.Email) != p.Email:
 			return nil, ErrInviteInvalid
+		case grant.Email != nil && *grant.Email != "" && !p.EmailTrusted:
+			// An email-bound invite vouches for that address, so an unproven one (a password
+			// signup without SMTP, OIDC under REQUIRE_VERIFIED_EMAIL=false, dev) cannot use it.
+			return nil, ErrInviteEmailUnconfirmed
 		}
 		ok, err := tx.UseOneTimeToken(p.GrantHash, now)
 		if err != nil {

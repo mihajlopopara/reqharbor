@@ -95,10 +95,19 @@ func TestAuth_InviteCodeRules(t *testing.T) {
 	if r := signup("four@example.test", code); r.StatusCode != 400 {
 		t.Fatalf("other email %d", r.StatusCode)
 	}
+	// Without SMTP a password signup's email is unconfirmed, so it cannot use an email-bound
+	// invite even with the right address (S10 QA); the invite stays unused.
+	if r := signup("three@example.test", code); r.StatusCode != 400 || !strings.Contains(string(r.Body), "this sign-in can&#39;t confirm that you own it") {
+		t.Fatalf("restricted invite, unconfirmed email: %d", r.StatusCode)
+	}
+	if h.Count(t, "one_time_tokens", "token_hash = ? AND uses = 0", accounts.CodeHash(code)) != 1 {
+		t.Fatal("the refused signup consumed the invite")
+	}
+	code = h.Invite(t, "", 1)
 	loose := strings.ToLower(strings.ReplaceAll(code, "-", " "))
 	loose = strings.NewReplacer("0", "o", "1", "l").Replace(loose)
 	if r := signup("three@example.test", loose); r.StatusCode != 303 {
-		t.Fatalf("restricted invite, loosely typed: %d %s", r.StatusCode, r.Body)
+		t.Fatalf("invite, loosely typed: %d %s", r.StatusCode, r.Body)
 	}
 	// Expired and revoked.
 	code = h.Invite(t, "", 5)

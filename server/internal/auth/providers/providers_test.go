@@ -39,10 +39,10 @@ func cfg(env ...string) *config.Config {
 }
 
 func TestEnabledAndListed(t *testing.T) {
-	if got := Enabled(cfg(), nil); len(got) != 0 {
+	if got := Enabled(cfg(), Deps{}); len(got) != 0 {
 		t.Fatalf("%v", got)
 	}
-	got := Enabled(cfg("REQHARBOR_GITHUB_CLIENT_ID=id", "REQHARBOR_GITHUB_CLIENT_SECRET=s"), nil)
+	got := Enabled(cfg("REQHARBOR_GITHUB_CLIENT_ID=id", "REQHARBOR_GITHUB_CLIENT_SECRET=s"), Deps{})
 	if len(got) != 1 || got[0].ID() != "github" || got[0].Label() != "GitHub" || !Listed(got[0]) {
 		t.Fatalf("%v", got)
 	}
@@ -53,7 +53,7 @@ func TestEnabledAndListed(t *testing.T) {
 
 func TestGitHubAuthURL(t *testing.T) {
 	g := NewGitHub(cfg("REQHARBOR_GITHUB_CLIENT_ID=id", "REQHARBOR_GITHUB_CLIENT_SECRET=topsecret"), nil)
-	u, err := url.Parse(g.AuthURL("st", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"))
+	u, err := url.Parse(g.AuthURL("st", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk", "nonce-ignored"))
 	if err != nil || u.Scheme+"://"+u.Host+u.Path != GitHubAuthURL {
 		t.Fatalf("%v %v", u, err)
 	}
@@ -67,6 +67,9 @@ func TestGitHubAuthURL(t *testing.T) {
 	}
 	if strings.Contains(u.String(), "topsecret") {
 		t.Fatal("secret in the authorize URL")
+	}
+	if q.Has("nonce") {
+		t.Fatal("GitHub is OAuth only: no nonce")
 	}
 }
 
@@ -103,7 +106,7 @@ func TestGitHubExchangeErrors(t *testing.T) {
 			defer srv.Close()
 			c := cfg("REQHARBOR_GITHUB_CLIENT_ID=id", "REQHARBOR_GITHUB_CLIENT_SECRET=s")
 			c.Test = config.TestOverrides{GitHubTokenURL: srv.URL + "/token", GitHubAPIURL: srv.URL}
-			_, err := NewGitHub(c, srv.Client()).Exchange(context.Background(), "code", "verifier")
+			_, err := NewGitHub(c, srv.Client()).Exchange(context.Background(), "code", "verifier", "")
 			if err == nil || ErrorCode(err) != tc.want || strings.Contains(err.Error(), "gho_secret") {
 				t.Fatalf("%v (%s)", err, ErrorCode(err))
 			}

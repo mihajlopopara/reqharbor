@@ -55,7 +55,7 @@ func (s *Service) devProvider() providers.Form {
 // runs: no canonical-origin redirect, no page, no cookie.
 func (s *Service) providerRoute(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p, ok := s.providerBy[r.PathValue("provider")]
+		p, ok := s.provider(r.PathValue("provider"))
 		if !ok {
 			httpx.NotFoundHandler.ServeHTTP(w, r)
 			return
@@ -89,6 +89,9 @@ func (s *Service) providerLinks(r *http.Request, ar *store.AuthRequest) []pageLi
 	}
 	var out []pageLink
 	for _, p := range s.providers {
+		if !providers.IsAvailable(p) {
+			continue
+		}
 		text := "Continue with " + p.Label()
 		if f, ok := p.(providers.Form); ok {
 			if !f.Allow(r) {
@@ -109,13 +112,16 @@ func (s *Service) start(w http.ResponseWriter, r *http.Request) {
 	if ar == nil {
 		return
 	}
-	switch p := s.providerBy[r.PathValue("provider")].(type) {
+	p, _ := s.provider(r.PathValue("provider"))
+	switch p := p.(type) {
 	case providers.Form:
 		s.renderForm(w, r, http.StatusOK, p, ar, "", "", "")
 	case providers.Redirector:
-		state, v := random16(), verifier()
+		// The nonce (Google and OIDC; GitHub ignores it) is stored with the verifier and must come
+		// back in the ID token.
+		state, v, nonce := random16(), verifier(), verifier()
 		err := s.Store.Write(r.Context(), func(tx store.WriteTx) error {
-			return tx.SetAuthRequestUpstream(ar.ID, p.ID(), ids.SHA256Hex(state), v)
+			return tx.SetAuthRequestUpstream(ar.ID, p.ID(), ids.SHA256Hex(state), v, nonce)
 		})
 		if errors.Is(err, store.ErrNotFound) {
 			s.renderError(w, r, http.StatusBadRequest, errRequestExpired)
@@ -126,7 +132,7 @@ func (s *Service) start(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Location", p.AuthURL(state, v))
+		w.Header().Set("Location", p.AuthURL(state, v, nonce))
 		w.WriteHeader(http.StatusFound)
 	default:
 		httpx.NotFoundHandler.ServeHTTP(w, r)
@@ -139,7 +145,8 @@ var errStaleAR = errors.New("auth request does not match")
 // finds the auth request, which must belong to this browser's cookie; the state then works only
 // once. access_denied goes back to the app's validated loopback URI as error=access_denied.
 func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
-	p, ok := s.providerBy[r.PathValue("provider")].(providers.Redirector)
+	pp, _ := s.provider(r.PathValue("provider"))
+	p, ok := pp.(providers.Redirector)
 	if !ok {
 		httpx.NotFoundHandler.ServeHTTP(w, r)
 		return
@@ -196,7 +203,11 @@ func (s *Service) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), ExchangeTimeout)
 	defer cancel()
-	prof, err := p.Exchange(ctx, code, *ar.UpstreamVerifier)
+	nonce := ""
+	if ar.UpstreamNonce != nil {
+		nonce = *ar.UpstreamNonce
+	}
+	prof, err := p.Exchange(ctx, code, *ar.UpstreamVerifier, nonce)
 	if err != nil {
 		s.Logger.Warn("provider sign-in failed", "provider", p.ID(), "reason", providers.ErrorCode(err))
 		s.renderError(w, r, http.StatusBadGateway, providerError(p))
@@ -353,7 +364,7 @@ func (s *Service) finishProvider(w http.ResponseWriter, r *http.Request, ar *sto
 	var inUse *emailInUse
 	err = s.Store.Write(r.Context(), func(tx store.WriteTx) error {
 		if u, err := tx.UserByEmail(prof.Email); err == nil {
-			label, err := accounts.MethodLabel(tx, u.ID)
+			label, err := s.methodLabel(tx, u.ID)
 			if err != nil {
 				return err
 			}
@@ -395,6 +406,8 @@ func (s *Service) finishProvider(w http.ResponseWriter, r *http.Request, ar *sto
 		s.renderEmailInUse(w, r, ar, &providers.Profile{}, &emailInUse{})
 	case errors.Is(err, accounts.ErrInviteRequired):
 		codePage(false, msgInviteRequired)
+	case errors.Is(err, accounts.ErrInviteEmailUnconfirmed):
+		codePage(false, msgInviteEmail)
 	case errors.Is(err, accounts.ErrInviteInvalid):
 		codePage(s.noUsers(r.Context()), msgInviteInvalid)
 	case errors.Is(err, accounts.ErrSetupRequired):
@@ -406,6 +419,16 @@ func (s *Service) finishProvider(w http.ResponseWriter, r *http.Request, ar *sto
 	default:
 		s.internal(w, r, err)
 	}
+}
+
+// methodLabel names how an account signs in on the pages; an OIDC account uses
+// REQHARBOR_OIDC_NAME.
+func (s *Service) methodLabel(tx store.ReadTx, userID string) (string, error) {
+	label, err := accounts.MethodLabel(tx, userID)
+	if err == nil && label == accounts.MethodLabelOIDC {
+		label = s.Config.OIDCName
+	}
+	return label, err
 }
 
 // noUsers reports whether the server still has no account (the code page then asks for the

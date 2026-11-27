@@ -180,10 +180,16 @@ func TestCreate_GrantsAndModes(t *testing.T) {
 	if _, err := create(t, h, accounts.CreateParams{Email: "x@example.test", SignupMode: "invite", GrantHash: accounts.CodeHash(inv)}); !errors.Is(err, accounts.ErrInviteInvalid) {
 		t.Fatalf("restricted invite, other email: %v", err)
 	}
-	if _, err := create(t, h, accounts.CreateParams{Email: "only@example.test", SignupMode: "closed", GrantHash: accounts.CodeHash(inv)}); !errors.Is(err, accounts.ErrSignupClosed) {
+	if _, err := create(t, h, accounts.CreateParams{Email: "only@example.test", EmailTrusted: true, SignupMode: "closed", GrantHash: accounts.CodeHash(inv)}); !errors.Is(err, accounts.ErrSignupClosed) {
 		t.Fatalf("invite in closed mode: %v", err)
 	}
-	c, err = create(t, h, accounts.CreateParams{Email: "only@example.test", SignupMode: "invite", GrantHash: accounts.CodeHash(inv)})
+	// An email-bound invite needs a trusted email (S10): an unproven address cannot claim it, and
+	// the refusal does not consume the invite.
+	if _, err := create(t, h, accounts.CreateParams{Email: "only@example.test", SignupMode: "invite", GrantHash: accounts.CodeHash(inv)}); !errors.Is(err, accounts.ErrInviteEmailUnconfirmed) ||
+		!errors.Is(err, accounts.ErrInviteInvalid) {
+		t.Fatalf("restricted invite, untrusted email: %v", err)
+	}
+	c, err = create(t, h, accounts.CreateParams{Email: "only@example.test", EmailTrusted: true, SignupMode: "invite", GrantHash: accounts.CodeHash(inv)})
 	if err != nil || c.User.SignupVia != accounts.ViaInvite || c.User.IsAdmin {
 		t.Fatalf("invite: %+v %v", c, err)
 	}

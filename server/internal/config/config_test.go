@@ -353,3 +353,44 @@ func TestBackupSettings(t *testing.T) {
 	wantErr(t, "REQHARBOR_BACKUP_INTERVAL", pub, "REQHARBOR_BACKUP_INTERVAL=daily")
 	wantErr(t, "REQHARBOR_BACKUP_KEEP", pub, "REQHARBOR_BACKUP_KEEP=0")
 }
+
+func TestOIDCSettings(t *testing.T) {
+	iss := "REQHARBOR_OIDC_ISSUER=https://sso.example.com/realms/acme"
+	id, sec := "REQHARBOR_OIDC_CLIENT_ID=rh", "REQHARBOR_OIDC_CLIENT_SECRET=s"
+	c := mustParse(t, pub, iss, id, sec).Config
+	if c.OIDCName != "Single sign-on" || strings.Join(c.OIDCScopes, " ") != "openid email profile" || c.OIDCEmailClaim != "email" || !c.OIDCRequireVerifiedEmail {
+		t.Fatalf("defaults: %+v", c)
+	}
+	c = mustParse(t, pub, iss, id, "REQHARBOR_OIDC_CLIENT_SECRET_FILE=/run/secrets/gh", "REQHARBOR_OIDC_NAME= Acme SSO ",
+		"REQHARBOR_OIDC_SCOPES=openid, email groups email", "REQHARBOR_OIDC_EMAIL_CLAIM=upn", "REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL=false").Config
+	if c.OIDCClientSecret != "s3cret" || c.OIDCName != "Acme SSO" || strings.Join(c.OIDCScopes, " ") != "openid email groups" ||
+		c.OIDCEmailClaim != "upn" || c.OIDCRequireVerifiedEmail {
+		t.Fatalf("custom: %+v", c)
+	}
+	// A loopback issuer may be http (a local IdP); anything else must be https.
+	mustParse(t, pub, "REQHARBOR_OIDC_ISSUER=http://127.0.0.1:5556/dex", id, sec)
+	mustParse(t, pub, "REQHARBOR_OIDC_ISSUER=http://localhost:9000/application/o/rh/", id, sec)
+	wantErr(t, "REQHARBOR_OIDC_ISSUER must use https", pub, "REQHARBOR_OIDC_ISSUER=http://sso.example.com", id, sec)
+	wantErr(t, "REQHARBOR_OIDC_ISSUER must be an absolute URL", pub, "REQHARBOR_OIDC_ISSUER=sso.example.com", id, sec)
+	wantErr(t, "REQHARBOR_OIDC_ISSUER must be an absolute URL", pub, "REQHARBOR_OIDC_ISSUER=https://sso.example.com/?x=1", id, sec)
+	wantErr(t, "REQHARBOR_OIDC_ISSUER must be an absolute URL", pub, "REQHARBOR_OIDC_ISSUER=https://u:p@sso.example.com", id, sec)
+	wantErr(t, "REQHARBOR_OIDC_SCOPES must include openid", pub, iss, id, sec, "REQHARBOR_OIDC_SCOPES=email profile")
+	wantErr(t, "is not a valid scope", pub, iss, id, sec, `REQHARBOR_OIDC_SCOPES=openid "email"`)
+	wantErr(t, "REQHARBOR_OIDC_NAME", pub, iss, id, sec, "REQHARBOR_OIDC_NAME=Acme\x1bSSO")
+	wantErr(t, "REQHARBOR_OIDC_NAME", pub, iss, id, sec, "REQHARBOR_OIDC_NAME="+strings.Repeat("x", 41))
+	wantErr(t, "REQHARBOR_OIDC_EMAIL_CLAIM", pub, iss, id, sec, "REQHARBOR_OIDC_EMAIL_CLAIM=e mail")
+	wantErr(t, "REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL", pub, iss, id, sec, "REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL=maybe")
+	wantErr(t, "OIDC sign-in needs both", pub, iss, id)
+	wantErr(t, "OIDC sign-in needs REQHARBOR_OIDC_ISSUER", pub, id, sec)
+	wantErr(t, "OIDC sign-in needs REQHARBOR_OIDC_ISSUER", pub, iss)
+	wantErr(t, "Google sign-in needs both", pub, "REQHARBOR_GOOGLE_CLIENT_ID=g")
+	if c := mustParse(t, pub, "REQHARBOR_GOOGLE_CLIENT_ID=g", "REQHARBOR_GOOGLE_CLIENT_SECRET_FILE=/run/secrets/gh").Config; c.GoogleClientSecret != "s3cret" {
+		t.Fatalf("google secret file: %q", c.GoogleClientSecret)
+	}
+	// Without OIDC the label, scopes and claim are unused and never stop the server.
+	mustParse(t, pub, "REQHARBOR_OIDC_NAME="+strings.Repeat("x", 41), "REQHARBOR_OIDC_SCOPES=email", "REQHARBOR_OIDC_EMAIL_CLAIM=e mail")
+	// The new variable is known: no unknown-variable warning.
+	if res := mustParse(t, pub, "REQHARBOR_OIDC_EMAIL_CLAIM=email"); len(res.Warnings) != 0 {
+		t.Fatalf("warnings %v", res.Warnings)
+	}
+}

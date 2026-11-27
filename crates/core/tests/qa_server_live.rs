@@ -549,13 +549,19 @@ async fn live_provider_dev_sign_in_is_unlisted_untrusted_and_follows_signup_rule
     assert_eq!(
         methods,
         ["password"],
-        "dev is never listed; GitHub is not configured"
+        "dev is never listed; GitHub, Google and OIDC are not configured"
     );
 
-    // GitHub is not configured, so its routes do not exist.
+    // GitHub, Google and OIDC (S10) are not configured, so their routes do not exist.
     let mut b = Browser::new();
-    let (status, _, _) = b.get("/auth/start/github?ar=x").await;
-    assert_eq!(status, 404);
+    for provider in ["github", "google", "oidc"] {
+        let (status, _, _) = b.get(&format!("/auth/start/{provider}?ar=x")).await;
+        assert_eq!(status, 404, "/auth/start/{provider}");
+        let (status, _, _) = b
+            .get(&format!("/auth/callback/{provider}?code=x&state=y"))
+            .await;
+        assert_eq!(status, 404, "/auth/callback/{provider}");
+    }
 
     // The authorize page offers the dev form to this loopback peer.
     let (ar, html) = b.authorize("st-dev").await;
@@ -624,7 +630,12 @@ async fn dev_sign_up(c: &reqwest::Client, invite: &str, email: &str, state: &str
     let (status, headers, body) = b
         .post(
             "/auth/dev",
-            form(&[("ar", &ar), ("email", email), ("name", "Space QA"), ("code", invite)]),
+            form(&[
+                ("ar", &ar),
+                ("email", email),
+                ("name", "Space QA"),
+                ("code", invite),
+            ]),
         )
         .await;
     let auth_code = loopback_code(status, &headers, &body, state);
@@ -875,7 +886,9 @@ async fn restore_round_trip(by_hand: bool) {
         ..Request::default()
     };
     let ra = a.create_request(&col.id, None, req("a")).unwrap();
-    sync::sync_now(&ca, &mut a).await.expect("device 1 pushes A");
+    sync::sync_now(&ca, &mut a)
+        .await
+        .expect("device 1 pushes A");
     let (_d2, mut b, cb) = sync_device(&token).await;
     sync::sync_now(&cb, &mut b).await.expect("device 2 pulls A");
     assert!(b.request(&ra.id).is_some(), "device 2 has A");
@@ -884,9 +897,13 @@ async fn restore_round_trip(by_hand: bool) {
     assert!(backup.ends_with(".db"), "backup path {backup:?}");
 
     let rb = a.create_request(&col.id, None, req("b")).unwrap();
-    let rep = sync::sync_now(&ca, &mut a).await.expect("device 1 pushes B");
+    let rep = sync::sync_now(&ca, &mut a)
+        .await
+        .expect("device 1 pushes B");
     assert!(rep.pushed >= 1, "{rep:?}");
-    sync::sync_now(&ca, &mut a).await.expect("device 1 pulls its own B");
+    sync::sync_now(&ca, &mut a)
+        .await
+        .expect("device 1 pulls its own B");
     let epoch_before = sync_epoch(&c).await;
 
     server_ctl(&[if by_hand { "replace" } else { "restore" }, &backup]);
@@ -924,7 +941,11 @@ async fn restore_round_trip(by_hand: bool) {
         .expect("device 2 after the restore");
     assert!(rep.conflicts.is_empty(), "{rep:?}");
     assert!(b.request(&ra.id).is_some(), "device 2 keeps A");
-    assert_eq!(b.request(&rb.id).map(|r| r.name.as_str()), Some("b"), "device 2 has B");
+    assert_eq!(
+        b.request(&rb.id).map(|r| r.name.as_str()),
+        Some("b"),
+        "device 2 has B"
+    );
 }
 
 #[tokio::test]
@@ -973,7 +994,12 @@ fn code(v: &Value) -> Value {
 
 /// Signs a new account up through the dev form with a team-invite signup ticket and no server
 /// invite code (REQHARBOR_SIGNUP=invite); returns the token response.
-async fn dev_sign_up_with_ticket(c: &reqwest::Client, ticket: &str, email: &str, state: &str) -> Value {
+async fn dev_sign_up_with_ticket(
+    c: &reqwest::Client,
+    ticket: &str,
+    email: &str,
+    state: &str,
+) -> Value {
     let mut b = Browser::new();
     let (ar, _) = b.authorize_with(state, &[("ticket", ticket)]).await;
     let (status, headers, body) = b
@@ -1026,62 +1052,149 @@ async fn live_teams_invites_ticket_roles_and_team_sync() {
         "the live script sets REQHARBOR_TEAMS=true"
     );
     let tag = random_ip().replace('.', "-");
-    let owner = dev_sign_up(&c, &invite, &format!("team-owner-{tag}@example.test"), "st-team-o").await;
+    let owner = dev_sign_up(
+        &c,
+        &invite,
+        &format!("team-owner-{tag}@example.test"),
+        "st-team-o",
+    )
+    .await;
     let o = owner["access_token"].as_str().unwrap().to_string();
-    let editor = dev_sign_up(&c, &invite, &format!("team-editor-{tag}@example.test"), "st-team-e").await;
+    let editor = dev_sign_up(
+        &c,
+        &invite,
+        &format!("team-editor-{tag}@example.test"),
+        "st-team-e",
+    )
+    .await;
     let e = editor["access_token"].as_str().unwrap().to_string();
 
     // Create the team.
-    let (status, team) = api(&c, Method::POST, "/v1/teams", Some(&o), Some(json!({"name": "Live QA team"}))).await;
+    let (status, team) = api(
+        &c,
+        Method::POST,
+        "/v1/teams",
+        Some(&o),
+        Some(json!({"name": "Live QA team"})),
+    )
+    .await;
     assert_eq!(status, 201, "{team}");
     assert_eq!(team["role"], json!("owner"));
     let tid = team["teamId"].as_str().unwrap().to_string();
     let space = team["spaceId"].as_str().unwrap().to_string();
 
     // Invite links: the token is only in the URL fragment.
-    let (status, ed_link) = api(&c, Method::POST, &format!("/v1/teams/{tid}/invites"), Some(&o),
-        Some(json!({"role": "editor", "maxUses": 5, "expiresInDays": 7}))).await;
+    let (status, ed_link) = api(
+        &c,
+        Method::POST,
+        &format!("/v1/teams/{tid}/invites"),
+        Some(&o),
+        Some(json!({"role": "editor", "maxUses": 5, "expiresInDays": 7})),
+    )
+    .await;
     assert_eq!(status, 201, "{ed_link}");
     let ed_token = ed_link["token"].as_str().unwrap().to_string();
-    assert_eq!(ed_link["url"], json!(format!("{}/i#{ed_token}", server_url())));
-    let (status, vw_link) = api(&c, Method::POST, &format!("/v1/teams/{tid}/invites"), Some(&o),
-        Some(json!({"role": "viewer", "maxUses": 1}))).await;
+    assert_eq!(
+        ed_link["url"],
+        json!(format!("{}/i#{ed_token}", server_url()))
+    );
+    let (status, vw_link) = api(
+        &c,
+        Method::POST,
+        &format!("/v1/teams/{tid}/invites"),
+        Some(&o),
+        Some(json!({"role": "viewer", "maxUses": 1})),
+    )
+    .await;
     assert_eq!(status, 201, "{vw_link}");
     let vw_token = vw_link["token"].as_str().unwrap().to_string();
-    let (status, err) = api(&c, Method::POST, &format!("/v1/teams/{tid}/invites"), Some(&o),
-        Some(json!({"role": "admin", "maxUses": 5}))).await;
-    assert_eq!((status, code(&err)), (400, json!("validation_failed")), "admin links are single-use");
+    let (status, err) = api(
+        &c,
+        Method::POST,
+        &format!("/v1/teams/{tid}/invites"),
+        Some(&o),
+        Some(json!({"role": "admin", "maxUses": 5})),
+    )
+    .await;
+    assert_eq!(
+        (status, code(&err)),
+        (400, json!("validation_failed")),
+        "admin links are single-use"
+    );
 
     // The hosted page: strict CSP, no team details in the static HTML.
     let page = c.get(format!("{}/i", server_url())).send().await.unwrap();
     assert_eq!(page.status().as_u16(), 200);
-    let csp = page.headers()["content-security-policy"].to_str().unwrap().to_string();
+    let csp = page.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_string();
     assert!(csp.starts_with("default-src 'none'"), "{csp}");
-    assert!(csp.contains("connect-src 'self'") && csp.contains("script-src 'sha256-"), "{csp}");
+    assert!(
+        csp.contains("connect-src 'self'") && csp.contains("script-src 'sha256-"),
+        "{csp}"
+    );
     let html = page.text().await.unwrap();
-    assert!(!html.contains("Live QA team") && html.contains("Join team"), "{html}");
+    assert!(
+        !html.contains("Live QA team") && html.contains("Join team"),
+        "{html}"
+    );
 
     // Preview needs no auth.
-    let (status, pv) = api(&c, Method::POST, "/v1/invites/preview", None, Some(json!({"token": ed_token}))).await;
+    let (status, pv) = api(
+        &c,
+        Method::POST,
+        "/v1/invites/preview",
+        None,
+        Some(json!({"token": ed_token})),
+    )
+    .await;
     assert_eq!(status, 200, "{pv}");
     assert_eq!(pv["teamName"], json!("Live QA team"));
     assert_eq!(pv["role"], json!("editor"));
     assert_eq!(pv["inviterName"], json!("Space QA"));
 
     // The editor joins with the link.
-    let (status, acc) = api(&c, Method::POST, "/v1/invites/accept", Some(&e), Some(json!({"token": ed_token}))).await;
+    let (status, acc) = api(
+        &c,
+        Method::POST,
+        "/v1/invites/accept",
+        Some(&e),
+        Some(json!({"token": ed_token})),
+    )
+    .await;
     assert_eq!(status, 200, "{acc}");
     assert_eq!(acc["role"], json!("editor"));
     assert_eq!(acc["spaceId"], json!(space));
 
     // The viewer has no account: a signup ticket lets them sign up without a server invite.
-    let (status, tk) = api(&c, Method::POST, "/v1/invites/ticket", None, Some(json!({"token": vw_token}))).await;
+    let (status, tk) = api(
+        &c,
+        Method::POST,
+        "/v1/invites/ticket",
+        None,
+        Some(json!({"token": vw_token})),
+    )
+    .await;
     assert_eq!(status, 200, "{tk}");
     let ticket = tk["ticket"].as_str().unwrap().to_string();
     assert!(ticket.starts_with("rht_"), "{tk}");
-    let viewer = dev_sign_up_with_ticket(&c, &ticket, &format!("team-viewer-{tag}@example.test"), "st-team-v").await;
+    let viewer = dev_sign_up_with_ticket(
+        &c,
+        &ticket,
+        &format!("team-viewer-{tag}@example.test"),
+        "st-team-v",
+    )
+    .await;
     let v = viewer["access_token"].as_str().unwrap().to_string();
-    let (status, acc) = api(&c, Method::POST, "/v1/invites/accept", Some(&v), Some(json!({"token": vw_token}))).await;
+    let (status, acc) = api(
+        &c,
+        Method::POST,
+        "/v1/invites/accept",
+        Some(&v),
+        Some(json!({"token": vw_token})),
+    )
+    .await;
     assert_eq!(status, 200, "{acc}");
     assert_eq!(acc["role"], json!("viewer"));
     let (status, spaces) = api(&c, Method::GET, "/v1/me/spaces", Some(&v), None).await;
@@ -1089,13 +1202,23 @@ async fn live_teams_invites_ticket_roles_and_team_sync() {
     assert_eq!(spaces["spaces"][1]["spaceId"], json!(space));
     assert_eq!(spaces["spaces"][1]["kind"], json!("team"));
     assert_eq!(spaces["spaces"][1]["role"], json!("viewer"));
-    let (status, members) = api(&c, Method::GET, &format!("/v1/teams/{tid}/members"), Some(&v), None).await;
+    let (status, members) = api(
+        &c,
+        Method::GET,
+        &format!("/v1/teams/{tid}/members"),
+        Some(&v),
+        None,
+    )
+    .await;
     assert_eq!(status, 200, "{members}");
     assert_eq!(members["members"].as_array().unwrap().len(), 3);
 
     // Team-space sync with roles.
     let sync = format!("/v1/spaces/{space}/sync");
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let push = json!({"changes": [
         {"type": "project", "id": "tp1", "updatedAt": now, "deleted": false, "deviceId": "01QA",
          "data": {"id": "tp1", "name": "Team project"}},
@@ -1138,49 +1261,117 @@ async fn live_teams_invites_ticket_roles_and_team_sync() {
     assert_eq!(res.status().as_u16(), 200);
     let text = res.text().await.unwrap();
     let page: Value = serde_json::from_str(&text).unwrap();
-    let upload = page["changes"].as_array().unwrap().iter().find(|ch| ch["id"] == json!("tr1")).unwrap();
+    let upload = page["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ch| ch["id"] == json!("tr1"))
+        .unwrap();
     assert_eq!(upload["data"]["body"]["binaryPath"], json!(""));
     assert_eq!(upload["updatedBy"]["name"], json!("Space QA"));
     let parsed: reqharbor_core::sync::PullPage = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed.changes.len(), 3, "tp1, tr1 and tr2");
     // A team space needs the version header.
-    let res = c.get(format!("{}{sync}", server_url())).bearer_auth(&v).send().await.unwrap();
+    let res = c
+        .get(format!("{}{sync}", server_url()))
+        .bearer_auth(&v)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status().as_u16(), 426);
 
     // A share in the team space, for the delete check below.
     let snapshot = json!({"schemaVersion": 1, "request": {"id": "tr2", "name": "Editor's", "method": "GET",
         "url": "https://example.com", "params": [], "headers": [], "auth": {"type": "none"},
         "body": {"type": "none"}}, "environment": null});
-    let (status, err) = api(&c, Method::POST, &format!("/v1/spaces/{space}/shares"), Some(&v),
-        Some(json!({"kind": "request", "entityId": "tr2", "snapshot": snapshot.clone()}))).await;
-    assert_eq!((status, code(&err)), (403, json!("forbidden_role")), "viewers can't share");
-    let (status, share) = api(&c, Method::POST, &format!("/v1/spaces/{space}/shares"), Some(&e),
-        Some(json!({"kind": "request", "entityId": "tr2", "snapshot": snapshot}))).await;
+    let (status, err) = api(
+        &c,
+        Method::POST,
+        &format!("/v1/spaces/{space}/shares"),
+        Some(&v),
+        Some(json!({"kind": "request", "entityId": "tr2", "snapshot": snapshot.clone()})),
+    )
+    .await;
+    assert_eq!(
+        (status, code(&err)),
+        (403, json!("forbidden_role")),
+        "viewers can't share"
+    );
+    let (status, share) = api(
+        &c,
+        Method::POST,
+        &format!("/v1/spaces/{space}/shares"),
+        Some(&e),
+        Some(json!({"kind": "request", "entityId": "tr2", "snapshot": snapshot})),
+    )
+    .await;
     assert_eq!(status, 201, "{share}");
     let share_url = share["url"].as_str().unwrap().to_string();
 
     // Removal: immediate 403, a `removed` departure, and the used single-use link stays invalid.
     let vid = viewer["user"]["id"].as_str().unwrap();
-    let (status, removed) = api(&c, Method::DELETE, &format!("/v1/teams/{tid}/members/{vid}"), Some(&o),
-        Some(json!({"revokeInvites": false}))).await;
+    let (status, removed) = api(
+        &c,
+        Method::DELETE,
+        &format!("/v1/teams/{tid}/members/{vid}"),
+        Some(&o),
+        Some(json!({"revokeInvites": false})),
+    )
+    .await;
     assert_eq!(status, 200, "{removed}");
     let (status, err) = api(&c, Method::GET, &sync, Some(&v), None).await;
     assert_eq!((status, code(&err)), (403, json!("not_a_member")));
     let (_, spaces) = api(&c, Method::GET, "/v1/me/spaces", Some(&v), None).await;
     assert_eq!(spaces["departed"][0]["reason"], json!("removed"));
     assert_eq!(spaces["departed"][0]["spaceId"], json!(space));
-    let (status, err) = api(&c, Method::POST, "/v1/invites/accept", Some(&v), Some(json!({"token": ed_token}))).await;
-    assert_eq!((status, code(&err)), (410, json!("invite_invalid")), "a link from before the removal");
+    let (status, err) = api(
+        &c,
+        Method::POST,
+        "/v1/invites/accept",
+        Some(&v),
+        Some(json!({"token": ed_token})),
+    )
+    .await;
+    assert_eq!(
+        (status, code(&err)),
+        (410, json!("invite_invalid")),
+        "a link from before the removal"
+    );
 
     // The billing owner can't leave; deleting the team cascades.
-    let (status, err) = api(&c, Method::POST, &format!("/v1/teams/{tid}/leave"), Some(&o), None).await;
+    let (status, err) = api(
+        &c,
+        Method::POST,
+        &format!("/v1/teams/{tid}/leave"),
+        Some(&o),
+        None,
+    )
+    .await;
     assert_eq!((status, code(&err)), (409, json!("last_owner")));
-    let (status, _) = api(&c, Method::DELETE, &format!("/v1/teams/{tid}"), Some(&e), None).await;
+    let (status, _) = api(
+        &c,
+        Method::DELETE,
+        &format!("/v1/teams/{tid}"),
+        Some(&e),
+        None,
+    )
+    .await;
     assert_eq!(status, 403);
-    let (status, _) = api(&c, Method::DELETE, &format!("/v1/teams/{tid}"), Some(&o), None).await;
+    let (status, _) = api(
+        &c,
+        Method::DELETE,
+        &format!("/v1/teams/{tid}"),
+        Some(&o),
+        None,
+    )
+    .await;
     assert_eq!(status, 204);
     let (_, spaces) = api(&c, Method::GET, "/v1/me/spaces", Some(&e), None).await;
-    assert_eq!(spaces["departed"][0]["reason"], json!("deleted"), "{spaces}");
+    assert_eq!(
+        spaces["departed"][0]["reason"],
+        json!("deleted"),
+        "{spaces}"
+    );
     assert_eq!(spaces["spaces"].as_array().unwrap().len(), 1, "{spaces}");
     let res = c.get(&share_url).send().await.unwrap();
     assert_eq!(res.status().as_u16(), 404, "the team's share page is gone");

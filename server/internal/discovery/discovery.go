@@ -125,22 +125,47 @@ type Handler struct {
 
 	mu         sync.Mutex
 	info       Info
+	set        bool
 	setup      atomic.Bool
 	UsersExist func(ctx context.Context) bool
+	// Methods, when set, supplies auth.methods each time the document is built, so a provider
+	// that becomes available later (OIDC after discovery) is listed; MethodsChanged rebuilds.
+	Methods func() []Method
 }
 
 // Set replaces the served document.
 func (h *Handler) Set(info Info) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.store(info)
+}
+
+// store builds and serves info; h.mu is held.
+func (h *Handler) store(info Info) error {
+	if h.Methods != nil {
+		info.Auth.Methods = h.Methods()
+		if info.Auth.Methods == nil {
+			info.Auth.Methods = []Method{}
+		}
+	}
 	b, err := httpx.Marshal(info)
 	if err != nil {
 		return err
 	}
-	h.mu.Lock()
-	h.info = info
+	h.info, h.set = info, true
 	h.setup.Store(info.Auth.SetupRequired)
 	h.body.Store(&b)
-	h.mu.Unlock()
 	return nil
+}
+
+// MethodsChanged rebuilds the document with the current methods (a no-op before the first Set,
+// which reads them itself).
+func (h *Handler) MethodsChanged() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.set {
+		_ = h.store(h.info)
+	}
 }
 
 // SetupDone clears setupRequired (the first account exists).
@@ -149,10 +174,10 @@ func (h *Handler) SetupDone() {
 		return
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	info := h.info
-	h.mu.Unlock()
 	info.Auth.SetupRequired = false
-	_ = h.Set(info)
+	_ = h.store(info)
 }
 
 // Current returns the served document.

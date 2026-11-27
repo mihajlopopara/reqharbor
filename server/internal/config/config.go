@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/mihajlopopara/reqharbor/server/internal/ids"
 )
@@ -64,7 +66,9 @@ type Config struct {
 	GitHubClientID, GitHubClientSecret         string
 	GoogleClientID, GoogleClientSecret         string
 	OIDCIssuer, OIDCClientID, OIDCClientSecret string
-	OIDCName, OIDCScopes                       string
+	OIDCName                                   string
+	OIDCScopes                                 []string // always contains "openid"
+	OIDCEmailClaim                             string   // the claim that holds the email (default "email")
 	OIDCRequireVerifiedEmail                   bool
 
 	DevAuth bool
@@ -114,6 +118,12 @@ type TestOverrides struct {
 	GitHubAuthURL  string // default https://github.com/login/oauth/authorize
 	GitHubTokenURL string // default https://github.com/login/oauth/access_token
 	GitHubAPIURL   string // default https://api.github.com
+	// Google endpoints (S10): default https://accounts.google.com/o/oauth2/v2/auth,
+	// https://oauth2.googleapis.com/token and https://www.googleapis.com/oauth2/v3/certs.
+	GoogleAuthURL, GoogleTokenURL, GoogleJWKSURL string
+	// OIDCDiscoveryBackoff is the first retry delay of OIDC discovery (default 1 s; it doubles up
+	// to 5 min).
+	OIDCDiscoveryBackoff time.Duration
 	// SMTPTLSConfig is the base client TLS configuration of the SMTP relay (a pool that trusts
 	// the fake SMTP server's certificate); nil means the system roots.
 	SMTPTLSConfig *tls.Config
@@ -379,8 +389,25 @@ func Parse(opts Options) (*Result, error) {
 	if (c.OIDCIssuer == "") != (c.OIDCClientID == "") {
 		return nil, errorf("OIDC sign-in needs REQHARBOR_OIDC_ISSUER together with REQHARBOR_OIDC_CLIENT_ID and REQHARBOR_OIDC_CLIENT_SECRET")
 	}
-	c.OIDCName = e.str("REQHARBOR_OIDC_NAME", "Single sign-on")
-	c.OIDCScopes = e.str("REQHARBOR_OIDC_SCOPES", "openid email profile")
+	if c.OIDCIssuer != "" {
+		if err := checkIssuer(c.OIDCIssuer); err != nil {
+			return nil, err
+		}
+	}
+	// The label, scopes and email claim are validated only when OIDC is configured; otherwise
+	// they are unused and a stray value must not stop the server.
+	oidc := c.OIDCIssuer != ""
+	c.OIDCName = strings.TrimSpace(e.str("REQHARBOR_OIDC_NAME", "Single sign-on"))
+	if oidc && (c.OIDCName == "" || utf8.RuneCountInString(c.OIDCName) > 40 || strings.ContainsFunc(c.OIDCName, unicode.IsControl)) {
+		return nil, errorf("REQHARBOR_OIDC_NAME must be 1 to 40 characters without control characters, got %q", c.OIDCName)
+	}
+	if c.OIDCScopes, err = parseScopes(e.str("REQHARBOR_OIDC_SCOPES", "openid email profile")); err != nil && oidc {
+		return nil, err
+	}
+	c.OIDCEmailClaim = strings.TrimSpace(e.str("REQHARBOR_OIDC_EMAIL_CLAIM", "email"))
+	if oidc && !claimNameRe.MatchString(c.OIDCEmailClaim) {
+		return nil, errorf("REQHARBOR_OIDC_EMAIL_CLAIM must be a claim name such as email, upn or preferred_username, got %q", c.OIDCEmailClaim)
+	}
 	if c.OIDCRequireVerifiedEmail, err = e.boolean("REQHARBOR_OIDC_REQUIRE_VERIFIED_EMAIL", true); err != nil {
 		return nil, err
 	}
@@ -535,6 +562,55 @@ func normaliseOrigin(raw string) (string, error) {
 	return scheme + "://" + host, nil
 }
 
+// claimNameRe is a JSON claim name we accept for REQHARBOR_OIDC_EMAIL_CLAIM: letters, digits and
+// the punctuation of namespaced claims (URIs such as http://schemas.example.com/claims/email).
+var claimNameRe = regexp.MustCompile(`^[A-Za-z0-9_.:/\-]{1,128}$`)
+
+// scopeRe is one OAuth scope token (RFC 6749 §3.3, without the quote and backslash).
+var scopeRe = regexp.MustCompile(`^[\x21\x23-\x5B\x5D-\x7E]{1,128}$`)
+
+// parseScopes splits REQHARBOR_OIDC_SCOPES on spaces or commas. "openid" is required, duplicates
+// are dropped.
+func parseScopes(raw string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, s := range strings.FieldsFunc(raw, func(r rune) bool { return r == ' ' || r == ',' || r == '\t' }) {
+		if !scopeRe.MatchString(s) {
+			return nil, errorf("REQHARBOR_OIDC_SCOPES: %q is not a valid scope", s)
+		}
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	if !seen["openid"] {
+		return nil, errorf("REQHARBOR_OIDC_SCOPES must include openid, got %q", raw)
+	}
+	return out, nil
+}
+
+// checkIssuer validates REQHARBOR_OIDC_ISSUER: an absolute https URL (http only for a loopback
+// host), without a query, fragment or credentials (§5.4).
+func checkIssuer(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.ContainsAny(raw, "?#") {
+		return errorf("REQHARBOR_OIDC_ISSUER must be an absolute URL such as https://sso.example.com/realms/acme, got %q", raw)
+	}
+	if u.Scheme != "https" && (u.Scheme != "http" || !IsLoopbackHost(u.Hostname())) {
+		return errorf("REQHARBOR_OIDC_ISSUER must use https (http only for a loopback host), got %q", raw)
+	}
+	return nil
+}
+
+// IsHTTPSOrLoopback reports whether an absolute URL from OIDC configuration or discovery may be
+// used (§5.4): https, or http to a loopback host.
+func IsHTTPSOrLoopback(u *url.URL) bool {
+	if u == nil || u.Host == "" || u.User != nil {
+		return false
+	}
+	return u.Scheme == "https" || (u.Scheme == "http" && IsLoopbackHost(u.Hostname()))
+}
+
 // IsLoopbackHost reports whether a host name (no port, brackets allowed) is loopback: a loopback
 // IP literal or "localhost". It judges hosts the server connects to or that users type (the SMTP
 // host, the PUBLIC_URL host). Listen addresses use IsLoopbackListen, which is stricter.
@@ -604,7 +680,7 @@ var knownNames = func() map[string]bool {
 		"LOG_CLIENT_IP", "TRUSTED_PROXIES", "CLIENT_IP_HEADER", "SIGNUP", "MAX_USERS", "ADMIN_EMAIL",
 		"SETUP_CODE", "PASSWORD_AUTH", "ARGON2_MEMORY_KIB", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
 		"GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET",
-		"OIDC_NAME", "OIDC_SCOPES", "OIDC_REQUIRE_VERIFIED_EMAIL", "DEV_AUTH", "SMTP_HOST", "SMTP_PORT",
+		"OIDC_NAME", "OIDC_SCOPES", "OIDC_EMAIL_CLAIM", "OIDC_REQUIRE_VERIFIED_EMAIL", "DEV_AUTH", "SMTP_HOST", "SMTP_PORT",
 		"SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM", "SMTP_TLS", "LEGACY_WORKSPACES", "LEGACY_TOTAL_BYTES",
 		"OPEN_SIGNUP_TOTAL_BYTES", "TEAMS", "MIN_CLIENT_VERSION", "QUOTA_LEGACY_BYTES", "QUOTA_PERSONAL_BYTES",
 		"QUOTA_TEAM_BYTES", "QUOTA_OWNER_BYTES", "MAX_OWNED_TEAMS", "MAX_TEAM_MEMBERS", "MAX_TEAM_INVITES",

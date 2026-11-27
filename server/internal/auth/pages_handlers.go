@@ -338,7 +338,7 @@ func (s *Service) code(w http.ResponseWriter, r *http.Request) {
 	}
 	// continue names the provider sign-in that asked for the code (S5); it resumes there.
 	cont := r.PostForm.Get("continue")
-	if _, ok := s.providerBy[cont]; !ok {
+	if _, ok := s.provider(cont); !ok {
 		cont = ""
 	}
 	res, err := s.applyCode(r, ar, r.PostForm.Get("code"))
@@ -626,6 +626,8 @@ func (s *Service) signupFailed(w http.ResponseWriter, r *http.Request, ar *store
 	switch {
 	case errors.Is(err, accounts.ErrEmailInUse):
 		again(http.StatusConflict, msgEmailInUse)
+	case errors.Is(err, accounts.ErrInviteEmailUnconfirmed):
+		again(http.StatusBadRequest, msgInviteEmail)
 	case errors.Is(err, accounts.ErrInviteInvalid):
 		again(http.StatusBadRequest, msgInviteInvalid)
 	case errors.Is(err, accounts.ErrInviteRequired):

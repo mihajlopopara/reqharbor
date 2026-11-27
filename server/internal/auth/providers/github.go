@@ -68,8 +68,9 @@ func NewGitHub(cfg *config.Config, client *http.Client) *GitHub {
 func (*GitHub) ID() string    { return "github" }
 func (*GitHub) Label() string { return "GitHub" }
 
-// AuthURL is GitHub's authorize URL with the state and the S256 challenge of verifier.
-func (g *GitHub) AuthURL(state, verifier string) string {
+// AuthURL is GitHub's authorize URL with the state and the S256 challenge of verifier. GitHub is
+// OAuth only, so the nonce is not sent.
+func (g *GitHub) AuthURL(state, verifier, _ string) string {
 	return g.oauth.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier))
 }
 
@@ -89,18 +90,11 @@ type GitHubEmail struct {
 
 // Exchange trades the code (with the PKCE verifier and the client secret) for a token, reads the
 // profile with it and drops it.
-func (g *GitHub) Exchange(ctx context.Context, code, verifier string) (*Profile, error) {
+func (g *GitHub) Exchange(ctx context.Context, code, verifier, _ string) (*Profile, error) {
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, g.client)
 	tok, err := g.oauth.Exchange(ctx, code, oauth2.VerifierOption(verifier))
 	if err != nil {
-		var re *oauth2.RetrieveError
-		if errors.As(err, &re) && re.ErrorCode != "" {
-			return nil, &Error{Code: "token_" + SafeCode(re.ErrorCode)}
-		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return nil, err
-		}
-		return nil, &Error{Code: "token_request_failed"}
+		return nil, tokenError(err)
 	}
 	var u githubUser
 	if err := g.get(ctx, tok.AccessToken, "/user", &u); err != nil {

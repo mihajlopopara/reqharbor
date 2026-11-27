@@ -79,6 +79,7 @@ type AuthRequest struct {
 	GrantTokenHash   *string
 	Provider         *string
 	UpstreamVerifier *string // PKCE verifier of the provider round trip (S5)
+	UpstreamNonce    *string // OIDC nonce of the provider round trip (S10); nil for GitHub
 	TicketHash       *string // SHA-256 of the team-invite signup ticket it was started with (M2)
 	// A password signup waiting for its emailed code (S9, §5.5).
 	PendingEmail       *string
@@ -194,8 +195,9 @@ type AccountsWriteTx interface {
 
 	InsertAuthRequest(ar AuthRequest) error
 	SetAuthRequestGrant(id, grantHash string) error
-	// SetAuthRequestUpstream starts a provider round trip on the request (state stored hashed).
-	SetAuthRequestUpstream(id, provider, stateHash, verifier string) error
+	// SetAuthRequestUpstream starts a provider round trip on the request (state stored hashed;
+	// nonce "" is stored as NULL).
+	SetAuthRequestUpstream(id, provider, stateHash, verifier, nonce string) error
 	// ClearAuthRequestUpstream ends it, so the upstream state works once.
 	ClearAuthRequestUpstream(id string) error
 	// ConsumeAuthRequest ends a request without a code (the provider was cancelled).

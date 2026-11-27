@@ -129,11 +129,13 @@ func New(d Deps) *App {
 	a.Auth = auth.New(auth.Deps{
 		Store: d.Store, Clock: d.Clock, Config: d.Config, Logger: d.Logger, ClientIP: a.Resolver,
 		Hasher: a.Hasher, Throttle: a.Throttle, Growth: a.accountGrowth, OpenSignupFull: a.Breaker.OpenSignupFull,
-		UserCreated: a.discovery.SetupDone,
-		HTTPClient:  d.HTTPClient,
-		Mail:        a.Mail,
+		UserCreated:    a.discovery.SetupDone,
+		HTTPClient:     d.HTTPClient,
+		MethodsChanged: a.discovery.MethodsChanged,
+		Mail:           a.Mail,
 	})
 	a.discovery.UsersExist = a.usersExist
+	a.discovery.Methods = a.methods
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", httpx.Methods{{Name: "GET", Handler: http.HandlerFunc(a.healthz)}})
 	mux.Handle("/readyz", httpx.Methods{{Name: "GET", Handler: http.HandlerFunc(a.readyz)}})
@@ -325,17 +327,26 @@ func (a *App) Init(ctx context.Context) error {
 	if err := a.Breaker.Sample(ctx); err != nil {
 		a.logger.Warn("initial breaker sample failed", "err", err.Error())
 	}
-	var methods []discovery.Method
-	for _, m := range auth.Methods(a.cfg) {
-		methods = append(methods, discovery.Method{ID: m.ID, Label: m.Label})
-	}
-	if err := a.discovery.Set(discovery.Build(a.cfg, a.version, instanceID, epoch, methods, users == 0)); err != nil {
+	if err := a.discovery.Set(discovery.Build(a.cfg, a.version, instanceID, epoch, nil, users == 0)); err != nil {
 		return err
 	}
 	a.migrations.Store(MigrationsOK)
 	a.ready.Store(true)
 	return nil
 }
+
+// methods are discovery's sign-in methods: those available now (§5.1).
+func (a *App) methods() []discovery.Method {
+	var out []discovery.Method
+	for _, m := range a.Auth.Methods() {
+		out = append(out, discovery.Method{ID: m.ID, Label: m.Label})
+	}
+	return out
+}
+
+// RunProviders runs the late sign-in providers (OIDC discovery with retries) until each is
+// available or ctx ends; serve starts it at once, before the migrations.
+func (a *App) RunProviders(ctx context.Context) { a.Auth.RunProviders(ctx) }
 
 func (a *App) healthz(w http.ResponseWriter, _ *http.Request) {
 	_ = httpx.WriteJSON(w, http.StatusOK, struct {

@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mihajlopopara/reqharbor/server/internal/auth"
 	"github.com/mihajlopopara/reqharbor/server/internal/clock"
 	"github.com/mihajlopopara/reqharbor/server/internal/config"
 	"github.com/mihajlopopara/reqharbor/server/internal/db"
@@ -87,6 +86,13 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 	jobsCtx, stopJobs := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 
+	// OIDC discovery runs from the start (it needs no database) and retries in the background;
+	// the provider is listed once it succeeds (§5.4).
+	if a.Auth.HasDynamicProviders() {
+		wg.Add(1)
+		go func() { defer wg.Done(); a.RunProviders(jobsCtx) }()
+	}
+
 	// 4–6. In the background: pre-migration backup, migrations, server state, ready.
 	wg.Add(1)
 	go func() {
@@ -100,7 +106,7 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 			return
 		}
 		var methods []string
-		for _, m := range auth.Methods(cfg) {
+		for _, m := range a.Auth.Methods() {
 			methods = append(methods, m.ID)
 		}
 		logger.Info("ready", "signup", cfg.Signup, "legacy_workspaces", cfg.LegacyWorkspaces, "methods", methods, "instance_id", a.InstanceID(),

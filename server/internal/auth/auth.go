@@ -4,6 +4,7 @@
 package auth
 
 import (
+	"context"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -66,6 +67,9 @@ type Deps struct {
 	UserCreated func()
 	// HTTPClient makes the outbound provider calls; nil means providers.DefaultHTTPClient.
 	HTTPClient *http.Client
+	// MethodsChanged is called when the method list changes after startup (the OIDC provider
+	// became available); discovery then rebuilds its document. nil means nothing to notify.
+	MethodsChanged func()
 	// Mail sends the signup codes and reset links when SMTP is configured (S9); nil means no
 	// email: signups are created at once and resets go through the admin.
 	Mail *mail.Outbox
@@ -116,7 +120,7 @@ func New(d Deps) *Service {
 		s.renderError(w, r, http.StatusForbidden, pageError{Code: "wrong_origin", Title: "Request blocked",
 			Message: "This form was sent from another site. Open this page from " + s.Config.PublicURL + "."})
 	}))
-	s.providers = providers.Enabled(d.Config, d.HTTPClient)
+	s.providers = providers.Enabled(d.Config, providers.Deps{Client: d.HTTPClient, Clock: d.Clock, Logger: d.Logger})
 	s.providerBy = make(map[string]providers.Provider, len(s.providers))
 	for _, p := range s.providers {
 		s.providerBy[p.ID()] = p
@@ -142,19 +146,59 @@ func (s *Service) Limiters() []*ratelimit.Limiter {
 		s.ForgotIPLimiter, s.ForgotEmailLimiter, s.CodeGuessLimiter}
 }
 
-// Methods are the enabled sign-in methods in their fixed order (§5.1): password, then each
-// configured provider (GitHub from S5; Google and OIDC in M3). The dev provider is never listed.
-func Methods(cfg *config.Config) []Method {
+// Methods are the sign-in methods available now, in their fixed order (§5.1): password, then
+// github, google and oidc when configured; oidc only once its discovery has succeeded. The dev
+// provider is never listed.
+func (s *Service) Methods() []Method {
 	var out []Method
-	if cfg.PasswordAuth {
+	if s.Config.PasswordAuth {
 		out = append(out, Method{ID: "password", Label: "Email and password"})
 	}
-	for _, p := range providers.Enabled(cfg, nil) {
-		if providers.Listed(p) {
+	for _, p := range s.providers {
+		if providers.Listed(p) && providers.IsAvailable(p) {
 			out = append(out, Method{ID: p.ID(), Label: p.Label()})
 		}
 	}
 	return out
+}
+
+// HasDynamicProviders reports whether RunProviders has work (an OIDC provider is configured).
+func (s *Service) HasDynamicProviders() bool {
+	for _, p := range s.providers {
+		if _, ok := p.(providers.Dynamic); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// RunProviders makes the late providers available (OIDC discovery with retries, §5.4) and calls
+// MethodsChanged each time one becomes available. It returns when every one is done or ctx ends.
+func (s *Service) RunProviders(ctx context.Context) {
+	var wg sync.WaitGroup
+	for _, p := range s.providers {
+		if d, ok := p.(providers.Dynamic); ok {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				d.Run(ctx, func() {
+					if s.MethodsChanged != nil {
+						s.MethodsChanged()
+					}
+				})
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+// provider returns the enabled and available provider with this id.
+func (s *Service) provider(id string) (providers.Provider, bool) {
+	p, ok := s.providerBy[id]
+	if !ok || !providers.IsAvailable(p) {
+		return nil, false
+	}
+	return p, true
 }
 
 // Register adds the auth routes to mux.

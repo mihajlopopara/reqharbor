@@ -125,15 +125,15 @@ func (t *rtx) PersonalSpace(userID string) (*store.Personal, error) {
 }
 
 const authRequestCols = `id, browser_hash, client_id, redirect_uri, code_challenge, client_state, device_name, method_hint,
-	grant_token_hash, provider, upstream_verifier, password_attempts, code_attempts, user_id, code_hash, code_expires_at, created_at, expires_at, consumed_at, ticket_hash,
+	grant_token_hash, provider, upstream_verifier, upstream_nonce, password_attempts, code_attempts, user_id, code_hash, code_expires_at, created_at, expires_at, consumed_at, ticket_hash,
 	pending_email, pending_name, pending_phc, email_code_hash, email_code_expires_at, email_code_attempts, email_codes_sent`
 
 func scanAuthRequest(r scanner) (*store.AuthRequest, error) {
 	var a store.AuthRequest
-	var hint, grant, provider, verifier, user, code, ticket, pEmail, pName, pPHC, eCode sql.NullString
+	var hint, grant, provider, verifier, nonce, user, code, ticket, pEmail, pName, pPHC, eCode sql.NullString
 	var codeExp, consumed, eCodeExp sql.NullInt64
 	err := r.Scan(&a.ID, &a.BrowserHash, &a.ClientID, &a.RedirectURI, &a.CodeChallenge, &a.ClientState, &a.DeviceName, &hint,
-		&grant, &provider, &verifier, &a.PasswordAttempts, &a.CodeAttempts, &user, &code, &codeExp, &a.CreatedAt, &a.ExpiresAt, &consumed, &ticket,
+		&grant, &provider, &verifier, &nonce, &a.PasswordAttempts, &a.CodeAttempts, &user, &code, &codeExp, &a.CreatedAt, &a.ExpiresAt, &consumed, &ticket,
 		&pEmail, &pName, &pPHC, &eCode, &eCodeExp, &a.EmailCodeAttempts, &a.EmailCodesSent)
 	if err != nil {
 		return nil, notFound(err)
@@ -141,7 +141,7 @@ func scanAuthRequest(r scanner) (*store.AuthRequest, error) {
 	a.PendingEmail, a.PendingName, a.PendingPHC, a.EmailCodeHash = nullStr(&pEmail), nullStr(&pName), nullStr(&pPHC), nullStr(&eCode)
 	a.EmailCodeExpiresAt = nullInt(&eCodeExp)
 	a.MethodHint, a.GrantTokenHash, a.Provider, a.UserID, a.CodeHash = nullStr(&hint), nullStr(&grant), nullStr(&provider), nullStr(&user), nullStr(&code)
-	a.UpstreamVerifier, a.TicketHash = nullStr(&verifier), nullStr(&ticket)
+	a.UpstreamVerifier, a.UpstreamNonce, a.TicketHash = nullStr(&verifier), nullStr(&nonce), nullStr(&ticket)
 	a.CodeExpiresAt, a.ConsumedAt = nullInt(&codeExp), nullInt(&consumed)
 	return &a, nil
 }
@@ -382,13 +382,17 @@ func (t *wtx) SetAuthRequestGrant(id, grantHash string) error {
 	return one(t.exec("UPDATE auth_requests SET grant_token_hash = ? WHERE id = ?", grantHash, id))
 }
 
-func (t *wtx) SetAuthRequestUpstream(id, provider, stateHash, verifier string) error {
-	return one(t.exec(`UPDATE auth_requests SET provider = ?, upstream_state_hash = ?, upstream_verifier = ?
-	     WHERE id = ? AND consumed_at IS NULL AND code_hash IS NULL`, provider, stateHash, verifier, id))
+func (t *wtx) SetAuthRequestUpstream(id, provider, stateHash, verifier, nonce string) error {
+	var n any
+	if nonce != "" {
+		n = nonce
+	}
+	return one(t.exec(`UPDATE auth_requests SET provider = ?, upstream_state_hash = ?, upstream_verifier = ?, upstream_nonce = ?
+	     WHERE id = ? AND consumed_at IS NULL AND code_hash IS NULL`, provider, stateHash, verifier, n, id))
 }
 
 func (t *wtx) ClearAuthRequestUpstream(id string) error {
-	_, err := t.exec("UPDATE auth_requests SET upstream_state_hash = NULL, upstream_verifier = NULL WHERE id = ?", id)
+	_, err := t.exec("UPDATE auth_requests SET upstream_state_hash = NULL, upstream_verifier = NULL, upstream_nonce = NULL WHERE id = ?", id)
 	return err
 }
 

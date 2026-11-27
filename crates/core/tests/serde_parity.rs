@@ -38,8 +38,8 @@ struct Case {
 fn fixture() -> Fixture {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../server/internal/jsonx/testdata/serde_parity.json");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&text).expect("fixture is valid JSON")
 }
 
@@ -59,14 +59,19 @@ fn accepted_outputs_parse_as_the_clients_pull_page() {
             .output
             .as_deref()
             .unwrap_or_else(|| panic!("{}: accepted without output", c.name));
-        let page: PullPage = serde_json::from_str(&pull_page(output))
-            .unwrap_or_else(|e| panic!("{}: pull page with {output:?} does not parse: {e}", c.name));
+        let page: PullPage = serde_json::from_str(&pull_page(output)).unwrap_or_else(|e| {
+            panic!("{}: pull page with {output:?} does not parse: {e}", c.name)
+        });
         assert_eq!(page.changes.len(), 1, "{}", c.name);
         assert_eq!(page.cursor, 1, "{}", c.name);
         // The canonical output is the same value as the input the client pushed.
         let out: Value = serde_json::from_str(output).expect("output parses");
-        let input: Value = serde_json::from_str(&c.input)
-            .unwrap_or_else(|e| panic!("{}: serde_json refuses an input the server accepts: {e}", c.name));
+        let input: Value = serde_json::from_str(&c.input).unwrap_or_else(|e| {
+            panic!(
+                "{}: serde_json refuses an input the server accepts: {e}",
+                c.name
+            )
+        });
         assert_eq!(page.changes[0].data.as_ref(), Some(&out), "{}", c.name);
         assert_eq!(out, input, "{}: canonicalisation changed the value", c.name);
         checked += 1;
@@ -116,6 +121,9 @@ fn fixture_covers_the_designs_edge_list() {
         "depth 100",
         "depth 101",
     ] {
-        assert!(f.cases.iter().any(|c| c.name == name), "missing case {name}");
+        assert!(
+            f.cases.iter().any(|c| c.name == name),
+            "missing case {name}"
+        );
     }
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -227,4 +228,51 @@ func TestRun_StartsTheMailSenderAndScheduledBackups(t *testing.T) {
 	if m := relay.Wait(t, 1)[0]; m.Body != "from serve\n" || m.TLS {
 		t.Fatalf("%+v", m)
 	}
+}
+
+// serve starts OIDC discovery at once, before the migrations finish, and lists the provider once
+// discovery succeeded (a loopback IdP may use http, §5.4).
+func TestRun_OIDCDiscoveryStartsWithServe(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	var idp *httptest.Server
+	idp = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/dex/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		select {
+		case hit <- struct{}{}:
+		default:
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": idp.URL + "/dex", "authorization_endpoint": idp.URL + "/dex/auth",
+			"token_endpoint": idp.URL + "/dex/token", "jwks_uri": idp.URL + "/dex/keys"})
+	}))
+	defer idp.Close()
+	release := make(chan struct{})
+	r := startRunWith(t, t.TempDir(), []string{"REQHARBOR_OIDC_ISSUER=" + idp.URL + "/dex", "REQHARBOR_OIDC_CLIENT_ID=rh",
+		"REQHARBOR_OIDC_CLIENT_SECRET=s", "REQHARBOR_OIDC_NAME=Dex"}, app.RunOptions{BeforeMigrate: func(ctx context.Context) {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	}})
+	select {
+	case <-hit: // discovery ran while the migrations were still blocked
+	case <-time.After(10 * time.Second):
+		t.Fatal("no discovery request")
+	}
+	close(release)
+	waitFor(t, "oidc listed", func() bool {
+		status, body, _ := get(t, r.base+"/v1/server")
+		if status != 200 {
+			return false
+		}
+		methods, _ := body["auth"].(map[string]any)["methods"].([]any)
+		for _, m := range methods {
+			if mm := m.(map[string]any); mm["id"] == "oidc" && mm["label"] == "Dex" {
+				return true
+			}
+		}
+		return false
+	})
 }

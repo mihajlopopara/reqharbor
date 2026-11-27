@@ -84,6 +84,10 @@ func UserByEmail(tx store.ReadTx, email string) (*store.User, error) {
 	return u, err
 }
 
+// MethodLabelOIDC is MethodLabel's name for the generic OIDC provider; the pages show
+// REQHARBOR_OIDC_NAME instead.
+const MethodLabelOIDC = "single sign-on"
+
 // MethodLabel names how an account signs in, for CLI messages ("Email and password", "GitHub").
 func MethodLabel(tx store.ReadTx, userID string) (string, error) {
 	id, err := tx.IdentityOf(userID)
@@ -99,7 +103,7 @@ func MethodLabel(tx store.ReadTx, userID string) (string, error) {
 	case "google":
 		return "Google", nil
 	case "oidc":
-		return "single sign-on", nil
+		return MethodLabelOIDC, nil
 	case "dev":
 		return "Dev sign-in", nil
 	}

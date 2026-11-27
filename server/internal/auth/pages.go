@@ -132,8 +132,10 @@ var (
 
 // Messages shown in forms.
 const (
-	msgBadLogin       = "Email or password is incorrect."
-	msgInviteInvalid  = "That code isn't valid. Check it, or ask your server admin for a new one."
+	msgBadLogin      = "Email or password is incorrect."
+	msgInviteInvalid = "That code isn't valid. Check it, or ask your server admin for a new one."
+	// msgInviteEmail: an email-bound invite needs an email this server has confirmed.
+	msgInviteEmail    = "This invite is for one email address, and this sign-in can't confirm that you own it. Ask your server admin for an invite without an email."
 	msgInviteRequired = "Enter the invite code your server admin gave you."
 	msgEmailInUse     = "An account with this email already exists. Sign in, or ask your server admin."
 	msgSetupRequired  = "This server hasn't been set up yet. Enter the setup code from the server log first."

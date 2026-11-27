@@ -45,7 +45,8 @@ type Harness struct {
 	// SMTP is the fake relay of WithSMTP, or nil.
 	SMTP *SMTPServer
 
-	noMail bool
+	noMail  bool
+	started []func(*Harness)
 
 	logger     *slog.Logger
 	httpClient *http.Client
@@ -60,6 +61,7 @@ type options struct {
 	wrap    func(store.Store) store.Store
 	smtp    *SMTPServer
 	noMail  bool
+	started []func(*Harness)
 }
 
 // Option customises New.
@@ -150,7 +152,7 @@ func New(t testing.TB, opts ...Option) *Harness {
 	logs := &Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	clk := clock.NewFake(time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC))
-	h := &Harness{Clock: clk, Config: cfg, Logs: logs, logger: logger, httpClient: o.client, SMTP: o.smtp, noMail: o.noMail}
+	h := &Harness{Clock: clk, Config: cfg, Logs: logs, logger: logger, httpClient: o.client, SMTP: o.smtp, noMail: o.noMail, started: o.started}
 
 	st := o.store
 	if st == nil {
@@ -183,7 +185,57 @@ func New(t testing.TB, opts ...Option) *Harness {
 	t.Cleanup(h.Server.Close)
 	h.URL = h.Server.URL
 	h.Client = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, f := range h.started {
+		f(h)
+	}
+	h.runProviders(t)
 	return h
+}
+
+// whenStarted runs f once the harness is up (before the late providers start), with the harness:
+// fakes use it to share its clock.
+func whenStarted(f func(*Harness)) Option {
+	return func(o *options) { o.started = append(o.started, f) }
+}
+
+// runProviders runs the App's late providers (OIDC discovery, which serve starts at once) until
+// the test ends.
+func (h *Harness) runProviders(t testing.TB) {
+	if !h.App.Auth.HasDynamicProviders() {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); h.App.RunProviders(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+}
+
+// WaitMethod waits until /v1/server lists the sign-in method id (a late provider such as OIDC).
+func (h *Harness) WaitMethod(t testing.TB, id string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if h.HasMethod(t, id) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("method %s never listed; logs:\n%s", id, h.Logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// HasMethod reports whether /v1/server lists the sign-in method id.
+func (h *Harness) HasMethod(t testing.TB, id string) bool {
+	t.Helper()
+	auth, _ := h.Call(t, "/v1/server", Req{}).JSON(t)["auth"].(map[string]any)
+	methods, _ := auth["methods"].([]any)
+	for _, m := range methods {
+		if mm, _ := m.(map[string]any); mm["id"] == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Restart stops the server and starts a new process-equivalent on the same data directory: a new
@@ -211,6 +263,7 @@ func (h *Harness) Restart(t testing.TB) {
 	h.Server = httptest.NewServer(h.App.Handler())
 	t.Cleanup(h.Server.Close)
 	h.URL = h.Server.URL
+	h.runProviders(t)
 }
 
 // WithoutMailSender leaves the App's email sender stopped, so a test can look at what a request

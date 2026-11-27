@@ -16,6 +16,7 @@ import (
 const inviteUsage = `usage: reqharbor-server invite <command> [flags]
 
   create [--email E] [--uses 1] [--ttl 168h]   prints a code XXXX-XXXX-XXXX-XXXX
+                                               (--email: only for a sign-in that confirms E)
   list
   revoke ID
 `
