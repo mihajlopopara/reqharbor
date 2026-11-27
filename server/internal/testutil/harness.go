@@ -40,6 +40,10 @@ type Harness struct {
 	Config *config.Config
 	Logs   *Buffer
 	Client *http.Client
+	// ClientVersion, when set, is sent as X-ReqHarbor-Version by the token helpers.
+	ClientVersion string
+
+	logger *slog.Logger
 }
 
 type options struct {
@@ -87,6 +91,7 @@ func DefaultEnv(dataDir string) []string {
 		"REQHARBOR_TRUSTED_PROXIES=127.0.0.1/32",
 		"REQHARBOR_CLIENT_IP_HEADER=CF-Connecting-IP",
 		"REQHARBOR_MIN_FREE_DISK_BYTES=0",
+		"REQHARBOR_ARGON2_MEMORY_KIB=8192", // the minimum: keeps password tests fast
 	}
 }
 
@@ -112,7 +117,7 @@ func New(t testing.TB, opts ...Option) *Harness {
 	logs := &Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	clk := clock.NewFake(time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC))
-	h := &Harness{Clock: clk, Config: cfg, Logs: logs}
+	h := &Harness{Clock: clk, Config: cfg, Logs: logs, logger: logger}
 
 	st := o.store
 	if st == nil {
@@ -142,6 +147,31 @@ func New(t testing.TB, opts ...Option) *Harness {
 	h.URL = h.Server.URL
 	h.Client = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	return h
+}
+
+// Restart stops the server and starts a new process-equivalent on the same data directory: a new
+// App (fresh in-memory limiters and throttle counters) over a reopened database. The URL changes.
+func (h *Harness) Restart(t testing.TB) {
+	t.Helper()
+	if h.DB == nil {
+		t.Fatal("Restart needs a real database")
+	}
+	h.Server.Close()
+	h.DB.Close()
+	d, err := db.Open(h.Config.DataDir, db.Options{Lock: true})
+	if err != nil {
+		t.Fatalf("reopen db: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	h.DB = d
+	h.Store = sqlite.New(d)
+	h.App = app.New(app.Deps{Config: h.Config, Clock: h.Clock, Store: h.Store, Logger: h.logger, Version: app.DefaultVersion, DB: d})
+	if err := h.App.Init(context.Background()); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	h.Server = httptest.NewServer(h.App.Handler())
+	t.Cleanup(h.Server.Close)
+	h.URL = h.Server.URL
 }
 
 // Req describes one call.

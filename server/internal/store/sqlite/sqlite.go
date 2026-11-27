@@ -81,7 +81,7 @@ func scanWorkspace(r *sql.Row) (*store.Workspace, error) {
 }
 
 func (t *rtx) WorkspaceByTokenHash(hash string) (*store.Workspace, error) {
-	return scanWorkspace(t.row("SELECT id, name, token_hash, rev, created_at FROM workspaces WHERE token_hash = ?", hash))
+	return scanWorkspace(t.row("SELECT id, name, token_hash, rev, created_at FROM workspaces WHERE token_hash = ? AND team_id IS NULL", hash))
 }
 
 func (t *rtx) Workspace(id string) (*store.Workspace, error) {
@@ -97,8 +97,9 @@ func (t *rtx) WorkspaceUsage(id string) (int64, error) {
 
 func (t *rtx) LegacyTotalBytes() (int64, error) {
 	var used int64
-	err := t.row(`SELECT (SELECT COALESCE(SUM(size), 0) FROM entities)
-	                   + (SELECT COALESCE(SUM(size), 0) FROM shares WHERE revoked_at IS NULL)`).Scan(&used)
+	err := t.row(`SELECT (SELECT COALESCE(SUM(e.size), 0) FROM entities e JOIN workspaces w ON w.id = e.workspace_id WHERE w.team_id IS NULL)
+	                   + (SELECT COALESCE(SUM(s.size), 0) FROM shares s JOIN workspaces w ON w.id = s.workspace_id
+	                      WHERE w.team_id IS NULL AND s.revoked_at IS NULL)`).Scan(&used)
 	return used, err
 }
 
@@ -167,8 +168,10 @@ func (t *rtx) ActiveShares(workspaceID string) ([]store.ShareListItem, error) {
 		if err := rows.Scan(&it.ID, &it.Kind, &it.EntityID, &it.CreatedAt, &it.UpdatedAt, &name); err != nil {
 			return nil, err
 		}
-		// json_extract returns TEXT only for JSON strings; numbers, booleans and objects are
-		// not names (the Worker checks typeof name === "string").
+		// The Worker returns the name only when typeof name === "string". json_extract gives TEXT
+		// for a JSON string and also for an object or array (its JSON text, as D1 does, so such
+		// a name is returned as that text, exactly like the Worker); numbers and booleans come
+		// back as INTEGER or REAL and are dropped, and null or a missing name is NULL.
 		if s, ok := name.(string); ok {
 			it.Name = &s
 		}

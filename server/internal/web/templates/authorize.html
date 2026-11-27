@@ -1,0 +1,16 @@
+{{- /* GET /auth/authorize and the login form after a failed attempt (§5.2, §5.5, §5.9). */ -}}
+{{define "content"}}<h1>Sign in to {{.ServerName}}</h1>
+<p class="meta">{{if .Device}}On {{.Device}}, started {{.Started}}.{{else}}Started {{.Started}}.{{end}} Only continue if you just clicked Sign in in ReqHarbor.</p>
+{{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+{{if .PasswordAuth}}<form method="post" action="/auth/password/login"{{if .PoW}} data-challenge="{{.PoW.Challenge}}" data-difficulty="{{.PoW.Difficulty}}"{{end}}>
+<input type="hidden" name="ar" value="{{.AR}}">
+{{if .PoW}}<input type="hidden" name="pow" value="">
+<div class="notice" id="pow-status" role="status">Your browser is checking this sign-in. This takes a few seconds.</div>
+<noscript><div class="error">Enable JavaScript to continue signing in.</div></noscript>{{end}}
+<label>Email<input type="email" name="email" autocomplete="username" required maxlength="254" value="{{.Email}}"{{if .FocusPassword}} autofocus{{end}}></label>
+<label>Password<input type="password" name="password" autocomplete="current-password" required maxlength="1024"></label>
+<button type="submit">Sign in</button>
+</form>
+<div class="links">{{if .SignupLink}}<a href="/auth/signup?ar={{.AR}}">Create an account</a>{{end}}<a href="/auth/forgot">Forgot password?</a></div>
+{{else}}<p>This server has no sign-in method turned on. Ask its admin.</p>{{end}}
+{{end}}

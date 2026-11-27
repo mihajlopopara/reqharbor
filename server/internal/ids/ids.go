@@ -93,3 +93,27 @@ func Code(groups int) string {
 	}
 	return strings.Join(parts, "-")
 }
+
+// NormalizeCode canonicalises a setup or invite code as typed: spaces and dashes are dropped,
+// letters are uppercased and the Crockford look-alikes I, L and O read as 1, 1 and 0.
+func NormalizeCode(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToUpper(s) {
+		switch {
+		case r == ' ' || r == '-' || r == '\t':
+		case r == 'I' || r == 'L':
+			b.WriteByte('1')
+		case r == 'O':
+			b.WriteByte('0')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// IsCrockford reports whether s is non-empty and only Crockford base32 characters (upper case,
+// as NormalizeCode returns them).
+func IsCrockford(s string) bool {
+	return s != "" && strings.Trim(s, crockford) == ""
+}

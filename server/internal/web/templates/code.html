@@ -1,0 +1,14 @@
+{{- /* Setup or invite code entry; POST /auth/code (§5.6). */ -}}
+{{define "content"}}{{if .Setup}}<h1>Finish setting up this server</h1>
+<p>Enter the setup code from the server log to create the first account. It becomes the server admin.</p>
+{{else}}<h1>Enter your invite code</h1>
+<p>{{.ServerName}} needs an invite code to create an account. Ask its admin for one.</p>{{end}}
+<p class="meta">{{if .Device}}On {{.Device}}, started {{.Started}}.{{else}}Started {{.Started}}.{{end}} Only continue if you just clicked Sign in in ReqHarbor.</p>
+{{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+<form method="post" action="/auth/code">
+<input type="hidden" name="ar" value="{{.AR}}">
+<label>{{if .Setup}}Setup code{{else}}Invite code{{end}}<input class="code" type="text" name="code" required maxlength="64" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" autofocus></label>
+<button type="submit">Continue</button>
+</form>
+{{if not .Setup}}<div class="links"><a href="/auth/authorize?{{.ResumeQuery}}">Back to sign in</a></div>{{end}}
+{{end}}

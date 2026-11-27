@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mihajlopopara/reqharbor/server/internal/ids"
 )
 
 // Legacy-workspace modes (REQHARBOR_LEGACY_WORKSPACES).
@@ -24,6 +26,10 @@ const (
 	LegacyExisting = "existing"
 	LegacyOpen     = "open"
 )
+
+// MinSetupCodeChars is the shortest REQHARBOR_SETUP_CODE accepted, counted after normalisation
+// (generated codes have 16).
+const MinSetupCodeChars = 12
 
 // Signup modes (REQHARBOR_SIGNUP).
 const (
@@ -252,11 +258,12 @@ func Parse(opts Options) (*Result, error) {
 	}
 
 	c.Listen = e.str("REQHARBOR_LISTEN", ":8080")
-	listenHost, _, err := net.SplitHostPort(c.Listen)
-	if err != nil {
+	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return nil, errorf("REQHARBOR_LISTEN must be host:port or :port, got %q", c.Listen)
 	}
-	loopback := IsLoopbackHost(listenHost)
+	// One definition of a loopback listener for both rules that depend on it: the PUBLIC_URL
+	// default here and the devauth guard below (an IP literal; "localhost:P" is not one).
+	loopback := IsLoopbackListen(c.Listen)
 
 	if raw := e.str("REQHARBOR_PUBLIC_URL", ""); raw != "" {
 		u, err := normaliseOrigin(raw)
@@ -308,6 +315,13 @@ func Parse(opts Options) (*Result, error) {
 	}
 	c.AdminEmail = strings.ToLower(e.str("REQHARBOR_ADMIN_EMAIL", ""))
 	c.SetupCode = e.str("REQHARBOR_SETUP_CODE", "")
+	if c.SetupCode != "" {
+		// The code must survive the pages' normalisation (a value such as "----" never could)
+		// and be long enough for an internet-facing first run.
+		if n := ids.NormalizeCode(c.SetupCode); len(n) < MinSetupCodeChars || !ids.IsCrockford(n) {
+			return nil, errorf("REQHARBOR_SETUP_CODE must be at least %d Crockford base32 characters (0-9 and A-Z without U; dashes and spaces are ignored), such as one printed by `reqharbor-server setup-code`", MinSetupCodeChars)
+		}
+	}
 	if c.PasswordAuth, err = e.boolean("REQHARBOR_PASSWORD_AUTH", true); err != nil {
 		return nil, err
 	}
@@ -469,7 +483,9 @@ func normaliseOrigin(raw string) (string, error) {
 	return scheme + "://" + host, nil
 }
 
-// IsLoopbackHost reports whether host (no port, brackets allowed) is a loopback IP literal.
+// IsLoopbackHost reports whether a host name (no port, brackets allowed) is loopback: a loopback
+// IP literal or "localhost". It judges hosts the server connects to or that users type (the SMTP
+// host, the PUBLIC_URL host). Listen addresses use IsLoopbackListen, which is stricter.
 func IsLoopbackHost(host string) bool {
 	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
 	if strings.EqualFold(host, "localhost") {
@@ -480,7 +496,8 @@ func IsLoopbackHost(host string) bool {
 }
 
 // IsLoopbackListen reports whether a listen address binds only to a loopback IP literal
-// (127.0.0.1:P or [::1]:P; ":8080" and "0.0.0.0:8080" are not).
+// (127.0.0.1:P or [::1]:P; ":8080", "0.0.0.0:8080" and "localhost:8080" are not: a name may
+// resolve to anything). It decides both the PUBLIC_URL default and the devauth guard.
 func IsLoopbackListen(listen string) bool {
 	host, _, err := net.SplitHostPort(listen)
 	if err != nil || host == "" {

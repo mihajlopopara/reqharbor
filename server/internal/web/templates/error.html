@@ -1,0 +1,5 @@
+{{- /* Every hosted-page error: email_in_use, signup_closed, server_user_limit, invite_invalid, setup_required, request_expired, wrong_origin, rate_limited, … */ -}}
+{{define "content"}}<h1>{{.Title}}</h1>
+<p>{{.Message}}</p>
+{{if .Hint}}<p class="meta">{{.Hint}}</p>{{end}}
+{{end}}

@@ -116,9 +116,14 @@ type Created struct {
 	UpdatedAt int64  `json:"updatedAt"`
 }
 
-// Create validates the body and stores a new share (order: kind, entityId, snapshot, quota,
-// breaker, insert).
-func (s *Service) Create(ctx context.Context, sc Scope, body *jsonx.Value) (*Created, error) {
+// Prepared is a validated share create body.
+type Prepared struct {
+	Kind, EntityID string
+	Snapshot       []byte
+}
+
+// Prepare validates a create body in the Worker's order: kind, entityId, then the snapshot.
+func (s *Service) Prepare(body *jsonx.Value) (*Prepared, error) {
 	kind, ok := body.Get("kind").Str()
 	if !ok || !isKind(kind) {
 		return nil, httpx.BadRequest("`kind` must be \"collection\" or \"request\"")
@@ -131,22 +136,37 @@ func (s *Service) Create(ctx context.Context, sc Scope, body *jsonx.Value) (*Cre
 	if err != nil {
 		return nil, err
 	}
-	size := int64(len(snap))
+	return &Prepared{Kind: kind, EntityID: entityID, Snapshot: snap}, nil
+}
+
+// Insert stores a prepared share after the quota and breaker checks.
+func (s *Service) Insert(ctx context.Context, sc Scope, p *Prepared) (*Created, error) {
+	size := int64(len(p.Snapshot))
 	id := ids.ShareID()
 	now := clock.Millis(s.Clock.Now())
-	err = s.Store.Write(ctx, func(tx store.WriteTx) error {
+	err := s.Store.Write(ctx, func(tx store.WriteTx) error {
 		if err := checkGrowth(tx, sc, size); err != nil {
 			return err
 		}
 		return tx.InsertShare(store.Share{
-			ID: id, WorkspaceID: sc.WorkspaceID, Kind: kind, EntityID: entityID,
-			Snapshot: snap, Size: size, CreatedAt: now, UpdatedAt: now,
+			ID: id, WorkspaceID: sc.WorkspaceID, Kind: p.Kind, EntityID: p.EntityID,
+			Snapshot: p.Snapshot, Size: size, CreatedAt: now, UpdatedAt: now,
 		})
 	})
 	if err != nil {
 		return nil, err
 	}
 	return &Created{ShareID: id, URL: s.URL(id), CreatedAt: now, UpdatedAt: now}, nil
+}
+
+// Create validates the body and stores a new share (order: kind, entityId, snapshot, quota,
+// breaker, insert).
+func (s *Service) Create(ctx context.Context, sc Scope, body *jsonx.Value) (*Created, error) {
+	p, err := s.Prepare(body)
+	if err != nil {
+		return nil, err
+	}
+	return s.Insert(ctx, sc, p)
 }
 
 func checkGrowth(tx store.WriteTx, sc Scope, delta int64) error {

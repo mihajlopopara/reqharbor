@@ -2,7 +2,9 @@
 package discovery
 
 import (
+	"context"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/mihajlopopara/reqharbor/server/internal/config"
@@ -68,9 +70,13 @@ type Limits struct {
 	JSONDepth     int `json:"jsonDepth"`
 }
 
-// Build returns the discovery document. In S1 (server-v0.1.0) there are no accounts: accounts is
-// false and the method list is empty, which clients treat as "token sync only".
-func Build(cfg *config.Config, version, instanceID, syncEpoch string) Info {
+// Build returns the discovery document. Since S4 accounts is true and methods lists the enabled
+// sign-in methods (server-v0.1.0 had accounts:false and no methods, which clients treat as
+// "token sync only"). setupRequired is true while no user exists.
+func Build(cfg *config.Config, version, instanceID, syncEpoch string, methods []Method, setupRequired bool) Info {
+	if methods == nil {
+		methods = []Method{}
+	}
 	var minClient *string
 	if cfg.MinClientVersion != "" {
 		v := cfg.MinClientVersion
@@ -86,12 +92,12 @@ func Build(cfg *config.Config, version, instanceID, syncEpoch string) Info {
 		PublicURL:        cfg.PublicURL,
 		MinClientVersion: minClient,
 		Auth: Auth{
-			Methods:       []Method{},
+			Methods:       methods,
 			Signup:        cfg.Signup,
-			PasswordReset: "admin",
-			SetupRequired: false,
+			PasswordReset: "admin", // "email" with SMTP (M3)
+			SetupRequired: setupRequired,
 		},
-		Features: Features{Accounts: false, Teams: false, LegacyWorkspaces: cfg.LegacyWorkspaces},
+		Features: Features{Accounts: true, Teams: false, LegacyWorkspaces: cfg.LegacyWorkspaces},
 		Sync:     Sync{Types: append([]string(nil), syncsvc.Types...), RequestKinds: []string{"http"}},
 		Limits: Limits{
 			EntityBytes:   syncsvc.EntityDataBytes,
@@ -103,8 +109,17 @@ func Build(cfg *config.Config, version, instanceID, syncEpoch string) Info {
 	}
 }
 
-// Handler serves the document built at startup; Set rebuilds it.
-type Handler struct{ body atomic.Pointer[[]byte] }
+// Handler serves the document built at startup; Set rebuilds it. While setupRequired is true,
+// each request asks UsersExist (an account may have been created by the pages or by the CLI in
+// another process) and rebuilds the document once one exists; it never goes back to true.
+type Handler struct {
+	body atomic.Pointer[[]byte]
+
+	mu         sync.Mutex
+	info       Info
+	setup      atomic.Bool
+	UsersExist func(ctx context.Context) bool
+}
 
 // Set replaces the served document.
 func (h *Handler) Set(info Info) error {
@@ -112,13 +127,39 @@ func (h *Handler) Set(info Info) error {
 	if err != nil {
 		return err
 	}
+	h.mu.Lock()
+	h.info = info
+	h.setup.Store(info.Auth.SetupRequired)
 	h.body.Store(&b)
+	h.mu.Unlock()
 	return nil
+}
+
+// SetupDone clears setupRequired (the first account exists).
+func (h *Handler) SetupDone() {
+	if !h.setup.Load() {
+		return
+	}
+	h.mu.Lock()
+	info := h.info
+	h.mu.Unlock()
+	info.Auth.SetupRequired = false
+	_ = h.Set(info)
+}
+
+// Current returns the served document.
+func (h *Handler) Current() Info {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.info
 }
 
 // Routes returns the GET-only route handler.
 func (h *Handler) Routes() http.Handler {
 	return httpx.Methods{{Name: "GET", Handler: httpx.Func(func(w http.ResponseWriter, r *http.Request) error {
+		if h.setup.Load() && h.UsersExist != nil && h.UsersExist(r.Context()) {
+			h.SetupDone()
+		}
 		b := h.body.Load()
 		if b == nil {
 			return httpx.NewError(503, "starting", "Server is starting; try again shortly").WithHeader("Retry-After", "5")

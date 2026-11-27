@@ -71,6 +71,7 @@ type ShareListItem struct {
 
 // ReadTx are the queries available in any transaction.
 type ReadTx interface {
+	AccountsReadTx
 	WorkspaceByTokenHash(hash string) (*Workspace, error)
 	Workspace(id string) (*Workspace, error)
 	// WorkspaceUsage is entity data plus active share snapshots, in bytes (QA-R1-024).
@@ -82,13 +83,14 @@ type ReadTx interface {
 	Share(id string) (*Share, error)
 	ActiveShares(workspaceID string) ([]ShareListItem, error)
 	ServerState(key string) (string, error)
-	// LegacyTotalBytes sums WorkspaceUsage over every legacy workspace.
+	// LegacyTotalBytes sums WorkspaceUsage over every legacy workspace (team_id IS NULL).
 	LegacyTotalBytes() (int64, error)
 }
 
 // WriteTx adds the writes.
 type WriteTx interface {
 	ReadTx
+	AccountsWriteTx
 	// LockWorkspace is a no-op on SQLite (the writer is serialised); Postgres would SELECT … FOR UPDATE.
 	LockWorkspace(id string) error
 	InsertWorkspace(w Workspace) error

@@ -96,6 +96,8 @@ func TestPublicURLRequiredUnlessListenerIsLoopback(t *testing.T) {
 	wantErr(t, "REQHARBOR_PUBLIC_URL is required")
 	wantErr(t, "REQHARBOR_PUBLIC_URL is required", "REQHARBOR_LISTEN=0.0.0.0:8080")
 	wantErr(t, "REQHARBOR_PUBLIC_URL is required", "REQHARBOR_LISTEN=:9000")
+	// The same loopback rule as the devauth guard: a name is not a loopback listener.
+	wantErr(t, "REQHARBOR_PUBLIC_URL is required", "REQHARBOR_LISTEN=localhost:8080")
 	for listen, want := range map[string]string{
 		"127.0.0.1:8080": "http://127.0.0.1:8080",
 		"[::1]:9000":     "http://[::1]:9000",
@@ -267,6 +269,24 @@ func TestLoopbackHelpers(t *testing.T) {
 	for in, want := range map[string]bool{"127.0.0.1:1": true, "[::1]:1": true, "127.9.9.9:1": true, ":8080": false, "0.0.0.0:1": false, "localhost:1": false, "10.0.0.1:1": false} {
 		if got := IsLoopbackListen(in); got != want {
 			t.Errorf("IsLoopbackListen(%q) = %v", in, got)
+		}
+	}
+	for in, want := range map[string]bool{"127.0.0.1": true, "[::1]": true, "::1": true, "localhost": true, "LOCALHOST": true, "10.0.0.1": false, "example.com": false, "": false} {
+		if got := IsLoopbackHost(in); got != want {
+			t.Errorf("IsLoopbackHost(%q) = %v", in, got)
+		}
+	}
+}
+
+// REQHARBOR_SETUP_CODE must be enterable on the pages (it survives NormalizeCode) and long enough.
+// (Only whitespace is trimmed to "" and means unset: a random code is generated.)
+func TestSetupCodeValidation(t *testing.T) {
+	for _, bad := range []string{"----", "- -", " - ", "1234", "K7Q4-ZX2P-8M3", "K7Q4-ZX2P-8M3U", "K7Q4_ZX2P_8M3D", "K7Q4-ZX2P-8M3D-1R6Ä"} {
+		wantErr(t, "REQHARBOR_SETUP_CODE must be at least 12 Crockford base32 characters", pub, "REQHARBOR_SETUP_CODE="+bad)
+	}
+	for _, good := range []string{"k7q4-zx2p-8m3d-1r6t", "K7Q4ZX2P8M3D", "k7q4 zx2p 8m3d", "ILO0-1234-5678"} {
+		if got := mustParse(t, pub, "REQHARBOR_SETUP_CODE="+good).Config.SetupCode; got != good {
+			t.Fatalf("SetupCode %q, want %q", got, good)
 		}
 	}
 }

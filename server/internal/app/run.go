@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mihajlopopara/reqharbor/server/internal/auth"
 	"github.com/mihajlopopara/reqharbor/server/internal/clock"
 	"github.com/mihajlopopara/reqharbor/server/internal/config"
 	"github.com/mihajlopopara/reqharbor/server/internal/db"
@@ -86,10 +87,15 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 			logger.Error("startup failed; the server stays unready (see /readyz)", "err", err.Error())
 			return
 		}
-		logger.Info("ready", "signup", cfg.Signup, "legacy_workspaces", cfg.LegacyWorkspaces, "methods", []string{}, "instance_id", a.InstanceID())
-		wg.Add(2)
+		var methods []string
+		for _, m := range auth.Methods(cfg) {
+			methods = append(methods, m.ID)
+		}
+		logger.Info("ready", "signup", cfg.Signup, "legacy_workspaces", cfg.LegacyWorkspaces, "methods", methods, "instance_id", a.InstanceID())
+		wg.Add(3)
 		go func() { defer wg.Done(); a.Breaker.Run(jobsCtx, jobs.SampleInterval) }()
 		go func() { defer wg.Done(); jobs.RunSweepers(jobsCtx, time.Minute, a.Sweepers()...) }()
+		go func() { defer wg.Done(); jobs.RunGC(jobsCtx, st, clk, jobs.GCInterval, logger) }()
 	}()
 
 	select {

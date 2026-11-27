@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -16,14 +17,42 @@ func (f Func) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// HandleError writes err: an *APIError as is, anything else as a logged 500.
+// HandleError writes err: an *APIError as is, anything else as a logged 500. When the handler
+// already started the response, nothing more can be sent: the error is only logged. A failure
+// caused by the client going away (its context is canceled) is logged at debug level, since it is
+// not a server fault and the response goes nowhere.
 func HandleError(w http.ResponseWriter, r *http.Request, err error) {
+	log := LoggerFrom(r.Context())
+	if started(w) {
+		log.Error("error after the response started", "err", err.Error())
+		return
+	}
 	if e, ok := AsAPIError(err); ok {
 		WriteError(w, e)
 		return
 	}
-	LoggerFrom(r.Context()).Error("unhandled error", "err", err.Error(), "req_id", RequestIDFrom(r.Context()))
+	if r.Context().Err() != nil && errors.Is(err, r.Context().Err()) {
+		log.Debug("request canceled by the client", "err", err.Error())
+		WriteError(w, Internal())
+		return
+	}
+	log.Error("unhandled error", "err", err.Error())
 	WriteError(w, Internal())
+}
+
+// started reports whether w (the security-header wrapper, possibly wrapped again) has already
+// written its header.
+func started(w http.ResponseWriter) bool {
+	for {
+		switch x := w.(type) {
+		case *headerWriter:
+			return x.wrote
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = x.Unwrap()
+		default:
+			return false
+		}
+	}
 }
 
 // Method is one entry of a Methods dispatch table.

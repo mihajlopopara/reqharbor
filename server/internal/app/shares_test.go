@@ -400,3 +400,24 @@ func TestShares_CreateIsLimitedPerWorkspace(t *testing.T) {
 	other := h.NewWorkspace(t, "")
 	createShare(t, h, other.Token, nil, "")
 }
+
+func TestShares_InvalidCreatesDoNotUseTheLimit(t *testing.T) {
+	h := tu.New(t, tu.WithEnv("REQHARBOR_RATE_SHARE_CREATE_PER_HOUR=2"))
+	ws := h.NewWorkspace(t, "")
+	for _, body := range []map[string]any{
+		{"kind": "folder", "entityId": "x", "snapshot": map[string]any{"schemaVersion": 1}},
+		{"kind": "request", "entityId": "bad id!", "snapshot": map[string]any{"schemaVersion": 1, "request": map[string]any{}}},
+		{"kind": "request", "entityId": "x", "snapshot": map[string]any{"schemaVersion": 0, "request": map[string]any{}}},
+		{"kind": "request", "entityId": "x"},
+	} {
+		if res := h.Call(t, "/v1/shares", tu.Req{Token: ws.Token, JSON: body}); res.StatusCode != 400 {
+			t.Fatalf("invalid create: %d %s", res.StatusCode, res.Body)
+		}
+	}
+	snap := map[string]any{"schemaVersion": 1, "request": map[string]any{"name": "r"}}
+	createShare(t, h, ws.Token, snap, "request")
+	createShare(t, h, ws.Token, snap, "request")
+	if res := h.Call(t, "/v1/shares", tu.Req{Token: ws.Token, JSON: map[string]any{"kind": "request", "entityId": "x", "snapshot": snap}}); res.StatusCode != 429 {
+		t.Fatalf("third valid create: %d", res.StatusCode)
+	}
+}

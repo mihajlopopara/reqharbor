@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -224,5 +225,40 @@ func TestQueryGet_URLSearchParamsSemantics(t *testing.T) {
 		if got := QueryGet(req, "since"); got != want {
 			t.Errorf("%q → %q, want %q", q, got, want)
 		}
+	}
+}
+
+func TestHandleError_AfterTheResponseStartedOnlyLogs(t *testing.T) {
+	var logs bytes.Buffer
+	mux := http.NewServeMux()
+	mux.Handle("/partial", Func(func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("half"))
+		return io.ErrUnexpectedEOF
+	}))
+	mux.Handle("/api", Func(func(w http.ResponseWriter, r *http.Request) error {
+		return NewError(409, "conflict", "Nope")
+	}))
+	mux.Handle("/canceled", Func(func(w http.ResponseWriter, r *http.Request) error {
+		return r.Context().Err()
+	}))
+	h := wrapped(mux, &logs, "")
+	rec := serve(t, h, httptest.NewRequest("GET", "/partial", nil))
+	if rec.Code != 200 || rec.Body.String() != "half" {
+		t.Fatalf("partial: %d %q", rec.Code, rec.Body)
+	}
+	if !strings.Contains(logs.String(), "error after the response started") {
+		t.Fatalf("not logged: %s", logs.String())
+	}
+	rec = serve(t, h, httptest.NewRequest("GET", "/api", nil))
+	if code, _ := errorOf(t, rec); rec.Code != 409 || code != "conflict" {
+		t.Fatalf("api error: %d %s", rec.Code, rec.Body)
+	}
+	logs.Reset()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	rec = serve(t, h, httptest.NewRequest("GET", "/canceled", nil).WithContext(ctx))
+	if rec.Code != 500 || strings.Contains(logs.String(), `"level":"ERROR"`) {
+		t.Fatalf("canceled: %d %s", rec.Code, logs.String())
 	}
 }

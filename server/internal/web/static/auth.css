@@ -1,0 +1,38 @@
+:root{--font-ui:-apple-system,BlinkMacSystemFont,"Segoe UI Variable Text","Segoe UI",system-ui,Ubuntu,Cantarell,"Noto Sans","Helvetica Neue",Arial,sans-serif;--font-mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,"Cascadia Mono",Consolas,"Liberation Mono","DejaVu Sans Mono",monospace;
+--fs-xs:10.5px;--fs-sm:11.5px;--fs-md:12.5px;--fs-lg:14px;--fs-xl:16px;--fs-code:12.5px;--lh-ui:18px;--lh-code:19px;
+--sp-1:2px;--sp-2:4px;--sp-3:6px;--sp-4:8px;--sp-5:12px;--sp-6:16px;--sp-7:20px;--sp-8:24px;--sp-9:32px;
+--r-xs:3px;--r-sm:4px;--r-md:6px;--h-control:28px;--h-control-lg:30px;--h-row-tree:26px;--h-row-kv:28px;--w-method-col:54px;--indent-tree:12px;--dur-fast:80ms;
+color-scheme:dark;--bg-pane:#15171b;--bg-sidebar:#1a1c21;--bg-input:#1f2228;--bg-hover:rgba(255,255,255,.045);--bg-active:rgba(255,255,255,.08);
+--border-subtle:#262a31;--border-strong:#3a404a;--text-1:#e4e7ec;--text-2:#aab1bd;--text-3:#8a929f;--text-on-accent:#fff;
+--accent:#2f6fdf;--accent-hover:#2a69d8;--accent-active:#2861c7;--accent-fg:#7cadff;--accent-soft:rgba(124,173,255,.14);--focus-ring:#7cadff;--warning:#e9b04f;--warning-soft:rgba(233,176,79,.14);
+--method-get:#5cc98a;--method-post:#e9b04f;--method-put:#6ea5ff;--method-patch:#b694ff;--method-delete:#ff7b72;--method-query:#2fc9c0;--method-head:#93a6c2;--method-options:#c3aa94;--method-custom:#a4a8ae;
+--var-fg:#79c0ff;--var-bg:rgba(121,192,255,.13)}
+@media (prefers-color-scheme:light){:root{color-scheme:light;--bg-pane:#fff;--bg-sidebar:#f6f7f9;--bg-input:#f1f3f6;--bg-hover:rgba(15,23,42,.045);--bg-active:rgba(15,23,42,.08);
+--border-subtle:#e4e7ec;--border-strong:#c9ced6;--text-1:#1a1d23;--text-2:#4a5260;--text-3:#626a78;
+--accent:#2563eb;--accent-hover:#1f56d6;--accent-active:#1a4abb;--accent-fg:#1d5bd6;--accent-soft:rgba(37,99,235,.1);--focus-ring:#2563eb;--warning:#9a5800;--warning-soft:rgba(154,88,0,.1);
+--method-get:#167246;--method-post:#9a5800;--method-put:#1f5fd1;--method-patch:#7339d0;--method-delete:#bd2f28;--method-query:#08746f;--method-head:#4a5f7d;--method-options:#75604c;--method-custom:#5c636e;
+--var-fg:#0b62c4;--var-bg:rgba(11,98,196,.1)}}
+@media (prefers-reduced-motion:reduce){:root{--dur-fast:0ms}}
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg-pane);color:var(--text-1);font:400 var(--fs-lg)/20px var(--font-ui);-webkit-font-smoothing:antialiased}
+:focus-visible{outline:2px solid var(--focus-ring);outline-offset:1px}
+svg.i{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+main{max-width:400px;margin:0 auto;padding:var(--sp-9) var(--sp-6)}
+.brand{display:flex;align-items:center;gap:var(--sp-3);color:var(--text-2);font-weight:600;margin-bottom:var(--sp-8)}
+h1{font-size:20px;line-height:26px;font-weight:600;margin:0 0 var(--sp-4)}
+p{margin:0 0 var(--sp-6)}
+.meta{color:var(--text-3);font-size:var(--fs-md);line-height:var(--lh-ui)}
+.banner{border:1px solid var(--warning);background:var(--warning-soft);color:var(--text-1);border-radius:var(--r-md);padding:var(--sp-4) var(--sp-5);margin-bottom:var(--sp-7);font-size:var(--fs-md)}
+.error{border:1px solid var(--method-delete);border-radius:var(--r-md);padding:var(--sp-4) var(--sp-5);margin-bottom:var(--sp-6);font-size:var(--fs-md)}
+.notice{border:1px solid var(--border-strong);background:var(--bg-sidebar);border-radius:var(--r-md);padding:var(--sp-4) var(--sp-5);margin-bottom:var(--sp-6);font-size:var(--fs-md)}
+form{display:flex;flex-direction:column;gap:var(--sp-5);margin:0 0 var(--sp-7)}
+label{display:flex;flex-direction:column;gap:var(--sp-2);color:var(--text-2);font-size:var(--fs-md)}
+input{height:34px;padding:0 var(--sp-5);border:1px solid var(--border-strong);border-radius:var(--r-md);background:var(--bg-input);color:var(--text-1);font:inherit}
+input.code{font-family:var(--font-mono);font-size:18px;letter-spacing:.08em;text-transform:uppercase}
+button,.button{display:inline-flex;align-items:center;justify-content:center;height:36px;padding:0 var(--sp-6);border:0;border-radius:var(--r-md);background:var(--accent);color:var(--text-on-accent);font:600 var(--fs-lg)/1 var(--font-ui);cursor:pointer;text-decoration:none}
+button:hover,.button:hover{background:var(--accent-hover)}
+button:disabled{opacity:.6;cursor:progress}
+.links{display:flex;flex-wrap:wrap;gap:var(--sp-6);font-size:var(--fs-md)}
+a{color:var(--accent-fg)}
+.ok{color:var(--method-get)}

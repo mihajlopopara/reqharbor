@@ -253,12 +253,18 @@ func (d *Deps) createShare(w http.ResponseWriter, r *http.Request, ws *store.Wor
 	if err != nil {
 		return err
 	}
+	// Validate first (kind, entityId, snapshot), so a malformed request never uses up the
+	// workspace's share-create budget; only then charge the limiter.
+	prepared, err := d.Shares.Prepare(body)
+	if err != nil {
+		return err
+	}
 	if d.ShareLimiter != nil {
 		if ok, retry := d.ShareLimiter.Allow("share_create:" + ws.ID); !ok {
 			return httpx.RateLimited("Too many shares created in this workspace; try again later", int64((retry+999_999_999)/1_000_000_000))
 		}
 	}
-	created, err := d.Shares.Create(r.Context(), d.scope(ws), body)
+	created, err := d.Shares.Insert(r.Context(), d.scope(ws), prepared)
 	if err != nil {
 		return err
 	}

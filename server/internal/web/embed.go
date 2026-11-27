@@ -48,3 +48,23 @@ var ShareCSP = strings.Join([]string{
 	"form-action 'none'",
 	"frame-ancestors 'none'",
 }, "; ")
+
+// The hosted sign-in pages' inline assets (06-go-server.md §5.3). Each page embeds them byte for
+// byte, so the hashes in AuthCSP match.
+var (
+	AuthCSS = mustRead("static/auth.css")
+	ResetJS = mustRead("static/reset.js")
+	PowJS   = mustRead("static/pow.js")
+)
+
+// AuthCSP is the Content-Security-Policy of every /auth/* page. form-action allows the loopback
+// redirect that follows a successful POST (browsers apply form-action to it).
+var AuthCSP = strings.Join([]string{
+	"default-src 'none'",
+	"style-src 'sha256-" + HashBase64(AuthCSS) + "'",
+	"script-src 'sha256-" + HashBase64(ResetJS) + "' 'sha256-" + HashBase64(PowJS) + "'",
+	"img-src data:",
+	"form-action 'self' http://127.0.0.1:*",
+	"frame-ancestors 'none'",
+	"base-uri 'none'",
+}, "; ")

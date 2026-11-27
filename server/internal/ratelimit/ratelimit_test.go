@@ -72,3 +72,26 @@ func TestLimiter_LimitOfOne(t *testing.T) {
 		t.Fatalf("second: %v %v", ok, retry)
 	}
 }
+
+func TestLimiter_CheckDoesNotRecord(t *testing.T) {
+	clk := clock.NewFake(time.Unix(1_800_000_000, 0))
+	l := New(clk, 2, time.Hour)
+	for range 5 {
+		if ok, _ := l.Check("a"); !ok {
+			t.Fatal("Check refused an unused key")
+		}
+	}
+	l.Allow("a")
+	l.Allow("a")
+	ok, retry := l.Check("a")
+	if ok || retry != 30*time.Minute {
+		t.Fatalf("Check after the budget: %v %v", ok, retry)
+	}
+	if ok, _ := l.Allow("a"); ok {
+		t.Fatal("Allow after the budget")
+	}
+	clk.Advance(30 * time.Minute)
+	if ok, _ := l.Check("a"); !ok {
+		t.Fatal("Check after the interval")
+	}
+}

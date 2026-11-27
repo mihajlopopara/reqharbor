@@ -1,0 +1,10 @@
+{{- /* Shell of every hosted /auth/* page (06-go-server.md §5.3). Style and scripts are inline and allowed by their CSP hashes. */ -}}
+{{define "layout"}}<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow"><meta name="color-scheme" content="dark light">
+<title>{{.Title}} · {{.ServerName}}</title>{{.Style}}</head>
+<body><main>
+<div class="brand">{{.Logo}}<span>ReqHarbor</span><span class="meta">{{.ServerName}}</span></div>
+{{if .Insecure}}<div class="banner" role="note">This server doesn't use HTTPS. Others on your network may see your password.</div>{{end}}
+{{template "content" .}}
+</main>{{.Script}}</body></html>{{end}}

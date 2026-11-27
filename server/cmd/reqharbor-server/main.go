@@ -20,6 +20,9 @@ const usage = `usage: reqharbor-server <command> [flags]
 commands:
   serve                     run the server (default)
   migrate [--status] [--to N]
+  user <list|create|set-password|reset-link|set-admin|disable|enable|unlock|sessions revoke> …
+  invite <create|list|revoke> …
+  setup-code                print a fresh first-run setup code (only while no account exists)
   healthcheck [--url URL]   exit 0 when /healthz answers 200 (Docker HEALTHCHECK)
   version
 `
@@ -39,6 +42,12 @@ func run(args, environ []string, stdout, stderr io.Writer) int {
 		return serve(args, environ, stdout, stderr)
 	case "migrate":
 		return migrate(args, environ, stdout, stderr)
+	case "user":
+		return user(args, environ, stdout, stderr)
+	case "invite":
+		return invite(args, environ, stdout, stderr)
+	case "setup-code":
+		return setupCode(args, environ, stdout, stderr)
 	case "healthcheck":
 		return healthcheck(args, environ, stderr)
 	case "version", "--version", "-v":

@@ -72,7 +72,7 @@ func TestMigrate_FreshDatabaseGoldenSchemas(t *testing.T) {
 		t.Fatal(err)
 	}
 	golden(t, "schema_v2.sql", schemaDump(t, d))
-	applied, err := d.Migrate(ctx, 0, time.Now)
+	applied, err := d.Migrate(ctx, 3, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +80,14 @@ func TestMigrate_FreshDatabaseGoldenSchemas(t *testing.T) {
 		t.Fatalf("applied %v", applied)
 	}
 	golden(t, "schema_v3.sql", schemaDump(t, d))
+	applied, err = d.Migrate(ctx, 0, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != 1 || applied[0].Version != 4 {
+		t.Fatalf("applied %v", applied)
+	}
+	golden(t, "schema_v4.sql", schemaDump(t, d))
 
 	var av int
 	if err := d.Writer.QueryRow("PRAGMA auto_vacuum").Scan(&av); err != nil || av != 2 {
@@ -98,7 +106,7 @@ func TestMigrate_FreshDatabaseGoldenSchemas(t *testing.T) {
 		t.Fatalf("re-run applied %v (%v)", again, err)
 	}
 	st, err := d.MigrationStatus(ctx)
-	if err != nil || st.Current != 3 || st.Latest != 3 || len(st.Pending) != 0 {
+	if err != nil || st.Current != 4 || st.Latest != 4 || len(st.Pending) != 0 {
 		t.Fatalf("status %+v %v", st, err)
 	}
 }
@@ -138,7 +146,7 @@ INSERT INTO rate_limits (key, window_start, count) VALUES ('k', 0, 1);`
 	if _, err := d.Migrate(ctx, 0, time.Now); err != nil {
 		t.Fatal(err)
 	}
-	for table, want := range map[string]int{"workspaces": 1, "entities": 2, "shares": 1, "server_state": 0} {
+	for table, want := range map[string]int{"workspaces": 1, "entities": 2, "shares": 1, "server_state": 0, "users": 0} {
 		var n int
 		if err := d.Writer.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&n); err != nil || n != want {
 			t.Fatalf("%s: %d rows (%v), want %d", table, n, err, want)
@@ -148,6 +156,27 @@ INSERT INTO rate_limits (key, window_start, count) VALUES ('k', 0, 1);`
 	if err := d.Writer.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name = 'rate_limits'").Scan(&n); err != nil || n != 0 {
 		t.Fatal("rate_limits not dropped")
 	}
+	// 0004 keeps legacy rows legacy: no team, the same token hash, updated_by '' and no share
+	// creator or options.
+	var team, by, created, opts *string
+	var hash string
+	if err := d.Writer.QueryRow("SELECT team_id, token_hash FROM workspaces WHERE id = 'W1'").Scan(&team, &hash); err != nil || team != nil || hash != "h1" {
+		t.Fatalf("workspace after 0004: team %v hash %q (%v)", team, hash, err)
+	}
+	if err := d.Writer.QueryRow("SELECT updated_by FROM entities WHERE id = 'r1'").Scan(&by); err != nil || by == nil || *by != "" {
+		t.Fatalf("updated_by %v (%v)", by, err)
+	}
+	if err := d.Writer.QueryRow("SELECT created_by, options FROM shares WHERE id = 'S1'").Scan(&created, &opts); err != nil || created != nil || opts != nil {
+		t.Fatalf("share after 0004: %v %v (%v)", created, opts, err)
+	}
+	rows, err := d.Writer.Query("PRAGMA foreign_key_check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows.Next() {
+		t.Fatal("foreign_key_check reported violations")
+	}
+	rows.Close()
 }
 
 func TestMigrate_DowngradeGuard(t *testing.T) {
@@ -165,7 +194,7 @@ func TestMigrate_DowngradeGuard(t *testing.T) {
 	d.Close()
 	_, err = Open(dir, Options{})
 	var tooNew *SchemaTooNewError
-	if !errors.As(err, &tooNew) || err.Error() != "database schema v99 is newer than this reqharbor-server (max v3); use a newer image" {
+	if !errors.As(err, &tooNew) || err.Error() != "database schema v99 is newer than this reqharbor-server (max v4); use a newer image" {
 		t.Fatalf("Open: %v", err)
 	}
 }

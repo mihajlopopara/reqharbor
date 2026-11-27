@@ -13,8 +13,11 @@ This release (0.1, phases S0 to S3 of `docs/plans/accounts/06-go-server.md`) ser
 - the public share page `GET /s/{id}` and `GET`/`OPTIONS /s/{id}.json`;
 - `GET /v1/server` (discovery), `/healthz` and `/readyz`.
 
-Accounts, sign-in and personal spaces come in 0.2. Until then, the desktop app syncs with a
-workspace token (Settings > Sync).
+The source tree is past 0.1: phase S4 adds **accounts** (email and password sign-in through hosted
+pages under `/auth/*`, the token endpoint `POST /v1/auth/token`, `POST /v1/auth/logout`, setup and
+invite codes, CLI reset links). Personal-space sync (`/v1/me*`, `/v1/spaces/*`) and GitHub sign-in
+follow before the 0.2 release; until then the desktop app syncs with a workspace token
+(Settings > Sync).
 
 ## Quick start
 
@@ -98,6 +101,34 @@ There are two ways to get this wrong. A trust list that is too wide lets clients
 rate-limit bucket by sending the header. A missing one puts every client in the proxy's single
 bucket. The server logs a one-time warning for each case: when an untrusted peer sends the header,
 and when all traffic arrives from one peer.
+
+## Accounts (from 0.2)
+
+- **First run.** While the server has no account, `serve` logs a setup code at each start:
+  `docker compose logs reqharbor | grep setup`. In the ReqHarbor app, sign in to your server and
+  enter the code; the account you create becomes the server admin. The code works only until the
+  first account exists. `reqharbor-server setup-code` prints a fresh one; `REQHARBOR_SETUP_CODE`
+  fixes it for automation (at least 12 characters of `0-9` and `A-Z` without `U`; dashes and
+  spaces are ignored). Or skip the pages and run
+  `reqharbor-server user create --email you@example.com --password-stdin` (the first CLI account
+  is always admin).
+- **Who may sign up** (`REQHARBOR_SIGNUP`): `invite` (default) needs a code from
+  `reqharbor-server invite create [--email E] [--uses N] [--ttl 168h]`; `open` lets anyone with
+  the address create an account; `closed` allows only the CLI. `REQHARBOR_MAX_USERS` (default 500)
+  caps the total.
+- **Passwords** are hashed with argon2id (`REQHARBOR_ARGON2_MEMORY_KIB`, default 64 MiB per hash,
+  at most four at once). Without SMTP there is no email reset: run
+  `reqharbor-server user reset-link --email E` and send the printed link privately (it works once,
+  for 24 hours, and signs the account out everywhere).
+- **Brute force.** Five wrong passwords for one email from one network throttle that pair, for 1,
+  2, 4, … up to 60 minutes; other networks are unaffected, so nobody can lock the owner out. After
+  20 failures for an email in an hour, the sign-in form asks the browser for a few seconds of
+  proof of work. `reqharbor-server user unlock --email E` clears both. The database keeps only
+  keyed hashes of (email, network) for 24 hours after the last failure.
+- **Other commands:** `user list`, `user set-admin --email E --on|--off`, `user disable|enable
+  --email E`, `user sessions revoke --email E`, `user set-password --email E --password-stdin`,
+  `invite list`, `invite revoke ID`. In the image: `docker compose exec reqharbor /reqharbor-server
+  user list`. They work while the server runs.
 
 ## Configuration
 

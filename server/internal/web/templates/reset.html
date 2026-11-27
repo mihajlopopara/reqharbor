@@ -1,0 +1,13 @@
+{{- /* /auth/reset#t=<token>: the token stays in the fragment; reset.js copies it into the form (§5.7). */ -}}
+{{define "content"}}{{if .Done}}<h1><span class="ok">✓</span> Password changed</h1>
+<p>Return to ReqHarbor and sign in.</p>
+{{else}}<h1>Choose a new password</h1>
+{{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+<noscript><div class="error">Enable JavaScript or ask your server admin for help.</div></noscript>
+<form method="post" action="/auth/reset">
+<input type="hidden" name="t" id="t" value="{{.Token}}">
+<label>New password<input type="password" name="password" autocomplete="new-password" required minlength="10" maxlength="256" autofocus></label>
+<p class="meta">At least 10 characters. Signing in again is needed on every device.</p>
+<button type="submit">Change password</button>
+</form>{{end}}
+{{end}}

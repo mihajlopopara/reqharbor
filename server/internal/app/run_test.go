@@ -123,7 +123,7 @@ func TestRun_PreMigrationBackupAndSingleInstanceLock(t *testing.T) {
 
 	r := startRun(t, dir, nil)
 	waitFor(t, "readyz", func() bool { c, _, _ := get(t, r.base+"/readyz"); return c == 200 })
-	matches, _ := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v2-v3-*.db"))
+	matches, _ := filepath.Glob(filepath.Join(dir, "backups", "pre-migrate-v2-v4-*.db"))
 	if len(matches) != 1 {
 		t.Fatalf("backups: %v", matches)
 	}
@@ -179,8 +179,9 @@ func TestDiscovery_V1Server(t *testing.T) {
 		"software": "reqharbor-server", "version": app.DefaultVersion, "apiVersion": 1,
 		"instanceId": h.App.InstanceID(), "syncEpoch": h.App.SyncEpoch(),
 		"name": "Acme ReqHarbor", "publicUrl": "https://reqharbor.test", "minClientVersion": nil,
-		"auth":     map[string]any{"methods": []any{}, "signup": "invite", "passwordReset": "admin", "setupRequired": false},
-		"features": map[string]any{"accounts": false, "teams": false, "legacyWorkspaces": "open"},
+		"auth": map[string]any{"methods": []any{map[string]any{"id": "password", "label": "Email and password"}},
+			"signup": "invite", "passwordReset": "admin", "setupRequired": true},
+		"features": map[string]any{"accounts": true, "teams": false, "legacyWorkspaces": "open"},
 		"sync":     map[string]any{"types": []any{"project", "collection", "folder", "request", "environment"}, "requestKinds": []any{"http"}},
 		"limits":   map[string]any{"entityBytes": 524288, "pushChanges": 500, "requestBytes": 5242880, "snapshotBytes": 1048576, "jsonDepth": 100},
 	})

@@ -64,6 +64,24 @@ func (l *Limiter) Allow(key string) (ok bool, retry time.Duration) {
 	return true, 0
 }
 
+// Check reports whether one more event for key would be allowed, without recording it. Callers
+// that count only failures (failed token exchanges) Check first and Allow on each failure.
+func (l *Limiter) Check(key string) (ok bool, retry time.Duration) {
+	k := sha256.Sum256([]byte(key))
+	s := &l.shards[maphash.Bytes(l.seed, k[:])%shards]
+	now := l.clock.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tat, found := s.tat[k]
+	if !found || tat.Before(now) {
+		return true, 0
+	}
+	if allowAt := tat.Add(-l.burst); now.Before(allowAt) {
+		return false, allowAt.Sub(now)
+	}
+	return true, 0
+}
+
 // Sweep drops keys whose window has fully drained.
 func (l *Limiter) Sweep() {
 	now := l.clock.Now()
