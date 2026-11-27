@@ -3,7 +3,7 @@
   import type { HistorySummary } from "../api/types";
   import { app } from "../stores/app.svelte";
   import { ui } from "../stores/ui.svelte";
-  import { historyGroup, methodClass, methodLabel, relativeTime, statusClass, stripScheme, ERROR_LABEL, formatMs } from "../util/format";
+  import { historyGroup, methodClass, methodLabel, relativeTime, statusClass, stripScheme, ERROR_LABEL, formatMs, formatDuration } from "../util/format";
   import { historyMatches } from "../util/highlight";
   import { call } from "../api";
   import VirtualList from "./VirtualList.svelte";
@@ -123,18 +123,20 @@
           }}
           onkeydown={() => {}}
         >
-          <span class="m {methodClass(h.method)}" title={h.method}><Hl text={methodLabel(h.method)} query={filter} /></span>
+          <span class="m {h.ws ? 'm-ws' : methodClass(h.method)}" title={h.ws ? (h.method === "SIO" ? "Socket.IO session" : "WebSocket session") : h.method}><Hl text={methodLabel(h.method)} query={filter} /></span>
           <span class="hurl"
             ><span class="host"><Hl text={hp.host} query={filter} /></span>{#if hp.path}<span class="path"><Hl text={hp.path} query={filter} /></span>{/if}</span
           >
           <span class="meta">
             <span>{relativeTime(h.timestamp, app.now)}</span>
-            {#if h.status !== null}
+            {#if h.ws}
+              <span class="code-chip ws-counts" title="{h.ws.sent} sent · {h.ws.received} received" data-testid="history-ws">↑{h.ws.sent} ↓{h.ws.received}</span>
+            {:else if h.status !== null}
               <span class="code-chip {statusClass(h.status)}" data-testid="history-status"><Hl text={String(h.status)} query={filter} /></span>
             {:else if h.errorKind}
               <span class="code-chip {h.errorKind === 'cancelled' ? 'scan' : 'serr'}">{ERROR_LABEL[h.errorKind]}</span>
             {/if}
-            {#if h.timeMs !== null}<span class="dur">{formatMs(h.timeMs)}</span>{/if}
+            {#if h.timeMs !== null}<span class="dur">{formatMs(h.timeMs)}</span>{:else if h.ws}<span class="dur">{formatDuration(h.ws.durationMs)}</span>{/if}
           </span>
           <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
           <span

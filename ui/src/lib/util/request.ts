@@ -95,7 +95,11 @@ export function isKnownAuth(a: Auth | null | undefined): boolean {
   return !a.apiKey || KNOWN_API_KEY_IN.includes(a.apiKey.in);
 }
 
-type ReadOnlyFields = Pick<Request, "kind" | "minClientVersion" | "body"> & { auth?: Auth };
+type ReadOnlyFields = Pick<Request, "kind" | "minClientVersion" | "body"> & { auth?: Auth; ws?: Request["ws"] };
+
+/** Request kinds this build edits and runs (AC-FWD-2, AC-WS-1). */
+export const EDITABLE_KINDS: readonly string[] = ["http", "ws"];
+const KNOWN_MESSAGE_KINDS = ["text", "json", "binary"];
 
 /**
  * Why a request is read-only here (AC-FWD-3/4), as the end of "This request needs a newer version
@@ -103,7 +107,10 @@ type ReadOnlyFields = Pick<Request, "kind" | "minClientVersion" | "body"> & { au
  */
 export function readOnlyReason(r: ReadOnlyFields, appVersion: string): string | null {
   const kind = r.kind ?? "http";
-  if (kind !== "http") return `This is a “${kind}” request`;
+  if (!EDITABLE_KINDS.includes(kind)) return `This is a “${kind}” request`;
+  const msg = (r.ws?.messages ?? []).find((m) => !KNOWN_MESSAGE_KINDS.includes(m.kind));
+  if (msg) return `Its saved message “${msg.name}” is of kind “${msg.kind}”`;
+  if (r.ws?.socketIo && r.ws.socketIo.version !== 4) return `It uses Socket.IO version ${r.ws.socketIo.version}`;
   if (!(KNOWN_BODY_TYPES as readonly string[]).includes(r.body.type)) return `Its body is “${r.body.type}”`;
   const field = (r.body.form ?? []).find((f) => !KNOWN_FORM_KINDS.includes(f.kind));
   if (field) return `Its form field “${field.key}” is of kind “${field.kind}”`;

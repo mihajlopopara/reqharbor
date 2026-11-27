@@ -18,13 +18,15 @@ import {
   type ProjectTree,
   type Request,
   type ResponseMeta,
+  type SavedMessage,
+  type WsSessionSummary,
   type SendError,
   type Settings,
   type SyncStatus,
   type VariableInfo,
 } from "../api";
 import { copyText } from "../api/platform";
-import { indexTree, ancestorsOf, type TreeIndex } from "../util/tree";
+import { indexTree, ancestorsOf, requestsInSubtree, type TreeIndex } from "../util/tree";
 import { makeLookup, setDynamicCatalogue } from "../util/vars";
 import { isContainerReadOnly, isReadOnlyNewer, looksLikeCurl, NEEDS_NEWER_VERSION, requestFingerprint, scratchRequest } from "../util/request";
 import { ulid } from "../util/ulid";
@@ -33,6 +35,8 @@ import { prettyJson } from "../util/json";
 import { RESTORED_NOTICE } from "../util/format";
 import { toasts } from "./toasts.svelte";
 import { ui } from "./ui.svelte";
+import { ws } from "./ws.svelte";
+import { messageError, switchKind } from "../util/ws";
 
 export const BODY_LIMIT = 5 * 1024 * 1024;
 
@@ -55,6 +59,8 @@ export interface ResponseView {
   body: Uint8Array | null;
   bodyLimited: boolean;
   bodyError: string | null;
+  /** A WebSocket session restored from history (AC-WS-7). */
+  wsSummary?: WsSessionSummary | null;
 }
 
 export const DEFAULT_AUTH: AuthStatus = {
@@ -182,6 +188,7 @@ class AppStore {
 
   // ───────────── bootstrap ─────────────
   async init(): Promise<void> {
+    ws.onEnded = () => void this.loadHistory();
     try {
       // QA-R2-007: subscribe before the startup load so an early pull isn't missed.
       await listen("sync://status", (s) => this.onSyncStatus(s));
@@ -254,9 +261,25 @@ class AppStore {
     }
   }
 
+  /**
+   * WebSocket sessions of requests that no longer exist (deleted here, by a sync pull, or with their
+   * project or space) are closed and forgotten. The open request keeps its session: deleted
+   * underneath us it becomes a scratch request that is still on screen.
+   */
+  pruneWsSessions(t: ProjectTree | null = null) {
+    const projects = new Set(this.projects.map((p) => p.id));
+    const requests = t ? new Set(t.requests.map((r) => r.id)) : null;
+    void ws.prune((s) => {
+      if (s.requestId === this.request.id) return true;
+      if (s.projectId && !projects.has(s.projectId)) return false;
+      return !(t && requests && s.saved && s.projectId === t.project.id && !requests.has(s.requestId));
+    });
+  }
+
   async reloadAll() {
     void this.loadLocations();
     this.projects = await call("list_projects", {});
+    this.pruneWsSessions();
     if (!this.projects.some((p) => p.id === this.activeProjectId)) this.activeProjectId = this.projects[0]?.id ?? null;
     this.environments = await call("list_environments", {});
     await Promise.all([this.loadTree(), this.loadVariables()]);
@@ -270,6 +293,7 @@ class AppStore {
   setTree(t: ProjectTree) {
     if (t.project.id !== this.activeProjectId) return;
     this.tree = t;
+    this.pruneWsSessions(t);
     this.projects = this.projects.map((p) => (p.id === t.project.id ? t.project : p));
     /** Unsaved edits of requests that a newer ReqHarbor changed underneath us (AC-FWD-3). */
     const lost: { draft: Request; saved: Request }[] = [];
@@ -594,6 +618,7 @@ class AppStore {
       await this.loadTree();
       const prevId = this.request.id;
       if (this.responses[prevId]) this.responses = { ...this.responses, [created.id]: { ...this.responses[prevId], requestId: created.id } };
+      ws.rekey(prevId, created.id);
       this.openRequest(created.id, { reveal: true });
       toasts.success(`Saved to ${this.index?.collectionById.get(collectionId)?.name ?? "collection"}`);
     } catch (e) {
@@ -604,11 +629,14 @@ class AppStore {
   // ───────────── send ─────────────
   async sendOrCancel() {
     if (this.middle.kind !== "request") return;
+    // ⌘Enter on a WebSocket request: send the composed message when open, else connect.
+    if (this.request.kind === "ws") return ws.session(this.request.id)?.state === "open" ? this.wsSendDraft() : this.wsConnectOrDisconnect();
     if (this.currentInflight) return this.cancel();
     return this.send();
   }
 
   async send() {
+    if (this.request.kind === "ws") return this.wsConnect();
     const req = $state.snapshot(this.request) as Request;
     if (this.readOnly) {
       this.sendBlocked = NEEDS_NEWER_VERSION;
@@ -669,6 +697,79 @@ class AppStore {
     }
   }
 
+  // ───────────── WebSocket (AC-WS-*) ─────────────
+
+  /** Method dropdown: switch the open request between HTTP (with `method`), WebSocket and Socket.IO. */
+  setKind(target: "http" | "ws" | "sio", method = "GET") {
+    if (this.readOnly) return;
+    if (target === "http" && ws.isLive(this.request.id)) void ws.disconnect(this.request.id);
+    switchKind(this.request, target, method);
+    this.sendBlocked = null;
+  }
+
+  /** Request bar button: Connect when closed, Disconnect (or stop connecting) when live. */
+  async wsConnectOrDisconnect() {
+    if (ws.isLive(this.request.id)) return ws.disconnect(this.request.id);
+    return this.wsConnect();
+  }
+
+  async wsConnect() {
+    const req = $state.snapshot(this.request) as Request;
+    if (this.readOnly) {
+      this.sendBlocked = NEEDS_NEWER_VERSION;
+      return;
+    }
+    if (!req.url.trim()) {
+      this.sendBlocked = "Enter a URL";
+      return;
+    }
+    this.sendBlocked = null;
+    try {
+      await ws.connect(req, this.activeProjectId);
+    } catch (e) {
+      const err = toCommandError(e);
+      if (err.code === "read_only_newer") this.sendBlocked = NEEDS_NEWER_VERSION;
+      else if (err.code === "validation") {
+        const d = err.details as { kind?: string } | undefined;
+        this.sendBlocked = d?.kind === "emptyUrl" ? "Enter a URL" : err.message;
+      } else this.reportError(err);
+    }
+  }
+
+  /** Send the composer's message on the open connection. */
+  async wsSendDraft() {
+    const r = this.request;
+    const msg = $state.snapshot(ws.draftOf(r)) as SavedMessage;
+    return this.wsSend(msg);
+  }
+
+  async wsSend(msg: SavedMessage): Promise<boolean> {
+    const r = this.request;
+    const sio = !!r.ws?.socketIo;
+    const problem = messageError(msg, sio);
+    if (problem) {
+      toasts.error(problem);
+      return false;
+    }
+    try {
+      await ws.send(r.id, msg);
+      return true;
+    } catch (e) {
+      this.reportError(e);
+      return false;
+    }
+  }
+
+  /** Save the composer's message to the request's saved messages (marks the request dirty). */
+  wsSaveDraft(name: string) {
+    const r = this.request;
+    if (this.readOnly || r.kind !== "ws") return;
+    const msg = structuredClone($state.snapshot(ws.draftOf(r)) as SavedMessage);
+    msg.name = name.trim();
+    r.ws ??= { messages: [], protocols: [], autoReconnect: false };
+    r.ws.messages.push(msg);
+  }
+
   async cancel() {
     const f = this.currentInflight;
     if (f) await call("cancel_request", { executionId: f.executionId }).catch(() => false);
@@ -723,6 +824,7 @@ class AppStore {
         body: null,
         bodyLimited: false,
         bodyError: null,
+        wsSummary: entry.ws ?? null,
       };
       this.setResponse(view);
       if (response) void this.fetchBody(view);
@@ -952,6 +1054,8 @@ class AppStore {
     }
     const ok = await ui.confirm({ title: `Delete “${name ?? ""}”?`, body });
     if (!ok) return;
+    // Their WebSocket sessions go too (AC-WS-3): nothing keeps running or reconnecting without a request.
+    const doomed = requestsInSubtree(ix, kind, id);
     try {
       const t =
         kind === "collection"
@@ -960,6 +1064,7 @@ class AppStore {
             ? await call("delete_folder", { folderId: id })
             : await call("delete_request", { requestId: id });
       if (this.middle.kind === "collection" && this.middle.id === id) this.middle = { kind: "request" };
+      void ws.discard(doomed);
       this.setTree(t);
       if (ui.selectedNode?.id === id) ui.selectedNode = null;
       toasts.success(`Deleted “${name ?? ""}”`);
@@ -1051,6 +1156,7 @@ class AppStore {
         this.activeProjectId = null;
         await this.switchProject(this.projects[0].id);
       }
+      this.pruneWsSessions();
       toasts.success(`Deleted “${p.name}”`);
     } catch (e) {
       this.reportError(e);

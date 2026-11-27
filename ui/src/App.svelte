@@ -8,6 +8,7 @@
   import Sidebar from "./lib/components/Sidebar.svelte";
   import RequestPane from "./lib/components/RequestPane.svelte";
   import ResponsePane from "./lib/components/ResponsePane.svelte";
+  import WsLog from "./lib/components/WsLog.svelte";
   import CollectionSettings from "./lib/components/CollectionSettings.svelte";
   import EnvEditor from "./lib/components/EnvEditor.svelte";
   import Splitter from "./lib/components/Splitter.svelte";
@@ -244,7 +245,11 @@
         testid="response-splitter"
       />
       <div class="right" data-pane="response">
-        <ResponsePane {stacked} ontogglelayout={toggleLayout} />
+        {#if app.middle.kind === "request" && app.request.kind === "ws"}
+          <WsLog {stacked} ontogglelayout={toggleLayout} />
+        {:else}
+          <ResponsePane {stacked} ontogglelayout={toggleLayout} />
+        {/if}
       </div>
     </div>
   </div>

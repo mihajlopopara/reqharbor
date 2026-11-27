@@ -38,7 +38,11 @@ describe("version helpers (mirror core requires_newer_client)", () => {
     const r = scratchRequest();
     expect(isReadOnlyNewer(r, "0.1.0")).toBe(false);
     expect(isReadOnlyNewer({ ...r, kind: "http" }, "0.1.0")).toBe(false);
-    for (const kind of ["graphql", "grpc", "ws", "socketio"]) expect(isReadOnlyNewer({ ...r, kind }, "0.1.0")).toBe(true);
+    for (const kind of ["graphql", "grpc", "socketio"]) expect(isReadOnlyNewer({ ...r, kind }, "0.1.0")).toBe(true);
+    // AC-WS-1: WebSocket requests are editable here, unless a part of them comes from a newer build.
+    expect(isReadOnlyNewer({ ...r, kind: "ws" }, "0.1.0")).toBe(false);
+    expect(isReadOnlyNewer({ ...r, kind: "ws", ws: { messages: [{ name: "m", kind: "cbor", body: "" }], protocols: [], autoReconnect: false } }, "0.1.0")).toBe(true);
+    expect(readOnlyReason({ ...r, kind: "ws", ws: { messages: [], protocols: [], autoReconnect: false, socketIo: { path: "/socket.io/", namespace: "/", version: 5 } } }, "0.1.0")).toBe("It uses Socket.IO version 5");
     expect(isReadOnlyNewer({ ...r, body: { type: "protobuf" } }, "0.1.0")).toBe(true);
     expect(isReadOnlyNewer({ ...r, minClientVersion: "9.0.0" }, "0.1.0")).toBe(true);
     expect(isReadOnlyNewer({ ...r, minClientVersion: "0.1.0" }, "0.1.0")).toBe(false);

@@ -160,6 +160,7 @@
   --method-head: #93a6c2;
   --method-options: #c3aa94;
   --method-custom: #a4a8ae;
+  --method-ws: #f08cc4;        /* WebSocket / Socket.IO requests (WS, SIO) */
 
   /* Status codes */
   --status-1xx: #aab1bd;
@@ -252,6 +253,7 @@
   --method-head: #4a5f7d;
   --method-options: #75604c;
   --method-custom: #5c636e;
+  --method-ws: #a3306f;
 
   --status-1xx: #4a5260;
   --status-2xx: #167246;
@@ -336,6 +338,7 @@
     --method-head: #4a5f7d;
     --method-options: #75604c;
     --method-custom: #5c636e;
+    --method-ws: #a3306f;
 
     --status-1xx: #4a5260;
     --status-2xx: #167246;

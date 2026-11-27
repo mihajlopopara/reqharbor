@@ -3,6 +3,7 @@
 use crate::error::{CmdResult, CommandError};
 use crate::registry::{CancelRegistry, Debouncer, ResponseCache};
 pub use crate::sync_policy::SyncStatus;
+use crate::ws_rt::WsRegistry;
 use reqharbor_core::http::HttpEngine;
 use reqharbor_core::storage::Store;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -23,6 +24,8 @@ pub struct AppState {
     pub retry: Debouncer,
     /// Serialises sync runs and token rotation (contract C4).
     pub sync_lock: tokio::sync::Mutex<()>,
+    /// connectionId -> open WebSocket session (AC-WS-3).
+    pub ws: WsRegistry,
 }
 
 impl AppState {
@@ -38,6 +41,7 @@ impl AppState {
             push_debounce: Debouncer::default(),
             retry: Debouncer::default(),
             sync_lock: tokio::sync::Mutex::new(()),
+            ws: WsRegistry::default(),
         })
     }
 

@@ -53,6 +53,8 @@ import { MockSpaces, type MockSpaceMode, type MockSpacesOptions } from "./spaces
 import { seed, defaultSettings } from "./seed";
 import { importCurl, looksLikeCurl, exportCurl } from "./curl";
 import { convertSpec, reportOf } from "./openapi";
+import { MockChannel, MockWs, isMockChannel, toOutMessage } from "./ws";
+import { normalizeNamespace, stampMinClientVersion, wsUrl } from "../../util/ws";
 import {
   bodyKindOf,
   cannedResponse,
@@ -97,11 +99,18 @@ export const AUTH_SHAPE: KeyShape = {
   known: ["type", "username", "password", "token", "apiKey"],
   objects: { apiKey: { known: ["key", "value", "in"] } },
 };
+export const WS_SHAPE: KeyShape = {
+  known: ["messages", "protocols", "socketIo", "autoReconnect"],
+  objects: { socketIo: { known: ["path", "namespace", "version", "auth"] } },
+  lists: { messages: { known: ["name", "kind", "body", "event", "ack"] } },
+};
 export const REQUEST_SHAPE: KeyShape = {
-  known: ["id", "kind", "minClientVersion", "collectionId", "folderId", "name", "method", "url", "params", "headers", "auth", "body", "settings", "sortOrder", "createdAt", "updatedAt"],
-  restore: ["minClientVersion"],
+  known: ["id", "kind", "minClientVersion", "collectionId", "folderId", "name", "method", "url", "params", "headers", "auth", "body", "settings", "ws", "sortOrder", "createdAt", "updatedAt"],
+  // Like core: a UI that dropped `ws` (or the stamp) doesn't wipe it.
+  restore: ["minClientVersion", "ws"],
   objects: {
     auth: AUTH_SHAPE,
+    ws: WS_SHAPE,
     settings: { known: ["followRedirects", "timeoutMs", "verifyTls"] },
     body: {
       known: ["type", "text", "form", "formEncoded", "graphql", "binaryPath"],
@@ -328,6 +337,9 @@ export class MockServer {
     firstSyncPending: false,
   };
   syncToken: string | null = null;
+  /** WebSocket sessions (AC-WS-*): the echo / Socket.IO server and what each history entry needs. */
+  ws: MockWs;
+  private wsMeta = new Map<string, { request: Request; projectId: string | null; historyId: string; ts: number; displayUrl: string; method: "WS" | "SIO"; sio: boolean }>();
   accounts: MockAccounts;
   spaces: MockSpaces;
   private clock = 0;
@@ -335,6 +347,25 @@ export class MockServer {
 
   constructor(opts: MockOptions = {}) {
     this.opts = opts;
+    this.ws = new MockWs({
+      latency: () => this.opts.latency ?? 1,
+      finished: (id, summary, error) => {
+        const m = this.wsMeta.get(id);
+        if (!m) return;
+        this.wsMeta.delete(id);
+        const entry: HistoryEntry = {
+          id: m.historyId,
+          timestamp: m.ts,
+          sourceRequestId: m.request.collectionId ? m.request.id : null,
+          request: m.request,
+          resolvedUrl: m.displayUrl,
+          method: m.method,
+          ws: summary,
+        };
+        if (error) entry.error = error;
+        this.addHistory(entry, null);
+      },
+    });
     this.accounts = new MockAccounts(opts.accounts ?? {}, {
       emit: (e, p) => this.emit(e, p),
       delay: (ms) => this.delay(ms),
@@ -806,6 +837,7 @@ export class MockServer {
       timeMs: h.response?.timeMs ?? null,
       errorKind: h.error?.kind ?? null,
       sourceRequestId: h.sourceRequestId,
+      ws: h.ws ?? null,
     };
   }
 
@@ -845,6 +877,12 @@ export class MockServer {
           credentialFields++;
           if (replace) h.value = `{{${k === "authorization" ? "authorization" : k === "cookie" ? "cookie" : "proxyAuthorization"}}}`;
         }
+      }
+      // Mirrors core sanitize_request: the Socket.IO CONNECT payload carries credentials.
+      const sio = c.ws?.socketIo;
+      if (sio?.auth?.trim()) {
+        credentialFields++;
+        if (replace) sio.auth = "{{socketIoAuth}}";
       }
       // The auth block is handled by scrubAuth (unknown schemes as a whole).
       const { auth, ...rest } = c;
@@ -1255,6 +1293,7 @@ export class MockServer {
         ? clone(request)
         : { id: "", collectionId, folderId: null, name: "Untitled request", method: "GET", url: "", params: [], headers: [], auth: { type: "none" }, body: { type: "none" }, settings: { followRedirects: true, timeoutMs: 30000, verifyTls: true }, sortOrder: 0, createdAt: 0, updatedAt: 0 };
       const r: Request = { ...base, id: ulid(ts), collectionId, folderId: folderId ?? null, name: base.name.trim() || "Untitled request", sortOrder: this.nextSort(collectionId, folderId ?? null), createdAt: ts, updatedAt: ts };
+      stampMinClientVersion(r);
       this.requests.push(r);
       this.markChanged();
       return clone(r);
@@ -1266,6 +1305,7 @@ export class MockServer {
       if (!METHOD_RE.test(request.method)) fail("invalid", `Invalid method "${request.method}"`);
       const { collectionId, folderId, sortOrder, createdAt } = r;
       Object.assign(r, keepUnknownKeys(clone(request), r), { collectionId, folderId, sortOrder, createdAt });
+      stampMinClientVersion(r);
       if (!r.name.trim()) r.name = "Untitled request";
       return clone(this.touch(r));
     },
@@ -1456,6 +1496,7 @@ export class MockServer {
       if (isReadOnlyNewer(request, MOCK_APP_VERSION) || this.requests.some((r) => r.id === request.id && isReadOnlyNewer(r, MOCK_APP_VERSION))) {
         fail("read_only_newer", "This request needs a newer version of ReqHarbor");
       }
+      if (request.kind === "ws") fail("validation", "This is a WebSocket request: connect to it instead", { kind: "notHttp" });
       const pid = projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
       const { prepared, displayUrl, unresolved } = this.prepare(request, pid);
       const ctrl = new AbortController();
@@ -1497,6 +1538,83 @@ export class MockServer {
         response = this.meta(executionId, res);
       }
       return { executionId, historyId: entry.id, method: request.method, resolvedUrl: displayUrl, unresolvedVariables: unresolved, response, error };
+    },
+    ws_connect: ({ connectionId, request, projectId, onEvent }) => {
+      if (isReadOnlyNewer(request, MOCK_APP_VERSION) || this.requests.some((r) => r.id === request.id && isReadOnlyNewer(r, MOCK_APP_VERSION))) {
+        fail("read_only_newer", "This request needs a newer version of ReqHarbor");
+      }
+      if (request.kind !== "ws") fail("validation", "This is not a WebSocket request", { kind: "notWebSocket" });
+      if (!request.url.trim()) fail("validation", "URL is empty", { kind: "emptyUrl" });
+      const pid = projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
+      const dynamic = dynamicMemo();
+      const res = this.resolveRequest(request, pid, false, dynamic);
+      const disp = this.resolveRequest(request, pid, true, dynamic);
+      const sioCfg = request.ws?.socketIo ?? null;
+      let url = "";
+      try {
+        url = wsUrl(res.url, sioCfg);
+      } catch (e) {
+        const message = (e as Error).message;
+        fail("validation", `Invalid WebSocket URL: ${message}`, { kind: "invalidWsUrl", message });
+      }
+      let displayUrl = disp.url;
+      try {
+        displayUrl = wsUrl(disp.url, sioCfg);
+      } catch {
+        /* shown as typed */
+      }
+      let sio: { namespace: string; auth: unknown } | null = null;
+      if (sioCfg) {
+        let auth: unknown = null;
+        const text = sioCfg.auth?.trim();
+        if (text) {
+          const { resolve, unresolved: missing } = this.resolver(pid, false, dynamic);
+          const resolved = resolve(text);
+          // Mirrors core prepare_ws: name an undefined variable instead of a confusing JSON error.
+          const name = [...missing][0];
+          if (name !== undefined) {
+            fail("validation", `Define {{${name}}} (the shared Socket.IO auth payload) in your environment`, { kind: "undefinedSocketIoAuthVariable", message: name });
+          }
+          try {
+            auth = JSON.parse(resolved);
+          } catch (e) {
+            const message = (e as Error).message;
+            fail("validation", `Invalid Socket.IO auth payload: ${message}`, { kind: "invalidSocketIoAuth", message });
+          }
+          if (!auth || typeof auth !== "object" || Array.isArray(auth)) {
+            fail("validation", "Invalid Socket.IO auth payload: it must be a JSON object", { kind: "invalidSocketIoAuth", message: "it must be a JSON object" });
+          }
+        }
+        sio = { namespace: normalizeNamespace(sioCfg.namespace), auth };
+      }
+      const ts = this.now();
+      const method = sio ? "SIO" : "WS";
+      const historyId = ulid(ts);
+      this.wsMeta.set(connectionId, { request: clone(request), projectId: pid ?? null, historyId, ts, displayUrl, method, sio: !!sio });
+      this.ws.connect(connectionId, url, displayUrl, sio, onEvent);
+      return { connectionId, historyId, method, resolvedUrl: displayUrl, unresolvedVariables: [...res.unresolved] };
+    },
+    ws_send: ({ connectionId, message }) => {
+      const meta = this.wsMeta.get(connectionId);
+      const conn = this.ws.conns.get(connectionId);
+      if (!meta || !conn) return fail("ws_not_connected", "Not connected");
+      if (conn.state !== "open") return fail("ws_not_connected", "Not connected yet");
+      const { resolve } = this.resolver(meta.projectId, false);
+      const out = toOutMessage(message.kind, resolve(message.body), resolve(message.event ?? ""), !!message.ack, meta.sio);
+      if (typeof out === "string") return fail("ws_invalid_message", out);
+      try {
+        return this.ws.send(connectionId, out);
+      } catch (e) {
+        return fail("ws_not_connected", (e as Error).message);
+      }
+    },
+    ws_ping: ({ connectionId }) => this.ws.ping(connectionId),
+    ws_close: ({ connectionId, code, reason }) => {
+      if (code !== undefined && code !== null && code !== 1000 && (code < 3000 || code > 4999)) {
+        fail("invalid", `Close code ${code} isn't allowed: use 1000 or 3000–4999`);
+      }
+      if (new TextEncoder().encode(reason ?? "").length > 123) fail("invalid", "The close reason can be at most 123 bytes");
+      return this.ws.close(connectionId, code ?? null, reason ?? "");
     },
     cancel_request: ({ executionId }) => {
       const c = this.inflight.get(executionId);
@@ -1542,6 +1660,7 @@ export class MockServer {
     looks_like_curl: ({ text }) => looksLikeCurl(text),
     export_curl: ({ request, projectId, keepVariables }) => {
       if (isReadOnlyNewer(request, MOCK_APP_VERSION)) fail("read_only_newer", "This request needs a newer version of ReqHarbor");
+      if (request.kind === "ws") fail("validation", "This is a WebSocket request: connect to it instead", { kind: "notHttp" });
       if (keepVariables) return exportCurl(request, true, this.inheritedAuth(request));
       const pid = projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
       const dynamic = dynamicMemo();
@@ -1867,8 +1986,12 @@ export class MockServer {
     const h = (this.handlers as Record<string, (a: unknown) => unknown>)[cmd];
     if (!h) throw new MockError("internal", `Unknown command ${cmd}`);
     try {
-      // Simulate the IPC boundary: callers never share references with the store.
-      const result = await h(clone(args ?? {}));
+      // Simulate the IPC boundary: callers never share references with the store. Channels
+      // (ws_connect's onEvent) cross it by reference, like Tauri's ipc::Channel.
+      const plain: Record<string, unknown> = {};
+      const channels: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(args ?? {})) (isMockChannel(v) ? channels : plain)[k] = v;
+      const result = await h({ ...clone(plain), ...channels });
       return result instanceof ArrayBuffer ? result : result === undefined ? null : clone(result);
     } catch (e) {
       if (e instanceof MockError) throw { code: e.code, message: e.message, ...(e.details !== undefined ? { details: e.details } : {}) };
@@ -1886,6 +2009,7 @@ export class MockServer {
         set.add(fn);
         return () => set.delete(fn);
       },
+      channel: (onmessage) => new MockChannel(onmessage as (m: unknown) => void) as never,
     };
   }
 }

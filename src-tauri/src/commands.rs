@@ -466,6 +466,151 @@ pub async fn send_request(
     })
 }
 
+// ------------------------------------------------------------------ websocket
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsConnectResult {
+    pub connection_id: String,
+    /// The history entry written when the session ends.
+    pub history_id: String,
+    /// "WS" or "SIO".
+    pub method: String,
+    /// URL being opened, secret variables shown as `{{name}}`.
+    pub resolved_url: String,
+    pub unresolved_variables: Vec<String>,
+}
+
+/// Open a WebSocket / Socket.IO connection (AC-WS-2/3). Resolves as soon as
+/// the connection is being opened; progress, every frame and the final
+/// close arrive on `onEvent`, in order. Validation problems reject.
+#[tauri::command]
+pub fn ws_connect(
+    app: AppHandle,
+    state: S<'_>,
+    connection_id: String,
+    request: Request,
+    project_id: Option<String>,
+    on_event: tauri::ipc::Channel<reqharbor_core::ws::WsFrame>,
+) -> CmdResult<WsConnectResult> {
+    use reqharbor_core::ws;
+    let (scope, collection_auth, pid) = {
+        let store = state.store();
+        if store.request(&request.id).is_some_and(|r| !r.is_editable()) {
+            return Err(PrepareError::NeedsNewerVersion.into());
+        }
+        let pid = project_id.or_else(|| {
+            store
+                .collection(&request.collection_id)
+                .map(|c| c.project_id.clone())
+        });
+        let auth = store
+            .collection(&request.collection_id)
+            .map(|c| c.auth.clone());
+        (store.var_scope(pid.as_deref()), auth, pid)
+    };
+    let prepared = ws::prepare_ws(&request, &scope, collection_auth.as_ref())?;
+    let reg = state
+        .ws
+        .register(&connection_id, pid, prepared.socket_io.is_some());
+    let history_id = ws::new_history_id();
+    let started_at = now_ms();
+    let result = WsConnectResult {
+        connection_id: connection_id.clone(),
+        history_id: history_id.clone(),
+        method: prepared.method().to_string(),
+        resolved_url: prepared.display_url.clone(),
+        unresolved_variables: prepared.unresolved.clone(),
+    };
+    let serial = reg.serial;
+    // A channel that can't deliver any more (webview reloaded or closed)
+    // ends the session rather than leaving it running without a UI.
+    let emit = crate::ws_rt::channel_emitter(move |f| on_event.send(f), reg.cancel.clone());
+    tauri::async_runtime::spawn(async move {
+        let stats = ws::run(prepared.clone(), reg.rx, emit, reg.cancel).await;
+        let state = app.state::<AppState>();
+        let redactor = reqharbor_core::redact::Redactor::from_scope(&scope);
+        let entry = ws::history_entry(
+            &history_id,
+            started_at,
+            &request,
+            &prepared,
+            &stats,
+            &redactor,
+        );
+        // History write failures must not break the session teardown.
+        let _ = state.store().history.append(&entry);
+        state.ws.finish(&connection_id, serial);
+    });
+    Ok(result)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSendResult {
+    /// Socket.IO acknowledgement id when `ack` was requested.
+    pub ack_id: Option<u64>,
+}
+
+/// Send a message on an open connection (AC-WS-4). Variables are resolved
+/// with the project's current environment; `{{$…}}` get fresh values.
+#[tauri::command]
+pub async fn ws_send(
+    state: S<'_>,
+    connection_id: String,
+    message: SavedMessage,
+) -> CmdResult<WsSendResult> {
+    use crate::ws_rt::SendRefused;
+    let (pid, sio) = state
+        .ws
+        .info(&connection_id)
+        .ok_or_else(|| CommandError::new("ws_not_connected", "Not connected"))?;
+    let scope = state.store().var_scope(pid.as_deref());
+    let out = reqharbor_core::ws::resolve_message(&message, &scope, sio)
+        .map_err(|m| CommandError::new("ws_invalid_message", m))?;
+    match state.ws.send(&connection_id, out).await {
+        Ok(ack_id) => Ok(WsSendResult { ack_id }),
+        Err(SendRefused::NotConnected) => {
+            Err(CommandError::new("ws_not_connected", "Not connected"))
+        }
+        Err(SendRefused::Session(m)) => Err(CommandError::new("ws_not_connected", m)),
+    }
+}
+
+/// Send a WebSocket ping frame (AC-WS-4). False when not connected.
+#[tauri::command]
+pub fn ws_ping(state: S<'_>, connection_id: String) -> bool {
+    state.ws.ping(&connection_id, Vec::new())
+}
+
+/// Close a connection (or stop connecting) with an optional code (1000 or
+/// 3000–4999) and reason (AC-WS-3). False when nothing was open.
+#[tauri::command]
+pub fn ws_close(
+    state: S<'_>,
+    connection_id: String,
+    code: Option<u16>,
+    reason: Option<String>,
+) -> CmdResult<bool> {
+    if let Some(c) = code
+        && c != 1000
+        && !(3000..=4999).contains(&c)
+    {
+        return Err(CommandError::new(
+            "invalid",
+            format!("Close code {c} isn't allowed: use 1000 or 3000–4999"),
+        ));
+    }
+    let reason = reason.unwrap_or_default();
+    if reason.len() > 123 {
+        return Err(CommandError::new(
+            "invalid",
+            "The close reason can be at most 123 bytes",
+        ));
+    }
+    Ok(state.ws.close(&connection_id, code, reason))
+}
+
 /// Cancel an in-flight send (AC-REQ-8). Returns false when nothing matched.
 #[tauri::command]
 pub fn cancel_request(state: S<'_>, execution_id: String) -> bool {

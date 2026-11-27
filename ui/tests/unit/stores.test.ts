@@ -5,6 +5,10 @@ import { MockServer } from "../../src/lib/api/mock";
 import { app } from "../../src/lib/stores/app.svelte";
 import { ui } from "../../src/lib/stores/ui.svelte";
 import { toasts } from "../../src/lib/stores/toasts.svelte";
+import { ws } from "../../src/lib/stores/ws.svelte";
+import { scratchRequest } from "../../src/lib/util/request";
+import { switchKind } from "../../src/lib/util/ws";
+import type { ProjectTree, Request } from "../../src/lib/api/types";
 
 const server = new MockServer({ latency: 0, platform: "macos" });
 
@@ -195,5 +199,52 @@ describe("app store", () => {
     await server.invoke("sync_create_workspace", { workerUrl: "https://w.dev" });
     expect(app.sync.connected).toBe(true);
     expect(app.sync.state).toBe("idle");
+  });
+});
+
+describe("WebSocket sessions of requests that are gone (QA pass 2)", () => {
+  const wsReq = (url: string): Request => {
+    const r = scratchRequest({ url });
+    switchKind(r, "ws");
+    return r;
+  };
+  const open = async (id: string) => until(() => ws.session(id)?.state === "open");
+
+  it("a sync pull that deletes a saved request closes its session; the open scratch one stays", async () => {
+    const pid = app.activeProjectId!;
+    const col = app.tree!.collections[0];
+    const saved = (await server.invoke("create_request", { collectionId: col.id, request: wsReq("ws://localhost:9000/a") })) as Request;
+    await app.loadTree();
+    await ws.connect(saved, pid);
+    await open(saved.id);
+    const conn = server.ws.conns.get(ws.session(saved.id)!.connectionId)!;
+    // The open scratch WebSocket request keeps its session.
+    app.newRequest();
+    app.setKind("ws");
+    app.request.url = "ws://localhost:9000/scratch";
+    await app.wsConnect();
+    await open(app.request.id);
+    // A pull removes the saved request: the tree arrives without it.
+    const t = (await server.invoke("delete_request", { requestId: saved.id })) as ProjectTree;
+    app.setTree(t);
+    await until(() => ws.session(saved.id) === null);
+    await until(() => conn.state === "closed");
+    expect(ws.session(app.request.id)?.state).toBe("open");
+    await ws.discard([app.request.id]);
+  });
+
+  it("deleting a project (or losing it with its space) closes its sessions", async () => {
+    const other = (await server.invoke("create_project", { name: "Gone soon", location: null })) as ProjectTree;
+    const r = wsReq("ws://localhost:9000/p");
+    await ws.connect(r, other.project.id);
+    await open(r.id);
+    const kept = wsReq("ws://localhost:9000/kept");
+    await ws.connect(kept, app.activeProjectId);
+    await open(kept.id);
+    await server.invoke("delete_project", { projectId: other.project.id });
+    await app.reloadAll(); // what a sync pull / leaving a space runs
+    await until(() => ws.session(r.id) === null);
+    expect(ws.session(kept.id)?.state).toBe("open");
+    await ws.discard([kept.id]);
   });
 });

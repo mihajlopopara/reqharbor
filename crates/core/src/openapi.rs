@@ -1081,6 +1081,7 @@ impl<'a> Importer<'a> {
             auth,
             body,
             settings: RequestSettings::default(),
+            ws: None,
             sort_order: 0,
             created_at: 0,
             updated_at: 0,

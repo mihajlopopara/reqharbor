@@ -9,13 +9,23 @@ mod secret_store;
 mod state;
 mod sync_policy;
 mod sync_rt;
+mod ws_rt;
 
 use reqharbor_core::storage::Store;
 use state::AppState;
-use tauri::{Manager, WindowEvent};
+use tauri::{Manager, RunEvent, WindowEvent};
 
 fn main() {
     tauri::Builder::default()
+        // A reloaded webview has lost every message log: close the sockets
+        // it opened instead of leaving them running (and reconnecting) unseen.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started
+                && let Some(state) = webview.try_state::<AppState>()
+            {
+                state.ws.close_all();
+            }
+        })
         // One process per data dir: a second launch focuses the first window
         // instead of racing it for the same files (QA-R1-023).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -151,7 +161,24 @@ fn main() {
             commands::space_notice_later,
             commands::legacy_merge,
             commands::legacy_disconnect,
+            commands::ws_connect,
+            commands::ws_send,
+            commands::ws_ping,
+            commands::ws_close,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ReqHarbor");
+        .build(tauri::generate_context!())
+        .expect("error while building ReqHarbor")
+        .run(|app, event| {
+            // AC-WS-3: every open socket says goodbye (1001) on exit; give
+            // the sessions a moment to send it and write their history.
+            if let RunEvent::Exit = event
+                && let Some(state) = app.try_state::<AppState>()
+                && state.ws.close_all() > 0
+            {
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(800);
+                while state.ws.len() > 0 && std::time::Instant::now() < until {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        });
 }

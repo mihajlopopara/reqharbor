@@ -22,5 +22,6 @@ pub mod storage;
 pub mod sync;
 pub mod urlx;
 pub mod vars;
+pub mod ws;
 
 pub use tokio_util::sync::CancellationToken;

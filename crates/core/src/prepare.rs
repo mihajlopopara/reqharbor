@@ -54,6 +54,21 @@ pub enum PrepareError {
     /// newer ReqHarbor (an unknown scheme): it can't be applied here.
     #[error("The collection's auth needs a newer version of ReqHarbor")]
     InheritedAuthNeedsNewerVersion,
+    /// A WebSocket request reached an HTTP-only path (send, cURL export).
+    #[error("This is a WebSocket request: connect to it instead")]
+    NotHttp,
+    /// An HTTP request reached `ws_connect`.
+    #[error("This is not a WebSocket request")]
+    NotWebSocket,
+    #[error("Invalid WebSocket URL: {0}")]
+    InvalidWsUrl(String),
+    #[error("Invalid Socket.IO auth payload: {0}")]
+    InvalidSocketIoAuth(String),
+    /// The Socket.IO auth payload uses a variable that isn't defined (say,
+    /// the `{{socketIoAuth}}` placeholder of a share imported without
+    /// credentials). Carries the variable name.
+    #[error("Define {{{{{0}}}}} (the shared Socket.IO auth payload) in your environment")]
+    UndefinedSocketIoAuthVariable(String),
 }
 
 /// The default Content-Type implied by a body type (AC-REQ-4). Multipart's
@@ -244,6 +259,9 @@ pub fn prepare_in(
 ) -> Result<PreparedRequest, PrepareError> {
     if !request.is_editable() {
         return Err(PrepareError::NeedsNewerVersion);
+    }
+    if !request.kind.is_http() {
+        return Err(PrepareError::NotHttp);
     }
     let method = request.method.trim().to_string();
     if !is_valid_method(&method) {

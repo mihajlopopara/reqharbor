@@ -4,11 +4,26 @@
   import { methodClass, methodLabel } from "../util/format";
   import Icon from "./Icon.svelte";
 
-  /** Method dropdown (DESIGN §5.5): listbox, type-ahead, Custom… inline input. */
-  let { method, onchange }: { method: string; onchange: (m: string) => void } = $props();
+  /**
+   * Method dropdown (DESIGN §5.5): listbox, type-ahead, Custom… inline input. The WS / SIO entries
+   * switch the request kind to WebSocket / Socket.IO (AC-WS-1); `kind` says which one is current.
+   */
+  let {
+    method,
+    onchange,
+    kind = "http",
+    onkind,
+  }: {
+    method: string;
+    onchange: (m: string) => void;
+    kind?: "http" | "ws" | "sio";
+    onkind?: (k: "http" | "ws" | "sio", method?: string) => void;
+  } = $props();
 
-  const HINTS: Record<string, string> = { QUERY: "safe, with body", HEAD: "headers only", OPTIONS: "capabilities", DELETE: "remove" };
-  const OPTIONS = [...STANDARD_METHODS, "CUSTOM"] as const;
+  const HINTS: Record<string, string> = { QUERY: "safe, with body", HEAD: "headers only", OPTIONS: "capabilities", DELETE: "remove", WS: "WebSocket", SIO: "Socket.IO" };
+  const OPTIONS: readonly string[] = $derived([...STANDARD_METHODS, ...(onkind ? ["WS", "SIO"] : []), "CUSTOM"]);
+  /** What the trigger shows and the list marks as current. */
+  const current = $derived(kind === "ws" ? "WS" : kind === "sio" ? "SIO" : method);
 
   let open = $state(false);
   let hl = $state(0);
@@ -20,25 +35,31 @@
 
   async function openList() {
     open = true;
-    const i = OPTIONS.indexOf(method as (typeof OPTIONS)[number]);
+    const i = OPTIONS.indexOf(current);
     hl = i >= 0 ? i : OPTIONS.length - 1;
     await tick();
     listEl?.focus();
   }
 
+  function apply(m: string) {
+    if (m === "WS" || m === "SIO") onkind?.(m === "WS" ? "ws" : "sio");
+    else if (kind !== "http") onkind?.("http", m);
+    else onchange(m);
+  }
+
   function choose(m: string) {
     open = false;
     if (m === "CUSTOM") {
-      custom = STANDARD_METHODS.includes(method as never) ? "" : method;
+      custom = kind === "http" && !STANDARD_METHODS.includes(method as never) ? method : "";
       void tick().then(() => customEl?.focus());
       return;
     }
-    onchange(m);
+    apply(m);
     trigger?.focus();
   }
 
   function commitCustom() {
-    if (custom !== null && custom !== "" && METHOD_RE.test(custom)) onchange(custom);
+    if (custom !== null && custom !== "" && METHOD_RE.test(custom)) apply(custom);
     custom = null;
     void tick().then(() => trigger?.focus());
   }
@@ -55,8 +76,8 @@
     const opts = TYPE_AHEAD[e.key.toLowerCase()];
     if (opts) {
       e.preventDefault();
-      const i = opts.indexOf(method);
-      onchange(opts[(i + 1) % opts.length]);
+      const i = kind === "http" ? opts.indexOf(method) : -1;
+      apply(opts[(i + 1) % opts.length]);
     }
   }
 
@@ -124,14 +145,14 @@
       type="button"
       aria-haspopup="listbox"
       aria-expanded={open}
-      aria-label="Method: {method}"
-      title={method.length > 7 ? method : undefined}
+      aria-label="Method: {kind === 'ws' ? 'WebSocket' : kind === 'sio' ? 'Socket.IO' : method}"
+      title={current.length > 7 ? current : undefined}
       data-testid="method-select"
-      data-method={method}
+      data-method={current}
       onclick={() => (open ? (open = false) : void openList())}
       onkeydown={triggerKey}
     >
-      <span class="m {methodClass(method)}">{methodLabel(method)}</span>
+      <span class="m {kind === 'http' ? methodClass(method) : 'm-ws'}">{methodLabel(current)}</span>
       <Icon name="chev-d" small />
     </button>
   {/if}
@@ -140,20 +161,20 @@
       class="menu pop list"
       role="listbox"
       tabindex="-1"
-      aria-label="HTTP method"
+      aria-label="Method"
       aria-activedescendant="method-opt-{hl}"
       bind:this={listEl}
       onkeydown={listKey}
       data-testid="method-list"
     >
       {#each OPTIONS as o, i (o)}
-        {#if o === "CUSTOM"}<div class="sep" aria-hidden="true"></div>{/if}
+        {#if o === "CUSTOM" || o === "WS"}<div class="sep" aria-hidden="true"></div>{/if}
         <div
           id="method-opt-{i}"
           class="mi"
           class:hl={hl === i}
           role="option"
-          aria-selected={o === method}
+          aria-selected={o === current}
           tabindex="-1"
           data-testid="method-option-{o}"
           onmouseenter={() => (hl = i)}
@@ -162,10 +183,10 @@
         >
           {#if o === "CUSTOM"}
             <span>Custom…</span>
-            {#if !STANDARD_METHODS.includes(method as never)}<span class="sc cur" aria-hidden="true"><span class="m m-custom">{method}</span><Icon name="check" small /></span>{/if}
+            {#if kind === "http" && !STANDARD_METHODS.includes(method as never)}<span class="sc cur" aria-hidden="true"><span class="m m-custom">{method}</span><Icon name="check" small /></span>{/if}
           {:else}
-            <span class="m {methodClass(o)} big">{o}</span>
-            {#if o === method}<span class="sc cur" aria-hidden="true"><Icon name="check" small /></span>
+            <span class="m {o === 'WS' || o === 'SIO' ? 'm-ws' : methodClass(o)} big">{o}</span>
+            {#if o === current}<span class="sc cur" aria-hidden="true"><Icon name="check" small /></span>
             {:else if HINTS[o]}<span class="sc">{HINTS[o]}</span>{/if}
           {/if}
         </div>

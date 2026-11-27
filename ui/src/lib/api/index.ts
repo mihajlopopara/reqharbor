@@ -3,7 +3,7 @@
  * plain browser (vite dev / Playwright) the same Commands map is served by an
  * in-memory mock (lazy-loaded, never part of the initial chunk).
  */
-import { makeCall, type CommandError, type CommandName, type Commands, type Events } from "./types";
+import { makeCall, type CommandError, type CommandName, type Commands, type EventChannel, type Events } from "./types";
 
 export type RawInvoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 export type Unlisten = () => void;
@@ -11,6 +11,8 @@ export type Unlisten = () => void;
 export interface Backend {
   invoke: RawInvoke;
   listen<E extends keyof Events>(event: E, handler: (payload: Events[E]) => void): Promise<Unlisten>;
+  /** A per-call ordered stream (Tauri `Channel`) to pass as a command argument, e.g. ws_connect's `onEvent`. */
+  channel<T>(onmessage: (message: T) => void): EventChannel<T>;
 }
 
 export const isTauri: boolean = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -18,10 +20,15 @@ export const isTauri: boolean = typeof window !== "undefined" && "__TAURI_INTERN
 let backendPromise: Promise<Backend> | null = null;
 
 async function tauriBackend(): Promise<Backend> {
-  const [{ invoke }, ev] = await Promise.all([import("@tauri-apps/api/core"), import("@tauri-apps/api/event")]);
+  const [{ invoke, Channel }, ev] = await Promise.all([import("@tauri-apps/api/core"), import("@tauri-apps/api/event")]);
   return {
     invoke: (cmd, args) => invoke(cmd, args),
     listen: (event, handler) => ev.listen(event, (e) => handler(e.payload as never)),
+    channel: <T>(onmessage: (message: T) => void) => {
+      const ch = new Channel<T>();
+      ch.onmessage = onmessage;
+      return ch;
+    },
   };
 }
 
@@ -64,6 +71,12 @@ const typed = makeCall(async (cmd, args) => {
 /** Typed command call; rejects with CommandError. */
 export const call: <K extends CommandName>(cmd: K, args: Commands[K]["args"]) => Promise<Commands[K]["result"]> =
   typed;
+
+/** A channel for a streaming command argument (see Backend.channel). */
+export async function channel<T>(onmessage: (message: T) => void): Promise<EventChannel<T>> {
+  const b = await getBackend();
+  return b.channel(onmessage);
+}
 
 export async function listen<E extends keyof Events>(event: E, handler: (payload: Events[E]) => void): Promise<Unlisten> {
   const b = await getBackend();

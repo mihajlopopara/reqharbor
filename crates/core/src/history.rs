@@ -5,7 +5,7 @@
 //! The file is compacted to the newest 500 entries on open and whenever it
 //! grows past 500 + [`COMPACT_SLACK`] lines.
 
-use crate::model::{ErrorKind, HistoryEntry};
+use crate::model::{ErrorKind, HistoryEntry, WsSessionSummary};
 use crate::storage::{StoreError, atomic_write};
 use serde::Serialize;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -26,6 +26,8 @@ pub struct HistorySummary {
     pub time_ms: Option<u64>,
     pub error_kind: Option<ErrorKind>,
     pub source_request_id: Option<String>,
+    /// WebSocket / Socket.IO sessions: duration and message counts.
+    pub ws: Option<WsSessionSummary>,
 }
 
 impl HistorySummary {
@@ -39,6 +41,7 @@ impl HistorySummary {
             time_ms: e.response.as_ref().map(|r| r.time_ms),
             error_kind: e.error.as_ref().map(|e| e.kind),
             source_request_id: e.source_request_id.clone(),
+            ws: e.ws.clone(),
         }
     }
 
@@ -256,6 +259,7 @@ mod tests {
                 kind: ErrorKind::Cancelled,
                 message: "cancelled".into(),
             }),
+            ws: None,
         }
     }
 

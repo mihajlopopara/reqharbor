@@ -11,8 +11,13 @@
   import AuthForm from "./AuthForm.svelte";
   import BodyEditor from "./BodyEditor.svelte";
   import Icon from "./Icon.svelte";
+  import WsComposer from "./WsComposer.svelte";
+  import WsSavedMessages from "./WsSavedMessages.svelte";
+  import WsSettings from "./WsSettings.svelte";
+  import { ws } from "../stores/ws.svelte";
+  import { isSocketIo } from "../util/ws";
 
-  type ReqTab = "query" | "headers" | "auth" | "body" | "tests" | "prerun";
+  type ReqTab = "query" | "headers" | "auth" | "body" | "tests" | "prerun" | "message" | "saved" | "settings";
   let tab = $state<ReqTab>("query");
   let lastId = "";
   let urlEl = $state<HTMLInputElement>();
@@ -42,6 +47,13 @@
   const hasAuthHeader = $derived(r.headers.some((h) => h.enabled && h.key.trim().toLowerCase() === "authorization"));
   const queryHint = $derived(r.method === "QUERY" && r.body.type === "none");
   const inflight = $derived(app.currentInflight);
+  /** AC-WS-1: a WebSocket / Socket.IO request gets the connect bar and its own tabs. */
+  const isWs = $derived(r.kind === "ws");
+  const sio = $derived(isSocketIo(r));
+  const wsSession = $derived(isWs ? ws.session(r.id) : null);
+  const wsState = $derived(wsSession?.state ?? "idle");
+  const wsLive = $derived(wsState === "connecting" || wsState === "open" || wsState === "closing");
+  const savedCount = $derived(r.ws?.messages.length ?? 0);
   /** AC-FWD-3/4: a request from a newer ReqHarbor is view-only. */
   const ro = $derived(app.readOnly);
   /** Why (from the editor copy, else the saved copy), e.g. "This is a “grpc” request". */
@@ -49,12 +61,16 @@
     ro ? (readOnlyReason(r, app.appVersion) ?? readOnlyReason(app.index?.requestById.get(r.id) ?? r, app.appVersion) ?? "It was made with a newer version of ReqHarbor") : null,
   );
 
-  // Pick a sensible tab when switching requests.
+  // Pick a sensible tab when switching requests (or between HTTP and WebSocket).
+  let lastWs = false;
   $effect(() => {
     const id = r.id;
-    if (id === lastId) return;
+    const w = isWs;
+    if (id === lastId && w === lastWs) return;
     lastId = id;
-    tab = app.readOnly || r.body.type !== "none" ? "body" : "query";
+    lastWs = w;
+    if (w) tab = "message";
+    else tab = app.readOnly || r.body.type !== "none" ? "body" : "query";
   });
 
   $effect(() => {
@@ -79,6 +95,7 @@
   }
 
   export async function format() {
+    if (isWs) return;
     tab = "body";
     await tick();
     await bodyEd?.format();
@@ -110,8 +127,8 @@
     const saved = !app.isScratch;
     ui.openMenu(
       [
-        { label: "Copy as cURL", disabled: ro, shortcut: shortcutText("Mod+Shift+C", app.platform), action: () => void app.copyCurl(), testid: "menu-copy-curl" },
-        { label: "Export as cURL…", disabled: ro, action: () => (ui.exportCurl = { anchor: menuBtn ?? null }), testid: "menu-export-curl" },
+        { label: "Copy as cURL", disabled: ro || isWs, reason: isWs ? "WebSocket requests have no cURL form" : undefined, shortcut: shortcutText("Mod+Shift+C", app.platform), action: () => void app.copyCurl(), testid: "menu-copy-curl" },
+        { label: "Export as cURL…", disabled: ro || isWs, reason: isWs ? "WebSocket requests have no cURL form" : undefined, action: () => (ui.exportCurl = { anchor: menuBtn ?? null }), testid: "menu-export-curl" },
         { label: "Share…", disabled: !saved || ro, action: () => (ui.shareDialog = { kind: "request", entityId: r.id, name: r.name }), testid: "menu-share" },
         { separator: true },
         { label: saved ? "Rename" : "Save to collection…", disabled: ro, shortcut: saved ? "F2" : shortcutText("Mod+S", app.platform), action: () => (saved ? startRename() : (ui.picker = { kind: "saveRequest" })) },
@@ -134,7 +151,9 @@
     void tick().then(() => document.querySelector<HTMLElement>(`[data-testid="req-tab-${tab}"]`)?.focus());
   }
 
-  const TABS: ReqTab[] = ["query", "headers", "auth", "body", "tests", "prerun"];
+  const HTTP_TABS: ReqTab[] = ["query", "headers", "auth", "body", "tests", "prerun"];
+  const WS_TABS: ReqTab[] = ["message", "saved", "headers", "auth", "query", "settings"];
+  const TABS = $derived(isWs ? WS_TABS : HTTP_TABS);
 </script>
 
 <svelte:window
@@ -193,27 +212,44 @@
   <div class="row2">
     <div class="reqbar" class:invalid={!!app.sendBlocked && app.sendBlocked === "Enter a URL"}>
       <fieldset class="ro-fs" disabled={ro}>
-      <MethodSelect method={r.method} onchange={(m) => (app.request.method = m)} />
+      <MethodSelect method={r.method} kind={isWs ? (sio ? "sio" : "ws") : "http"} onchange={(m) => (app.request.method = m)} onkind={(k, m) => app.setKind(k, m)} />
       <VarInput
         variant="url"
         lookup={app.lookup}
         value={r.url}
-        placeholder="Enter a URL or paste a cURL command"
+        placeholder={isWs ? (sio ? "Enter a Socket.IO server URL, e.g. http://localhost:3000" : "Enter a ws:// or wss:// URL") : "Enter a URL or paste a cURL command"}
         ariaLabel="URL"
         testid="url-input"
         disabled={ro}
         bind:inputEl={urlEl}
         oninput={(v) => app.setUrl(v)}
-        onpaste={onUrlPaste}
+        onpaste={isWs ? undefined : onUrlPaste}
         onkeydown={(e) => {
           if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
             e.preventDefault();
-            void app.send();
+            if (isWs) {
+              if (!wsLive) void app.wsConnect();
+            } else void app.send();
           }
         }}
       />
       </fieldset>
     </div>
+    {#if isWs}
+    <button
+      class="btn send"
+      class:btn-primary={!wsLive}
+      class:btn-secondary={wsLive}
+      type="button"
+      disabled={wsState === "closing" || (!wsLive && (ro || !r.url.trim()))}
+      title={ro ? NEEDS_NEWER_VERSION : (app.sendBlocked ?? (wsState === "connecting" ? "Stop connecting" : wsState === "open" ? "Close the connection" : "Connect"))}
+      onclick={() => void app.wsConnectOrDisconnect()}
+      data-testid="ws-connect"
+      data-state={wsState}
+    >
+      {#if wsState === "connecting"}<span class="spinner" aria-hidden="true"></span>Cancel{:else if wsState === "open"}Disconnect{:else if wsState === "closing"}Closing…{:else}Connect{/if}
+    </button>
+    {:else}
     <button
       class="btn send"
       class:btn-primary={!inflight}
@@ -226,6 +262,7 @@
     >
       {#if inflight}<span class="spinner" aria-hidden="true"></span>Cancel{:else}Send{/if}
     </button>
+    {/if}
   </div>
   {#if app.sendBlocked}
     <div class="blocked" role="alert" data-testid="send-blocked"><Icon name="alert" small />{app.sendBlocked}</div>
@@ -249,11 +286,15 @@
         {:else if t === "auth"}Auth{#if r.auth.type !== "none"}<span class="dot" title={r.auth.type}></span>{/if}
         {:else if t === "body"}Body{#if r.body.type !== "none"}<span class="dot" title={r.body.type}></span>{:else if queryHint}<span class="dot warn" title="QUERY requests normally carry a body"></span>{/if}
         {:else if t === "tests"}Tests
+        {:else if t === "message"}Message
+        {:else if t === "saved"}Saved messages{#if savedCount}<sup data-testid="badge-saved">{savedCount}</sup>{/if}
+        {:else if t === "settings"}Settings
         {:else}Pre Run{/if}
       </button>
     {/each}
     </div>
     <span class="end">
+      {#if !isWs}
       <button
         class="icon-btn"
         type="button"
@@ -292,12 +333,13 @@
           </fieldset>
         </div>
       {/if}
+      {/if}
     </span>
   </div>
 
   <div class="panel" role="tabpanel" data-testid="req-panel-{tab}">
     <fieldset class="ro-fs" disabled={ro}>
-    {#if ro && tab === "body"}
+    {#if ro && (tab === "body" || tab === "message")}
       <div class="empty newer" data-testid="body-needs-newer">
         <h3>{NEEDS_NEWER_VERSION}</h3>
         <p>
@@ -324,6 +366,12 @@
       </div>
     {:else if tab === "body"}
       <BodyEditor bind:this={bodyEd} bind:editor={bodyCm} />
+    {:else if tab === "message"}
+      <WsComposer />
+    {:else if tab === "saved"}
+      <WsSavedMessages onload={() => (tab = "message")} />
+    {:else if tab === "settings"}
+      <WsSettings />
     {:else}
       <div class="empty soon" data-testid="coming-soon">
         <h3>Coming soon</h3>

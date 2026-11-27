@@ -158,6 +158,15 @@ fn strip_request_extra(r: &mut Request, replace: bool) -> usize {
     for f in r.body.form.iter_mut().flatten() {
         n += strip_extra(&mut f.extra, replace);
     }
+    if let Some(ws) = r.ws.as_mut() {
+        n += strip_extra(&mut ws.extra, replace);
+        for m in &mut ws.messages {
+            n += strip_extra(&mut m.extra, replace);
+        }
+        if let Some(sio) = ws.socket_io.as_mut() {
+            n += strip_extra(&mut sio.extra, replace);
+        }
+    }
     n
 }
 
@@ -187,8 +196,20 @@ fn sanitize_request(r: &mut Request, replace: bool) -> usize {
             }
         }
     }
+    // The Socket.IO CONNECT payload carries the handshake credentials.
+    if let Some(sio) = r.ws.as_mut().and_then(|w| w.socket_io.as_mut())
+        && sio.auth.as_deref().is_some_and(|a| !a.trim().is_empty())
+    {
+        n += 1;
+        if replace {
+            sio.auth = Some(SOCKET_IO_AUTH_PLACEHOLDER.to_string());
+        }
+    }
     n
 }
+
+/// What a shared Socket.IO auth payload becomes without credentials.
+pub const SOCKET_IO_AUTH_PLACEHOLDER: &str = "{{socketIoAuth}}";
 
 /// Build a sanitized snapshot for a collection or request share.
 pub fn build_snapshot(
@@ -529,7 +550,27 @@ mod tests {
 
     #[test]
     fn ac_share_2_strips_secrets_and_credentials() {
-        let (_d, s, cid, _rid, eid) = setup();
+        let (_d, mut s, cid, _rid, eid) = setup();
+        // A Socket.IO request: its CONNECT auth payload is a credential.
+        let sio = s
+            .create_request(
+                &cid,
+                None,
+                Request {
+                    name: "Chat".into(),
+                    kind: crate::model::RequestKind::Ws,
+                    url: "ws://chat".into(),
+                    ws: Some(crate::model::WsConfig {
+                        socket_io: Some(crate::model::SocketIoConfig {
+                            auth: Some(r#"{"token":"sio-secret"}"#.into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Request::default()
+                },
+            )
+            .unwrap();
         let opts = ShareOptions {
             include_credentials: false,
             environment_id: Some(eid),
@@ -556,9 +597,17 @@ mod tests {
             snap["environment"]["variables"].as_array().unwrap().len(),
             1
         );
+        assert!(!text.contains("sio-secret"));
+        let chat = snap["collection"]["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == sio.id.as_str())
+            .unwrap();
+        assert_eq!(chat["ws"]["socketIo"]["auth"], SOCKET_IO_AUTH_PLACEHOLDER);
         assert_eq!(preview.secret_variables_removed, 1);
-        assert_eq!(preview.credentials_replaced, 5);
-        assert_eq!(preview.request_count, 1);
+        assert_eq!(preview.credentials_replaced, 6);
+        assert_eq!(preview.request_count, 2);
 
         // Include credentials keeps them, but secrets are still removed.
         let opts = ShareOptions {
@@ -568,6 +617,7 @@ mod tests {
         let (snap, preview) = build_snapshot(&s, ShareKind::Collection, &cid, &opts).unwrap();
         let text = snap.to_string();
         assert!(text.contains("Bearer real"));
+        assert!(text.contains("sio-secret"));
         assert!(!text.contains("SECRET"));
         assert_eq!(preview.credentials_replaced, 0);
     }

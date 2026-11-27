@@ -69,9 +69,10 @@ macro_rules! open_string_enum {
 }
 
 open_string_enum! {
-    /// What a request talks (AC-FWD-2). Only `Http` is editable and sendable
-    /// in this build; the others are reserved for GraphQL, gRPC and WebSocket
-    /// editors. Omitted from JSON when `Http`, so older readers see no change.
+    /// What a request talks (AC-FWD-2). `Http` and `Ws` (WebSocket, with
+    /// Socket.IO as a mode of it) are editable in this build; the others are
+    /// reserved for GraphQL and gRPC editors. Omitted from JSON when `Http`,
+    /// so older readers see no change.
     pub enum RequestKind {
         #[default]
         Http = "http",
@@ -84,6 +85,13 @@ open_string_enum! {
 impl RequestKind {
     pub fn is_http(&self) -> bool {
         *self == RequestKind::Http
+    }
+    pub fn is_ws(&self) -> bool {
+        *self == RequestKind::Ws
+    }
+    /// Kinds this build can edit and run: HTTP and WebSocket.
+    pub fn is_supported(&self) -> bool {
+        matches!(self, RequestKind::Http | RequestKind::Ws)
     }
 }
 
@@ -298,6 +306,10 @@ pub struct Request {
     pub body: Body,
     #[serde(default)]
     pub settings: RequestSettings,
+    /// WebSocket / Socket.IO settings (kind `ws`). Kept when the kind is
+    /// switched back to HTTP, so switching again loses nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws: Option<WsConfig>,
     #[serde(default)]
     pub sort_order: i64,
     #[serde(default)]
@@ -328,6 +340,7 @@ impl Default for Request {
             auth: Auth::default(),
             body: Body::default(),
             settings: RequestSettings::default(),
+            ws: None,
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
@@ -341,18 +354,159 @@ pub const NEEDS_NEWER_VERSION: &str = "This request needs a newer version of Req
 
 impl Request {
     /// False when this build cannot faithfully edit or send the request: a
-    /// non-HTTP kind, an unknown body type, form field kind, auth scheme or
-    /// API key location, or a `minClientVersion` newer than this build
+    /// kind other than HTTP or WebSocket, an unknown body type, form field
+    /// kind, auth scheme, API key location, WebSocket message kind or
+    /// Socket.IO version, or a `minClientVersion` newer than this build
     /// (AC-FWD-3/4). Such requests are read-only, are never sent, and a
     /// locally modified version is never pushed.
     pub fn is_editable(&self) -> bool {
-        self.kind.is_http()
+        self.kind.is_supported()
             && self.body.is_known()
             && self.auth.is_known()
+            && self.ws.as_ref().is_none_or(WsConfig::is_known)
             && !self
                 .min_client_version
                 .as_deref()
                 .is_some_and(requires_newer_client)
+    }
+
+    /// A WebSocket request must not be edited by a ReqHarbor that predates
+    /// WebSocket support (an older client would drop `ws` on save): stamp
+    /// `minClientVersion` with [`WS_MIN_CLIENT_VERSION`] unless an equal or
+    /// newer one is already there. Never the running version, so a newer
+    /// patch build doesn't lock out older WebSocket-capable builds.
+    pub fn stamp_min_client_version(&mut self) {
+        if !self.kind.is_ws() {
+            return;
+        }
+        let older = match self.min_client_version.as_deref() {
+            None => true,
+            Some(v) => match (parse_version(v), parse_version(WS_MIN_CLIENT_VERSION)) {
+                (Some(have), Some(min)) => have < min,
+                _ => false,
+            },
+        };
+        if older {
+            self.min_client_version = Some(WS_MIN_CLIENT_VERSION.to_string());
+        }
+    }
+}
+
+/// The first ReqHarbor that edits and runs WebSocket / Socket.IO requests:
+/// the `minClientVersion` stamped on every `ws` request (AC-WS-1). Fixed;
+/// raise it only when the `ws` format changes in a way older builds would
+/// lose on save.
+pub const WS_MIN_CLIENT_VERSION: &str = "0.1.0";
+
+/// Socket.IO protocol version this build speaks (Engine.IO v4 transport).
+pub const SOCKET_IO_VERSION: u32 = 4;
+
+/// WebSocket settings of a `ws` request. Headers, auth, query params and
+/// settings of the request apply to the opening handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsConfig {
+    /// Saved messages, in user order.
+    #[serde(default)]
+    pub messages: Vec<SavedMessage>,
+    /// `Sec-WebSocket-Protocol` values offered on connect.
+    #[serde(default)]
+    pub protocols: Vec<String>,
+    /// Set = Socket.IO mode (Engine.IO v4 over the WebSocket).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_io: Option<SocketIoConfig>,
+    /// Reconnect after the connection drops (not after Disconnect).
+    #[serde(default)]
+    pub auto_reconnect: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+impl WsConfig {
+    /// False when a message kind or the Socket.IO version comes from a newer
+    /// ReqHarbor (AC-FWD-3).
+    pub fn is_known(&self) -> bool {
+        self.messages.iter().all(|m| m.kind.is_known())
+            && self
+                .socket_io
+                .as_ref()
+                .is_none_or(|s| s.version == SOCKET_IO_VERSION)
+    }
+}
+
+open_string_enum! {
+    /// Payload kind of a saved WebSocket message. `Binary` bodies are base64.
+    /// Unknown values round-trip and make a request read-only (AC-FWD-3).
+    pub enum MessageKind {
+        #[default]
+        Text = "text",
+        Json = "json",
+        Binary = "binary",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedMessage {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: MessageKind,
+    /// Text, JSON text, or base64 for `binary`. Variables are resolved when
+    /// it is sent.
+    #[serde(default)]
+    pub body: String,
+    /// Socket.IO: the event name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// Socket.IO: ask the server for an acknowledgement.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ack: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocketIoConfig {
+    /// Engine.IO endpoint path, default `/socket.io/`.
+    #[serde(default = "default_sio_path")]
+    pub path: String,
+    /// Namespace joined after the handshake, default `/`.
+    #[serde(default = "default_sio_namespace")]
+    pub namespace: String,
+    #[serde(default = "default_sio_version")]
+    pub version: u32,
+    /// Optional JSON object sent as the CONNECT packet's auth payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+fn default_sio_path() -> String {
+    "/socket.io/".to_string()
+}
+fn default_sio_namespace() -> String {
+    "/".to_string()
+}
+fn default_sio_version() -> u32 {
+    SOCKET_IO_VERSION
+}
+
+impl Default for SocketIoConfig {
+    fn default() -> Self {
+        SocketIoConfig {
+            path: default_sio_path(),
+            namespace: default_sio_namespace(),
+            version: SOCKET_IO_VERSION,
+            auth: None,
+            extra: Extra::new(),
+        }
     }
 }
 
@@ -797,6 +951,27 @@ pub struct HistoryEntry {
     pub response: Option<HistoryResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<SendError>,
+    /// Set for a WebSocket / Socket.IO session (method `WS` / `SIO`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws: Option<WsSessionSummary>,
+}
+
+/// Summary of a finished WebSocket session, for history (AC-WS-7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSessionSummary {
+    pub duration_ms: u64,
+    /// Data messages sent (text, binary, Socket.IO events).
+    pub sent: u64,
+    /// Data messages received (text, binary, Socket.IO events and acks).
+    pub received: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_code: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    /// Keys from a newer ReqHarbor, kept on rewrite (AC-FWD-1).
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

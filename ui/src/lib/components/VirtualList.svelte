@@ -13,6 +13,7 @@
     onkeydown,
     scrollToIndex = $bindable(-1),
     sticky,
+    version = 0,
   }: {
     items: T[];
     itemHeight: (item: T) => number;
@@ -25,6 +26,8 @@
     scrollToIndex?: number;
     /** Optional sticky header for the first visible item. */
     sticky?: Snippet<[T]>;
+    /** Bump when `items` changed in place (same array), e.g. a log that grows: re-measures without a copy. */
+    version?: number;
   } = $props();
 
   let viewport: HTMLDivElement;
@@ -32,6 +35,7 @@
   let height = $state(400);
 
   const offsets = $derived.by(() => {
+    void version;
     const o = new Float64Array(items.length + 1);
     for (let i = 0; i < items.length; i++) o[i + 1] = o[i] + itemHeight(items[i]);
     return o;

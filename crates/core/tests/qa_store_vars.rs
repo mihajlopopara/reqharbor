@@ -358,6 +358,7 @@ fn entry(i: usize) -> HistoryEntry {
         method: "GET".into(),
         response: None,
         error: None,
+        ws: None,
     }
 }
 

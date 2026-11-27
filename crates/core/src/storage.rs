@@ -1354,6 +1354,7 @@ impl Store {
         if r.name.trim().is_empty() {
             r.name = "Untitled request".into();
         }
+        r.stamp_min_client_version();
         r.sort_order = next_sort(t, collection_id, folder_id);
         r.created_at = now;
         r.updated_at = now;
@@ -1395,6 +1396,7 @@ impl Store {
         );
         let mut next = update.clone();
         merge_request_extra(&mut next, r);
+        next.stamp_min_client_version();
         *r = next;
         (r.collection_id, r.folder_id, r.sort_order, r.created_at) = keep;
         r.updated_at = touch(r.updated_at);
@@ -2164,6 +2166,28 @@ pub fn merge_request_extra(target: &mut Request, stored: &Request) {
     if let (Some(t), Some(s)) = (tb.form.as_mut(), sb.form.as_ref()) {
         merge_list_extra(t, s, ff_key, ff_mut, ff_ref);
     }
+    match (target.ws.as_mut(), stored.ws.as_ref()) {
+        // A UI that rebuilt the request without `ws` must not wipe it.
+        (None, Some(s)) => target.ws = Some(s.clone()),
+        (Some(t), Some(s)) => {
+            merge_extra(&mut t.extra, &s.extra);
+            merge_list_extra(&mut t.messages, &s.messages, msg_key, msg_mut, msg_ref);
+            if let (Some(t), Some(s)) = (t.socket_io.as_mut(), s.socket_io.as_ref()) {
+                merge_extra(&mut t.extra, &s.extra);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn msg_key(m: &SavedMessage) -> &str {
+    &m.name
+}
+fn msg_mut(m: &mut SavedMessage) -> &mut Extra {
+    &mut m.extra
+}
+fn msg_ref(m: &SavedMessage) -> &Extra {
+    &m.extra
 }
 
 /// New `updatedAt` for an edit: now, but always later than the previous

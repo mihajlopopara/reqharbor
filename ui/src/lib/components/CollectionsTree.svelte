@@ -9,6 +9,7 @@
   import VirtualList from "./VirtualList.svelte";
   import Hl from "./Hl.svelte";
   import Icon from "./Icon.svelte";
+  import { ws } from "../stores/ws.svelte";
 
   const ROW = 26;
   const filter = $derived(ui.filters.collections);
@@ -394,7 +395,7 @@
             {@const req = app.index?.requestById.get(r.id)}
             <span class="m m-custom" title={req?.kind ?? "http"} data-testid="tree-kind">{newerKindLabel(req ?? {})}</span>
           {:else}
-            <span class="m {methodClass(r.method ?? 'GET')}" title={r.method}>{methodLabel(r.method ?? "GET")}</span>
+            <span class="m {r.ws ? 'm-ws' : methodClass(r.method ?? 'GET')}" title={r.ws ? (r.method === "SIO" ? "Socket.IO" : "WebSocket") : r.method} data-testid={r.ws ? "tree-ws" : undefined}>{methodLabel(r.method ?? "GET")}</span>
           {/if}
         {/if}
         {#if ui.renaming?.id === r.id}
@@ -430,6 +431,13 @@
         {#if r.kind === "request" && app.skippedReasons.has(r.id)}
           {@const why = skippedReasonText(app.skippedReasons.get(r.id) ?? "too_large")}
           <span class="skipped" title={why.title} data-testid="not-synced-badge"><Icon name="cloud-off" small />{why.label}</span>
+        {/if}
+        {#if r.kind === "request" && r.ws}
+          {@const st = ws.session(r.id)?.state}
+          {#if st === "open" || st === "connecting" || st === "closing"}
+            {@const label = st === "open" ? "Connected" : st === "connecting" ? "Connecting" : "Closing"}
+            <span class="live" class:pending={st !== "open"} title={label} aria-label={label} role="img" data-testid="tree-live" data-state={st}></span>
+          {/if}
         {/if}
         {#if r.kind === "request" && app.isDirty(r.id)}<span class="unsaved" title="Unsaved changes" data-testid="tree-dirty"></span>{/if}
         {#if r.kind === "collection"}<span class="cnt">{r.count}</span>{/if}
@@ -544,6 +552,17 @@
     border-radius: 50%;
     background: var(--text-2);
     flex: none;
+  }
+  /* An open WebSocket / Socket.IO connection (DESIGN §5.3). */
+  .live {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--success);
+    flex: none;
+  }
+  .live.pending {
+    background: var(--warning);
   }
   .newer {
     display: inline-flex;

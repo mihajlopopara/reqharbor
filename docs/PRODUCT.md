@@ -26,7 +26,7 @@ ReqHarbor is a native-feeling desktop HTTP client for developers who want Postma
 
 ### 2.2 Later (not in MVP)
 
-Multiple open request tabs; scripting (pre-request/tests); OAuth 1/2, AWS SigV4, Digest, NTLM; GraphQL schema introspection/autocomplete; WebSocket, SSE, gRPC; collection runner; Postman/Insomnia/Thunder import; HAR import; code generation beyond cURL; OS keychain for tokens; real-time collaboration and multi-user permissions; deep link `reqharbor://` to import shares; proxy and client-certificate settings; Windows `cmd` (`^`) and PowerShell cURL dialects.
+Multiple open request tabs; scripting (pre-request/tests); OAuth 1/2, AWS SigV4, Digest, NTLM; GraphQL schema introspection/autocomplete; SSE, gRPC (WebSocket and Socket.IO shipped, §5.12); collection runner; Postman/Insomnia/Thunder import; HAR import; code generation beyond cURL; OS keychain for tokens; real-time collaboration and multi-user permissions; deep link `reqharbor://` to import shares; proxy and client-certificate settings; Windows `cmd` (`^`) and PowerShell cURL dialects.
 
 ## 3. Data model
 
@@ -37,10 +37,14 @@ Workspace   { id, name, sync?: { workerUrl, remoteWorkspaceId, token, cursor } }
 Project     { id, workspaceId, name, sortOrder, activeEnvironmentId|null }
 Collection  { id, projectId, name, description, auth: Auth, sortOrder }
 Folder      { id, collectionId, parentFolderId|null, name, sortOrder }
-Request     { id, collectionId, folderId|null, name, method, url,
+Request     { id, kind?: "http"(default, omitted)|"ws"|…, minClientVersion?,
+              collectionId, folderId|null, name, method, url,
               params: KeyValue[], headers: KeyValue[], auth: Auth, body: Body,
               settings: { followRedirects: bool=true, timeoutMs: int=30000, verifyTls: bool=true },
-              sortOrder }
+              ws?: WsConfig, sortOrder }
+WsConfig    { messages: SavedMessage[], protocols: string[], autoReconnect: bool=false,
+              socketIo?: { path="/socket.io/", namespace="/", version=4, auth? (JSON text) } }
+SavedMessage{ name, kind: "text"|"json"|"binary" (body base64), body, event? (Socket.IO), ack?: bool }
 KeyValue    { key, value, enabled: bool, description? }
 Auth        { type: "none"|"inherit"|"basic"|"bearer"|"apikey",
               username?, password?, token?, apiKey?: { key, value, in: "header"|"query" } }
@@ -54,7 +58,8 @@ HistoryEntry{ id, timestamp, sourceRequestId|null,
               request: Request (as edited, unresolved) , resolvedUrl, method,
               response?: { status, statusText, timeMs, sizeBytes,
                            headers: [name, value][], body (≤1 MB, truncated flag), bodyEncoding: "utf8"|"base64" },
-              error?: { kind: "dns"|"connect"|"tls"|"timeout"|"cancelled"|"other", message } }
+              error?: { kind: "dns"|"connect"|"tls"|"timeout"|"cancelled"|"other", message },
+              ws?: { durationMs, sent, received, closeCode?, closeReason? } }   // WebSocket sessions, method "WS"/"SIO"
 ```
 
 Rules: `method` is an uppercase token string (`GET … QUERY` or custom matching `^[A-Z][A-Z0-9_-]*$`). `auth.type="inherit"` uses the parent collection's auth. Deleting a container deletes its children. Sync tombstones are kept locally as `{ id, type, deletedAt }` until pushed.
@@ -165,7 +170,7 @@ Entry points: ⌘U dialog; pasting text starting with `curl ` into the URL bar t
 - AC-ENV-10: JSON, XML, Text and GraphQL-variables editors have "Insert fake data" next to Format: a menu of the catalogue that inserts `{{$name}}` at the caret.
 
 ### 5.9 History (HIST)
-- AC-HIST-1: Every send (success, error, or cancel) appends a history entry; the newest 500 are kept.
+- AC-HIST-1: Every send (success, error, or cancel) appends a history entry; the newest 500 are kept. A WebSocket / Socket.IO session appends one entry when it ends (AC-WS-7).
 - AC-HIST-2: Activity rows show method badge, resolved URL, relative time (refreshing each minute), and status code chip.
 - AC-HIST-3: The filter matches URL, method, or status code (e.g. `404`, `QUERY`) and updates on each keystroke.
 - AC-HIST-4: Clicking a row opens the request in the editor and its stored response in the response pane without re-sending; "Save to collection" turns it into a saved request.
@@ -182,17 +187,27 @@ Entry points: ⌘U dialog; pasting text starting with `curl ` into the URL bar t
 
 ### 5.11 Sharing (SHARE)
 - AC-SHARE-1: "Share…" on a collection or request (requires sync connection) uploads an immutable snapshot and copies the share URL.
-- AC-SHARE-2: Before sharing, a dialog lists what will be stripped: secret variables are always removed; Authorization/Cookie headers and Auth tab values are replaced by `{{placeholder}}` unless "Include credentials" is checked. Without credentials, fields this version doesn't know are left out too (a newer ReqHarbor may keep secrets there), and an item made with a newer ReqHarbor can only be shared with "Include credentials" checked. Optionally an environment (non-secret variables only) can be attached.
+- AC-SHARE-2: Before sharing, a dialog lists what will be stripped: secret variables are always removed; Authorization/Cookie headers, Auth tab values and a Socket.IO auth payload are replaced by `{{placeholder}}` (`{{socketIoAuth}}` for the latter) unless "Include credentials" is checked. Without credentials, fields this version doesn't know are left out too (a newer ReqHarbor may keep secrets there), and an item made with a newer ReqHarbor can only be shared with "Include credentials" checked. Optionally an environment (non-secret variables only) can be attached.
 - AC-SHARE-3: The share URL opens a read-only web page with the collection tree, method badges, URLs, headers, and bodies, and a "Copy as cURL" button per request. No editing is possible.
 - AC-SHARE-4: "Update share" replaces the snapshot behind the same URL; "Revoke" makes the URL return 410 Gone.
 - AC-SHARE-5: "Import from link" in the app accepts a share URL and creates a copy in the current project (new IDs).
 - AC-SHARE-6: Settings → Shares lists active shares with created/updated time, copy link, update, and revoke.
 
+### 5.12 WebSocket and Socket.IO (WS)
+- AC-WS-1: The method dropdown offers **WS** (WebSocket) and **SIO** (Socket.IO) after the HTTP methods. Choosing one sets `kind: "ws"` (Socket.IO = `ws.socketIo` present, defaults path `/socket.io/`, namespace `/`, version 4); choosing an HTTP method switches back and keeps `ws` for later. Every save stamps `minClientVersion` with "0.1.0", the first version with WebSocket support (a fixed value, never the running version, so later builds don't lock out older WebSocket-capable ones; a newer stamp is never lowered), so a ReqHarbor without WebSocket support shows the request read-only instead of dropping `ws`. A saved message kind other than text/json/binary, or a Socket.IO version other than 4, makes the request read-only (AC-FWD-3). The tree, Activity and the request bar show `WS` / `SIO` in `--method-ws`.
+- AC-WS-2: Connect resolves variables like a send (project env → Global, `{{$…}}` with one value per name for the whole handshake), applies Query params, Headers and Auth (Basic, Bearer, API key header or query, Inherit) to the opening GET, offers the subprotocols as `Sec-WebSocket-Protocol`, maps `http(s)://` to `ws(s)://` (no scheme: like AC-REQ-10) and drops the fragment. Socket.IO mode replaces the URL's path with the Engine.IO path and adds `EIO=4&transport=websocket`, then joins the namespace (CONNECT with the optional JSON auth payload). `timeoutMs` limits connect + handshake (0 = none); `verifyTls: false` accepts any certificate. Failures are typed like AC-REQ-9 (DNS, connect, TLS, timeout, a non-101 answer with its status, a refused namespace with the server's message) and shown in the log with Retry; a TLS failure offers "Disable TLS verification for this request". Validation problems (empty or non-ws URL, auth payload that isn't a JSON object, or one using an undefined variable: "Define {{socketIoAuth}} (the shared Socket.IO auth payload) in your environment") block the connect inline.
+- AC-WS-3: The request bar's button reads Connect → Cancel (spinner, while connecting) → Disconnect (open) → Closing…; Enter in the URL bar connects. Disconnect sends a close frame (1000; in Socket.IO mode the namespace DISCONNECT first) and waits up to 3 s for the server's close. Cancel while the connect is still being set up is honoured as soon as it is. Quitting the app (or reloading its window) closes every open socket with 1001. Deleting a request, or the folder or collection holding it, closes its connection. The tree shows a live dot on a request with an open connection.
+- AC-WS-4: Tabs are Message · Saved messages · Headers · Auth · Query · Settings. Message: Text / JSON / Binary (base64) for WebSocket; event name, Ack toggle and a JSON or text argument for Socket.IO (an empty JSON argument emits no argument; reserved event names are refused). JSON and base64 are checked before sending; variables (incl. new `{{$…}}` values per message) resolve when sent. Send / Emit and ⌘Enter send while connected; Ping sends a ping frame. "Save message" adds the composed message (with a name) to Saved messages, which belong to the request (saved with ⌘S, synced and shared); each can be loaded into the composer, sent, renamed, duplicated, moved or deleted.
+- AC-WS-5: The response pane becomes the message log: one row per frame with direction icon (received / sent / system), time (ms), kind, a one-line preview and size; frames arrive in order and the list is virtualised (newest 10 000 frames and about 32 MB kept; a payload over 256 KB is cut in the log with a notice). A row expands to the full payload, JSON pretty-printed, binary as UTF-8 text when possible else hex, with Copy. The log follows new messages until scrolled up ("Jump to latest"). Filter by text (event name or the first 8 KB of each payload; text further into a larger message isn't searched, and the filter's tooltip says so), by direction (All / Received / Sent / System) and Hide pings; Clear empties it; Copy copies the shown rows. The status strip shows Connecting / Connected / Closed / Failed, the duration and the sent / received data-message counts.
+- AC-WS-6: Settings: subprotocols, "Reconnect automatically" (after a drop or an abnormal close, up to 5 attempts 1 s → 16 s apart, shown in the log, counted afresh only after a connection stayed up 10 s; never after Disconnect or a normal 1000 close; a failing first connect isn't retried), connect timeout, Verify TLS and, in Socket.IO mode, path, namespace and auth payload; the URL that will be opened is shown.
+- AC-WS-7: When a session ends, one history entry is written: method `WS` / `SIO`, the URL with secrets masked (AC-ENV-7), the request as edited, duration, sent / received counts, close code and reason, or the connect error. Activity shows `↑sent ↓received` and the duration; opening it restores the request with a summary and Reconnect (message contents are not kept).
+- AC-WS-8: Socket.IO speaks Engine.IO v4 over WebSocket (Socket.IO 3/4 servers): server pings are answered automatically (shown as ping / pong rows) and a missing ping within `pingInterval + pingTimeout` drops the connection; incoming events are shown by name with their arguments, acks with their id (outgoing acks are numbered from 0 per connection). Binary attachments are reported as unsupported and skipped. Known limitation: server events that ask for an acknowledgement are shown with their ack id but never acknowledged.
+
 ## 6. Keyboard shortcuts
 
 | Action | macOS | Win/Linux |
 |---|---|---|
-| Send request / cancel when in flight | ⌘Enter | Ctrl+Enter |
+| Send request / cancel when in flight; WebSocket: connect, or send the composed message when connected | ⌘Enter | Ctrl+Enter |
 | Import cURL | ⌘U | Ctrl+U |
 | Change environment | ⌘E | Ctrl+E |
 | New request | ⌘N | Ctrl+N |

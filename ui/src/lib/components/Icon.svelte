@@ -3,6 +3,12 @@
   const PATHS: Record<string, string> = {
     "chev-d": '<path d="M4 6l4 4 4-4"/>',
     "chev-r": '<path d="M6 4l4 4-4 4"/>',
+    // Message log directions (AC-WS-5): received, sent, system note.
+    "dir-in": '<path d="M12 4L4.5 11.5M4.5 6v5.5H10"/>',
+    "dir-out": '<path d="M4 12l7.5-7.5M6 4.5h5.5V10"/>',
+    "dir-sys": '<circle cx="8" cy="8" r="2"/>',
+    plug: '<path d="M6 2.5v3M10 2.5v3M4.5 5.5h7v2a3.5 3.5 0 0 1-7 0zM8 11v2.5"/>',
+    filter: '<path d="M2.5 3.5h11l-4.2 5v4l-2.6 1.2V8.5z"/>',
     menu: '<path d="M3 4h10M3 8h10M3 12h10"/>',
     search: '<circle cx="7" cy="7" r="4"/><path d="M10 10l3 3"/>',
     plus: '<path d="M8 3v10M3 8h10"/>',

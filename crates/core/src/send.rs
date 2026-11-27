@@ -289,6 +289,7 @@ pub fn history_entry(
             // Error texts embed the resolved URL: show the masked one.
             message: e.message.replace(&prepared.url, &prepared.display_url),
         }),
+        ws: None,
     };
     redactor.redact_struct(&entry)
 }

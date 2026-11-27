@@ -61,6 +61,16 @@ Backend: `src-tauri/src/commands.rs` (thin wrappers) over `crates/core` (`reqhar
 | New error codes `read_only_role`, `space_unavailable`, `forbidden_role`; sync errors `sign_in_required`, `client_too_old`, `server_full` (retried), `rate_limited` (retried). A legacy 403 `legacy_disabled` reads "This server no longer accepts token sync. Sign in instead." | §1, §3.12 |
 | New file `sync-spaces.json` (+ backup); `account.json` holds the bindings. Signing in removes `sync` from `workspace.json`. | §3.12, §4 |
 
+### WebSocket and Socket.IO (next features §3)
+
+| Change | Where |
+|---|---|
+| `kind: "ws"` is editable and runnable (AC-WS-1); `Request` gains `ws?: WsConfig` (`messages: SavedMessage[]`, `protocols`, `socketIo?`, `autoReconnect`). Unknown keys inside `ws` round-trip; an unknown `SavedMessage.kind` or a `socketIo.version` other than 4 makes the request read-only. `create_request` / `save_request` stamp `minClientVersion` on `ws` requests with the fixed `WS_MIN_CLIENT_VERSION` "0.1.0" (the first version with WebSocket support, never the running version; never lowering a newer stamp); `save_request` keeps the stored `ws` when the update lacks it. | §2 |
+| New commands `ws_connect` (with an `ipc::Channel` argument `onEvent` streaming `WsFrame`s), `ws_send`, `ws_ping`, `ws_close`. | §3.13 |
+| `HistoryEntry.ws?` / `HistorySummary.ws` (`WsSessionSummary`): one entry per session, method `"WS"` / `"SIO"`. | §3.6 |
+| New error codes `ws_not_connected`, `ws_invalid_message`; `validation` details gain `notHttp` (`send_request` / `export_curl` got a `ws` request), `notWebSocket`, `invalidWsUrl`, `invalidSocketIoAuth`, `undefinedSocketIoAuthVariable`. | §1 |
+| `Backend.channel(handler)` in `ui/src/lib/api` creates the channel (Tauri `Channel`, or the mock's). | §3.13 |
+
 ## 1. Calling convention
 
 ```ts
@@ -89,7 +99,7 @@ try { await call("save_request", { request }); } catch (e) { const err = e as Co
 | `not_found` | id does not exist (project, collection, folder, request, environment, history entry, cached response) |
 | `invalid` | invalid input: empty name, deleting the last project or the Global environment, moving a node across projects or into itself, bad method on save |
 | `io` | disk error |
-| `validation` | send blocked; `details` = `{kind:"invalidMethod",message}` \| `{kind:"invalidGraphqlVariables",message}` (AC-REQ-5) \| `{kind:"emptyUrl"}` |
+| `validation` | send blocked; `details` = `{kind:"invalidMethod",message}` \| `{kind:"invalidGraphqlVariables",message}` (AC-REQ-5) \| `{kind:"emptyUrl"}` \| `{kind:"inheritedAuthNeedsNewerVersion"}` \| `{kind:"notHttp"}` (a `ws` request given to `send_request` / `export_curl`) \| `{kind:"notWebSocket"}` \| `{kind:"invalidWsUrl",message}` \| `{kind:"invalidSocketIoAuth",message}` \| `{kind:"undefinedSocketIoAuthVariable",message}` (`message` = the variable name; "Define {{socketIoAuth}} (the shared Socket.IO auth payload) in your environment") (`ws_connect`) |
 | `format_error` | `format_body` failed; `details` = `{message, line, column}` (1-based) — leave text untouched, move the cursor there (AC-REQ-6) |
 | `not_curl` | text is not a curl command → show "Not a cURL command", change nothing (AC-CURL-17) |
 | `curl_missing_url`, `curl_syntax` | curl command without URL / with an unterminated quote |
@@ -111,6 +121,8 @@ try { await call("save_request", { request }); } catch (e) { const err = e as Co
 | `not_signed_in` | an account command without an account |
 | `keychain_unavailable` | the session could not be written to (or read from) the secret store |
 | `rate_limited`, `server_full`, `server_error`, `auth_rejected` | 429, 507, other 5xx / unexpected answer, other refusals (`message` from the server) |
+| `ws_not_connected` | `ws_send` on a connection that isn't open (unknown id, still connecting, or closed) |
+| `ws_invalid_message` | `ws_send` refused the message: invalid JSON or base64, no or reserved Socket.IO event name, binary in Socket.IO mode (`message` says which) |
 | `internal` | unexpected |
 
 ## 2. Data model
@@ -129,7 +141,7 @@ Exactly PRODUCT.md §3, serialized as in `types.ts`. Notes that matter to the UI
 * **Timeout**: `settings.timeoutMs: 0` disables the timeout (imported from `curl -m 0`).
 * **Unknown keys (AC-FWD-1)**: objects may carry keys that are not in `types.ts`, written by a newer ReqHarbor (on another device, via sync or a share). The backend preserves them everywhere; the UI must not drop them — copy objects with spread / `structuredClone` instead of rebuilding them. As a safety net `save_request` re-adds keys the stored request has and the update lacks, at every nesting level (list rows are matched by `key`).
 * **Newer containers (AC-FWD-4)**: a `Project`, `Collection`, `Folder` or `Environment` may carry `minClientVersion`; newer than `Bootstrap.appVersion` (or not a string) = read-only here, see `read_only_newer` in §1. The tree shows the "Requires a newer ReqHarbor" badge on such a collection or folder, offers no Rename / Duplicate / Move / Settings for it, and never starts a rename or drag of it.
-* **Request kind (AC-FWD-2..4)**: `kind` is absent (= `"http"`) for every request this build creates. A request is **read-only** when `kind` is anything but `"http"`, when `body.type` is not one of the eight known types, when `auth.type` is not one of the five known schemes or `auth.apiKey.in` is not `header`/`query`, when a form field's `kind` is not `text`/`file`, or when `minClientVersion` is newer than `Bootstrap.appVersion` (an unparseable version counts as newer). The stored copy decides: the UI treats an open request as read-only when either the editor copy or the saved one is. When a sync pull turns the open request read-only, the editor switches to the saved, view-only copy; unsaved edits (of it or of a stashed draft) are offered once as "Save my edits as a copy" (a new, editable request via `create_request`). Read-only requests: the tree shows a "Requires a newer ReqHarbor" badge; the pane is view-only, Save and Send are disabled ("This request needs a newer version of ReqHarbor"); the only tree actions are Open and Delete. The backend refuses edits and sends with `read_only_newer` and sync never pushes a locally modified version of one (a remote version always replaces it).
+* **Request kind (AC-FWD-2..4, AC-WS-1)**: `kind` is absent (= `"http"`) for HTTP requests and `"ws"` for WebSocket / Socket.IO requests (§3.13). A request is **read-only** when `kind` is anything but `"http"` or `"ws"`, when a saved WebSocket message's `kind` is not `text`/`json`/`binary` or `ws.socketIo.version` is not 4, when `body.type` is not one of the eight known types, when `auth.type` is not one of the five known schemes or `auth.apiKey.in` is not `header`/`query`, when a form field's `kind` is not `text`/`file`, or when `minClientVersion` is newer than `Bootstrap.appVersion` (an unparseable version counts as newer). The stored copy decides: the UI treats an open request as read-only when either the editor copy or the saved one is. When a sync pull turns the open request read-only, the editor switches to the saved, view-only copy; unsaved edits (of it or of a stashed draft) are offered once as "Save my edits as a copy" (a new, editable request via `create_request`). Read-only requests: the tree shows a "Requires a newer ReqHarbor" badge; the pane is view-only, Save and Send are disabled ("This request needs a newer version of ReqHarbor"); the only tree actions are Open and Delete. The backend refuses edits and sends with `read_only_newer` and sync never pushes a locally modified version of one (a remote version always replaces it).
 
 ## 3. Commands
 
@@ -224,6 +236,8 @@ Backend behaviour the UI can rely on: URL without scheme → `http://` for local
 | `open_history_entry` | `historyId` | `OpenedHistory` — request for the editor + `response` meta with a `responseId` for `get_response_body` (AC-HIST-4, no re-send). `entry.error` holds failed/cancelled sends. |
 | `delete_history_entry` | `historyId` | `null` |
 | `clear_history` | – | `null` (confirm in the UI first) |
+
+A WebSocket / Socket.IO session writes one entry when it ends (AC-WS-7): `method` `"WS"` / `"SIO"`, no `response`, `ws: WsSessionSummary` (`durationMs`, `sent`, `received`, `closeCode?`, `closeReason?`) and `error` when the connect failed or the connection was lost; `HistorySummary.ws` carries the same summary (`null` for HTTP sends; `status` / `timeMs` are `null` for sessions). `open_history_entry` returns `response: null` for them.
 
 Filtering (AC-HIST-3) is done in the UI over the summaries: case-insensitive substring match on `resolvedUrl`, `method`, or `String(status)`. "Save to collection" = `create_request(collectionId, folderId, entry.request)`. Secret variable values never appear in history (`resolvedUrl` shows `{{name}}`).
 
@@ -359,6 +373,48 @@ Shares in account mode go to the entity's project space (`sync_not_connected` "S
 The viewer guard (04 §6.8): every project-tree mutator refuses with `read_only_role` for a project in a space where the account is a viewer (teams, M2).
 
 Mock switches: `?mockSpace=quota|server_full|skew|client_too_old|unavailable`, `?mockTeam=1`, `?mockLegacy=1`, `?mockForeign=1` (with `mockAccount=signedIn`).
+
+### 3.13 WebSocket and Socket.IO (AC-WS-*)
+
+The webview's CSP allows no `ws:` connections: sockets live in Rust (`crates/core/src/ws.rs`, tokio-tungstenite over tokio-rustls with the platform verifier like reqwest) and stream to the UI over a Tauri 2 `ipc::Channel` per connection, in order.
+
+| command | args | result |
+|---|---|---|
+| `ws_connect` | `connectionId, request, projectId?, onEvent: Channel<WsFrame>` | `WsConnectResult { connectionId, historyId, method: "WS"\|"SIO", resolvedUrl, unresolvedVariables }` — resolves as soon as the connection is being opened |
+| `ws_send` | `connectionId, message: SavedMessage` (`name` ignored) | `{ ackId: number \| null }` once the frame is on the wire (`ackId` for a Socket.IO emit with `ack: true`) |
+| `ws_ping` | `connectionId` | `boolean` (false when not connected) |
+| `ws_close` | `connectionId, code?, reason?` | `boolean` (false when nothing was open). `code` 1000 (default) or 3000–4999, `reason` ≤ 123 bytes, else `invalid`. While connecting it stops the attempt. |
+
+```ts
+const onEvent = await channel<WsFrame>((f) => log.push(f)); // ui/src/lib/api: Backend.channel → new Channel()
+const { resolvedUrl } = await call("ws_connect", { connectionId: ulid(), request, projectId, onEvent });
+await call("ws_send", { connectionId, message: { name: "", kind: "json", body: '{"op":"hi"}' } });
+await call("ws_close", { connectionId, code: 1000 });
+```
+
+`ws_connect` rejects (nothing opened) with `read_only_newer`, or `validation` (`notWebSocket`, `emptyUrl`, `invalidWsUrl`, `invalidSocketIoAuth`, `undefinedSocketIoAuthVariable` when the auth payload uses an undefined variable such as a share's `{{socketIoAuth}}`, `inheritedAuthNeedsNewerVersion`). Variables resolve like `send_request` with one `{{$…}}` memo for the whole handshake (URL, params, headers, auth, subprotocols, Socket.IO auth); `ws_send` resolves the message with the project's current environment and fresh `{{$…}}` values. Re-using a `connectionId` closes the previous connection.
+
+**Frames** (`WsFrame`, camelCase): `{ dir: "in"|"out"|"system", ts, kind, data, size, event?, ackId?, code?, truncated?, last? }`.
+
+| `kind` | dir | `data` |
+|---|---|---|
+| `text` | in / out | the text |
+| `binary` | in / out | base64 |
+| `ping`, `pong` | in / out | base64 payload (WebSocket); the Engine.IO probe text in Socket.IO mode |
+| `close` | in / out | close reason, `code` set |
+| `event` | in / out | JSON array of the arguments; `event` = name, `ackId` when an ack was asked for |
+| `ack` | in | JSON array of the ack's arguments, `ackId` |
+| `open` | system | "Connected to … (101 Switching Protocols) · subprotocol x" / "… · Socket.IO namespace /x · sid …" |
+| `error` | system | a connect failure, a dropped connection, a skipped binary attachment, an invalid packet |
+| `reconnecting` | system | "Reconnecting in 2 s (attempt 2 of 5)" (`autoReconnect`) |
+| `info` | system | other notes (a server close before a reconnect) |
+| `close` | system | **always last**, `last: true`, `code` when the socket closed with one: "Disconnected · 1000", "Connection failed", "Connection lost", "Connection cancelled". The history entry is written right after it. |
+
+`data` is cut at 256 KB (`truncated: true`); `size` is the payload size in bytes (Socket.IO: the packet). Messages up to 64 MB are accepted. The UI log keeps the newest 10 000 frames and about 32 MB of payload text (oldest dropped first); its text filter searches the event name and the first 8 KB of each payload. The connection state follows from the frames: `open` → open; an `out` `close` → closing; `reconnecting` → connecting; `last` → closed.
+
+Behaviour: plain WebSocket answers server pings automatically (shown as an `in` ping). Socket.IO (Engine.IO v4): handshake `?EIO=4&transport=websocket` on the configured path; OPEN `0{…}`, CONNECT `40/ns,{auth}` → `40…` (or `44…` = refused, the connect fails with the server's `message`), EVENT `42/ns,id[…]`, ACK `43/ns,id[…]`, PING `2` → PONG `3` (both logged), DISCONNECT `41/ns,` on close; no ping within `pingInterval + pingTimeout` drops the connection (`error`, `timeout`). Packets of another namespace are ignored; BINARY_EVENT / BINARY_ACK (5/6) and binary frames are skipped with one `error` note. An Engine.IO CLOSE (`1`) is answered with a WebSocket close 1000. **Known limitation:** a server event that asks for an acknowledgement (`42…id[…]`, shown with its `ackId`) is never acknowledged; the server's callback won't fire. `autoReconnect`: after an `error`-drop or a server close other than 1000 (Socket.IO: not after the server's namespace DISCONNECT), up to 5 attempts 1, 2, 4, 8, 16 s apart; the count starts over only after a connection stayed up 10 s, so a server that accepts and drops at once gets 5 in all. `ws_close` during the wait ends the session. On app exit every session closes with 1001 "ReqHarbor closed"; when the webview reloads (or its channel can't deliver a frame) its sessions are cancelled the same way. `ws_close` sent while `ws_connect` is still pending is held by the UI and sent once it resolves. Deleting a request (or its folder / collection) closes its connection.
+
+Mock (browser mode): `ui/src/lib/api/mock/ws.ts` echoes text and binary (and greets with `{"type":"welcome",…}`), `close:<code>` makes it close with that code; Socket.IO echoes each event and acknowledges when asked. Host `refused.test` or port 1 → connect error, `*.invalid` → DNS error, a path containing `/forbidden` → 403.
 
 ## 4. Storage (for reference)
 

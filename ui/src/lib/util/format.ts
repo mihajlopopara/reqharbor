@@ -12,6 +12,17 @@ export function formatMs(ms: number): string {
   return `${Math.round(ms).toLocaleString("en-US")} ms`;
 }
 
+/** Session length: "850 ms", "4.2 s", "38 s", "3 min 05 s", "1 h 02 min". */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return formatMs(ms);
+  const s = ms / 1000;
+  if (s < 10) return `${s.toFixed(1)} s`;
+  if (s < 60) return `${Math.round(s)} s`;
+  const total = Math.round(s);
+  if (total < 3600) return `${Math.floor(total / 60)} min ${String(total % 60).padStart(2, "0")} s`;
+  return `${Math.floor(total / 3600)} h ${String(Math.floor((total % 3600) / 60)).padStart(2, "0")} min`;
+}
+
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 function startOfDay(ts: number): number {

@@ -273,7 +273,6 @@ fn ac_fwd_2_kind_defaults_to_http_and_is_omitted() {
     for (s, k) in [
         ("graphql", RequestKind::Graphql),
         ("grpc", RequestKind::Grpc),
-        ("ws", RequestKind::Ws),
         ("socketio", RequestKind::Other("socketio".into())),
     ] {
         let r: Request = serde_json::from_value(json!({"id": "x", "kind": s})).unwrap();
@@ -281,6 +280,124 @@ fn ac_fwd_2_kind_defaults_to_http_and_is_omitted() {
         assert!(!r.is_editable(), "{s} must be read-only");
         assert_eq!(serde_json::to_value(&r).unwrap()["kind"], s);
     }
+    // WebSocket requests are editable in this build (AC-WS-1).
+    let r: Request = serde_json::from_value(json!({"id": "x", "kind": "ws"})).unwrap();
+    assert_eq!(r.kind, RequestKind::Ws);
+    assert!(r.is_editable());
+    assert_eq!(serde_json::to_value(&r).unwrap()["kind"], "ws");
+}
+
+#[test]
+fn ac_ws_1_ws_config_defaults_round_trip_and_unknown_parts_are_read_only() {
+    let raw = json!({
+        "id": "x", "kind": "ws", "minClientVersion": WS_MIN_CLIENT_VERSION,
+        "ws": {
+            "messages": [{"name": "Hi", "kind": "json", "body": "{}", "fxMsg": 1}],
+            "socketIo": {"namespace": "/chat", "fxSio": true},
+            "fxWs": [1]
+        }
+    });
+    let r: Request = serde_json::from_value(raw).unwrap();
+    assert!(r.is_editable());
+    let ws = r.ws.as_ref().unwrap();
+    assert!(ws.protocols.is_empty() && !ws.auto_reconnect);
+    let sio = ws.socket_io.as_ref().unwrap();
+    assert_eq!(
+        (sio.path.as_str(), sio.namespace.as_str(), sio.version),
+        ("/socket.io/", "/chat", 4)
+    );
+    assert_eq!(ws.messages[0].kind, MessageKind::Json);
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(v["ws"]["fxWs"], json!([1]));
+    assert_eq!(v["ws"]["messages"][0]["fxMsg"], 1);
+    assert_eq!(v["ws"]["socketIo"]["fxSio"], true);
+    assert!(
+        v["ws"]["messages"][0].get("ack").is_none(),
+        "false ack omitted"
+    );
+    // A message kind or Socket.IO version from a newer ReqHarbor: read-only.
+    let mut newer = r.clone();
+    newer.ws.as_mut().unwrap().messages[0].kind = MessageKind::Other("cbor".into());
+    assert!(!newer.is_editable());
+    let mut newer = r.clone();
+    newer
+        .ws
+        .as_mut()
+        .unwrap()
+        .socket_io
+        .as_mut()
+        .unwrap()
+        .version = 5;
+    assert!(!newer.is_editable());
+    // The stamp: ws requests carry this build's version, http ones nothing.
+    let mut stamped: Request = serde_json::from_value(json!({"id": "y", "kind": "ws"})).unwrap();
+    stamped.stamp_min_client_version();
+    assert_eq!(
+        stamped.min_client_version.as_deref(),
+        Some(WS_MIN_CLIENT_VERSION)
+    );
+    let mut kept: Request =
+        serde_json::from_value(json!({"id": "y", "kind": "ws", "minClientVersion": "0.0.1"}))
+            .unwrap();
+    kept.stamp_min_client_version();
+    assert_eq!(kept.min_client_version.as_deref(), Some(WS_MIN_CLIENT_VERSION));
+    // Never the running version: a newer stamp is kept, the WS one isn't bumped
+    // to this build (a later patch build mustn't lock out older WS builds).
+    let mut newer: Request =
+        serde_json::from_value(json!({"id": "y", "kind": "ws", "minClientVersion": "99.0.0"}))
+            .unwrap();
+    newer.stamp_min_client_version();
+    assert_eq!(newer.min_client_version.as_deref(), Some("99.0.0"));
+    assert_eq!(WS_MIN_CLIENT_VERSION, "0.1.0");
+    let mut http: Request = serde_json::from_value(json!({"id": "z"})).unwrap();
+    http.stamp_min_client_version();
+    assert!(http.min_client_version.is_none());
+}
+
+#[test]
+fn ac_ws_7_session_summary_keeps_unknown_keys() {
+    let raw = json!({
+        "id": "h", "timestamp": 1, "sourceRequestId": null,
+        "request": {"id": "r", "kind": "ws"}, "resolvedUrl": "ws://a/", "method": "WS",
+        "ws": {"durationMs": 5, "sent": 1, "received": 2, "fxFrames": {"n": 3}}
+    });
+    let h: HistoryEntry = serde_json::from_value(raw).unwrap();
+    let ws = h.ws.as_ref().unwrap();
+    assert_eq!((ws.duration_ms, ws.sent, ws.received), (5, 1, 2));
+    let v = serde_json::to_value(&h).unwrap();
+    assert_eq!(v["ws"]["fxFrames"], json!({"n": 3}));
+    assert!(v["ws"].get("closeCode").is_none());
+}
+
+#[test]
+fn ac_ws_1_store_stamps_and_keeps_ws_on_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path()).unwrap();
+    let pid = s.project_list()[0].id.clone();
+    let c = s.create_collection(&pid, "C").unwrap();
+    let r: Request = serde_json::from_value(json!({
+        "id": "w", "kind": "ws", "url": "ws://echo",
+        "ws": {"messages": [{"name": "m", "body": "hi", "fxMsg": 2}], "fxWs": 1}
+    }))
+    .unwrap();
+    let created = s.create_request(&c.id, None, r).unwrap();
+    assert_eq!(
+        created.min_client_version.as_deref(),
+        Some(WS_MIN_CLIENT_VERSION)
+    );
+    // A UI that dropped the unknown keys (or `ws` entirely) loses nothing.
+    let mut edited = created.clone();
+    edited.url = "ws://echo2".into();
+    edited.ws.as_mut().unwrap().extra.clear();
+    edited.ws.as_mut().unwrap().messages[0].extra.clear();
+    let saved = s.save_request(&edited).unwrap();
+    let v = serde_json::to_value(&saved).unwrap();
+    assert_eq!(v["ws"]["fxWs"], 1);
+    assert_eq!(v["ws"]["messages"][0]["fxMsg"], 2);
+    let mut dropped = saved.clone();
+    dropped.ws = None;
+    let saved = s.save_request(&dropped).unwrap();
+    assert_eq!(saved.ws.unwrap().messages[0].body, "hi");
 }
 
 #[test]

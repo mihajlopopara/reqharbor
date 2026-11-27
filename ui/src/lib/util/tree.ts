@@ -8,7 +8,9 @@ export interface TreeRow {
   collectionId: string;
   /** For folders: parent folder; for requests: containing folder. */
   parentFolderId: string | null;
+  /** HTTP method, or "WS" / "SIO" for WebSocket requests (then `ws` is true). */
   method?: string;
+  ws?: boolean;
   url?: string;
   count?: number;
   hasChildren: boolean;
@@ -48,6 +50,22 @@ export function indexTree(tree: ProjectTree): TreeIndex {
     requestById: new Map(tree.requests.map((r) => [r.id, r])),
     collectionById: new Map(tree.collections.map((c) => [c.id, c])),
   };
+}
+
+/** Ids of the requests a delete of this node removes (the request itself, or every request below). */
+export function requestsInSubtree(ix: TreeIndex, kind: "collection" | "folder" | "request", id: string): string[] {
+  if (kind === "request") return ix.requestById.has(id) ? [id] : [];
+  const out: string[] = [];
+  const walk = (collectionId: string, folderId: string | null) => {
+    for (const r of childRequests(ix, collectionId, folderId)) out.push(r.id);
+    for (const f of childFolders(ix, collectionId, folderId)) walk(collectionId, f.id);
+  };
+  if (kind === "collection") walk(id, null);
+  else {
+    const f = ix.folderById.get(id);
+    if (f) walk(f.collectionId, f.id);
+  }
+  return out;
 }
 
 export function childFolders(ix: TreeIndex, collectionId: string, folderId: string | null): Folder[] {
@@ -104,7 +122,8 @@ export function flattenTree(ix: TreeIndex, expanded: ReadonlySet<string>, filter
         name: r.name,
         collectionId,
         parentFolderId: folderId,
-        method: r.method,
+        method: r.kind === "ws" ? (r.ws?.socketIo ? "SIO" : "WS") : r.method,
+        ws: r.kind === "ws",
         url: r.url,
         hasChildren: false,
         expanded: false,

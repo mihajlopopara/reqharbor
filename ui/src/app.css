@@ -366,6 +366,9 @@ span.icon-btn:hover {
 .m-custom {
   color: var(--method-custom);
 }
+.m-ws {
+  color: var(--method-ws);
+}
 .code-chip {
   display: inline-flex;
   align-items: center;
@@ -403,6 +406,10 @@ span.icon-btn:hover {
 .s1,
 .scan {
   color: var(--status-1xx);
+  background: var(--bg-active);
+}
+.ws-counts {
+  color: var(--text-2);
   background: var(--bg-active);
 }
 

@@ -75,16 +75,20 @@ export interface Folder {
 }
 
 /**
- * What a request talks (AC-FWD-2). Only "http" is editable and sendable in this build; any other
- * value (including ones this build doesn't know) makes the request read-only.
+ * What a request talks (AC-FWD-2). "http" and "ws" (WebSocket; Socket.IO when `ws.socketIo` is set,
+ * AC-WS-1) are editable in this build; any other value (including ones this build doesn't know)
+ * makes the request read-only.
  */
 export type RequestKind = "http" | "graphql" | "grpc" | "ws" | (string & {});
 
 export interface Request {
   id: string;
-  /** Omitted (= "http") for every request this build creates. */
+  /** Omitted (= "http") for HTTP requests; "ws" for WebSocket / Socket.IO requests. */
   kind?: RequestKind;
-  /** Oldest ReqHarbor allowed to edit this request (AC-FWD-4); newer than `Bootstrap.appVersion` = read-only. */
+  /**
+   * Oldest ReqHarbor allowed to edit this request (AC-FWD-4); newer than `Bootstrap.appVersion` = read-only.
+   * WebSocket requests are stamped with "0.1.0", the first version with WebSocket support (AC-WS-1).
+   */
   minClientVersion?: string;
   /** Owning collection; "" (empty string) for an unsaved scratch request. */
   collectionId: string;
@@ -99,9 +103,53 @@ export interface Request {
   auth: Auth;
   body: Body;
   settings: RequestSettings;
+  /**
+   * WebSocket settings (kind "ws"). Headers, auth, params and settings apply to the opening handshake;
+   * `body` is unused. Kept when the kind is switched back to HTTP.
+   */
+  ws?: WsConfig;
   sortOrder: number;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface WsConfig {
+  /** Saved messages, in user order. */
+  messages: SavedMessage[];
+  /** `Sec-WebSocket-Protocol` values offered on connect. */
+  protocols: string[];
+  /** Set = Socket.IO mode (Engine.IO v4 over the WebSocket). */
+  socketIo?: SocketIoConfig;
+  /** Reconnect (up to 5 times, 1 s … 16 s apart) after the connection drops; never after Disconnect. */
+  autoReconnect: boolean;
+}
+
+/** Any other string comes from a newer ReqHarbor and makes the request read-only (AC-FWD-3). */
+export type MessageKind = "text" | "json" | "binary" | (string & {});
+
+export interface SavedMessage {
+  name: string;
+  kind: MessageKind;
+  /**
+   * Text, JSON text, or base64 for "binary". Variables resolve when sent. Socket.IO: the body is the
+   * event's single argument (a JSON value; a string for "text"; empty JSON = no argument).
+   */
+  body: string;
+  /** Socket.IO: event name. */
+  event?: string;
+  /** Socket.IO: ask for an acknowledgement (omitted when false). */
+  ack?: boolean;
+}
+
+export interface SocketIoConfig {
+  /** Engine.IO path, default "/socket.io/" (replaces the URL's path). */
+  path: string;
+  /** Namespace, default "/". */
+  namespace: string;
+  /** Always 4 in this build; any other value makes the request read-only. */
+  version: number;
+  /** Optional JSON object sent as the CONNECT auth payload (variables resolve). */
+  auth?: string;
 }
 
 export interface KeyValue {
@@ -246,6 +294,18 @@ export interface HistoryEntry {
   method: HttpMethod;
   response?: HistoryResponse;
   error?: SendError;
+  /** WebSocket / Socket.IO session (method "WS" / "SIO"); `response` is absent. */
+  ws?: WsSessionSummary;
+}
+
+export interface WsSessionSummary {
+  durationMs: number;
+  /** Data messages sent (text, binary, Socket.IO events). */
+  sent: number;
+  /** Data messages received (text, binary, Socket.IO events and acks). */
+  received: number;
+  closeCode?: number;
+  closeReason?: string;
 }
 
 export type Theme = "system" | "dark" | "light";
@@ -332,6 +392,11 @@ export type CommandErrorCode =
   | "server_error"
   /** Any other refusal from an account endpoint (message from the server). */
   | "auth_rejected"
+  // ── WebSocket (AC-WS-*) ──
+  /** ws_send on a connection that isn't open (never opened, still connecting, or closed). */
+  | "ws_not_connected"
+  /** ws_send: the message failed validation (invalid JSON or base64, missing event name…); the message says why. */
+  | "ws_invalid_message"
   // ── accounts: personal sync and bindings (04 §6, 06-go-server §9) ──
   /** The project syncs with a space where this account is a viewer (04 §6.8). */
   | "read_only_role"
@@ -345,7 +410,15 @@ export type PrepareErrorDetails =
   | { kind: "invalidGraphqlVariables"; message: string }
   | { kind: "emptyUrl" }
   /** The request inherits a collection auth from a newer ReqHarbor (unknown scheme). */
-  | { kind: "inheritedAuthNeedsNewerVersion" };
+  | { kind: "inheritedAuthNeedsNewerVersion" }
+  /** send_request / export_curl got a WebSocket request. */
+  | { kind: "notHttp" }
+  /** ws_connect got a request whose kind isn't "ws". */
+  | { kind: "notWebSocket" }
+  | { kind: "invalidWsUrl"; message: string }
+  | { kind: "invalidSocketIoAuth"; message: string }
+  /** ws_connect: the Socket.IO auth payload uses an undefined variable (`message` = its name), e.g. `{{socketIoAuth}}` of a share. */
+  | { kind: "undefinedSocketIoAuthVariable"; message: string };
 
 export interface FormatErrorDetails {
   message: string;
@@ -418,6 +491,8 @@ export interface HistorySummary {
   timeMs: number | null;
   errorKind: ErrorKind | null;
   sourceRequestId: string | null;
+  /** WebSocket / Socket.IO sessions: duration and message counts (status and timeMs are null). */
+  ws: WsSessionSummary | null;
 }
 
 export interface ResponseCookie {
@@ -895,6 +970,73 @@ export interface KnownServer {
   keepTyped?: boolean;
 }
 
+// ───────────────────────────── WebSocket (AC-WS-*) ─────────────────────────────
+
+/**
+ * An ordered per-call stream from Rust (a Tauri 2 `ipc::Channel`). Create it with
+ * `backend.channel(handler)` and pass it as a command argument.
+ */
+export interface EventChannel<T> {
+  onmessage: (message: T) => void;
+}
+
+export type WsFrameKind =
+  | "text"
+  | "binary"
+  | "ping"
+  | "pong"
+  | "close"
+  /** Socket.IO event: `event` = name, `data` = JSON array of its arguments. */
+  | "event"
+  /** Socket.IO acknowledgement: `ackId`, `data` = JSON array of its arguments. */
+  | "ack"
+  | "error"
+  /** system: connected (`data` = summary, e.g. "Connected to ws://… · subprotocol chat"). */
+  | "open"
+  /** system: the connection dropped and a reconnect is scheduled (autoReconnect). */
+  | "reconnecting"
+  /** system: any other note. */
+  | "info";
+
+/** One message-log entry (ws_connect's channel), delivered in order. */
+export interface WsFrame {
+  dir: "in" | "out" | "system";
+  /** Unix epoch ms. */
+  ts: number;
+  kind: WsFrameKind;
+  /** Text; base64 for binary / ping / pong payloads; JSON args for events and acks; a sentence for system frames. */
+  data: string;
+  /** Payload bytes (0 for system frames). */
+  size: number;
+  event?: string;
+  ackId?: number;
+  /** Close code (close frames and the final system close). */
+  code?: number;
+  /** `data` was cut at 256 KB (`size` is the whole payload). */
+  truncated?: boolean;
+  /** The final system "close": nothing follows on this connection (history is written). */
+  last?: boolean;
+}
+
+export interface WsConnectArgs {
+  /** Client-generated id; re-using one closes the previous connection. */
+  connectionId: string;
+  /** The request as edited (kind "ws"). Never auto-saved. */
+  request: Request;
+  projectId?: string | null;
+  onEvent: EventChannel<WsFrame>;
+}
+
+export interface WsConnectResult {
+  connectionId: string;
+  /** History entry written when the session ends (after the `last` frame). */
+  historyId: string;
+  method: "WS" | "SIO";
+  /** URL being opened (secret values shown as {{name}}). */
+  resolvedUrl: string;
+  unresolvedVariables: string[];
+}
+
 // ───────────────────────────── Events ─────────────────────────────
 
 export interface Events {
@@ -970,6 +1112,14 @@ export interface Commands {
   clear_history: { args: {}; result: null };
 
   send_request: { args: SendRequestArgs; result: SendResult };
+  /** Resolves once the connection is being opened; everything else arrives on `onEvent` (AC-WS-2/3). */
+  ws_connect: { args: WsConnectArgs; result: WsConnectResult };
+  /** Name is ignored. Rejects with "ws_not_connected" or "ws_invalid_message". */
+  ws_send: { args: { connectionId: string; message: SavedMessage }; result: { ackId: number | null } };
+  /** WebSocket ping frame; false when not connected. */
+  ws_ping: { args: { connectionId: string }; result: boolean };
+  /** Close (or stop connecting). `code`: 1000 or 3000–4999 (else "invalid"); reason ≤ 123 bytes. False when nothing was open. */
+  ws_close: { args: { connectionId: string; code?: number | null; reason?: string | null }; result: boolean };
   cancel_request: { args: { executionId: string }; result: boolean };
   get_response_body: { args: { responseId: string; limit?: number | null }; result: ArrayBuffer };
   save_response_body: { args: { responseId: string; path: string }; result: null };
