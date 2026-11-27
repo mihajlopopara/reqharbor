@@ -1,6 +1,7 @@
 //! ReqHarbor core: data model, HTTP execution, variables, cURL and OpenAPI
 //! import/export, local storage and the sync client. No Tauri dependency.
 
+pub mod auth;
 pub mod cookies;
 pub mod curl;
 pub mod dynamic;
@@ -11,7 +12,9 @@ pub mod model;
 pub mod openapi;
 pub mod prepare;
 pub mod redact;
+pub mod secrets;
 pub mod send;
+pub mod server_info;
 pub mod share;
 pub mod storage;
 pub mod sync;

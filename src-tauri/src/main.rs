@@ -1,9 +1,11 @@
 // Prevents an additional console window on Windows in release.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth_rt;
 mod commands;
 mod error;
 mod registry;
+mod secret_store;
 mod state;
 mod sync_policy;
 mod sync_rt;
@@ -24,6 +26,7 @@ fn main() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             let store = Store::open(&dir)
@@ -31,6 +34,25 @@ fn main() {
             let connected = store.workspace.sync.is_some();
             let state = AppState::new(store).map_err(|e| e.message)?;
             app.manage(state);
+            // Sign-in state: account.json plus the keychain (or 0600 file).
+            // The keychain is probed lazily: only with the accounts flag on
+            // and a saved account, or on the first sign-in (UX §2: no
+            // startup prompt for users who never use accounts).
+            let enabled = auth_rt::accounts_enabled();
+            let auth = auth_rt::AuthState::load(
+                &dir,
+                std::sync::Arc::new(secret_store::AppSecrets::for_app(&dir)),
+                enabled,
+            );
+            let signed_in = enabled && auth.account_origin().is_some();
+            app.manage(auth);
+            if signed_in {
+                // 06 §9: rediscover the account's server at app start.
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    auth_rt::rediscover_on_start(&handle).await;
+                });
+            }
             if connected {
                 // AC-SYNC-2: pull on startup.
                 let handle = app.handle().clone();
@@ -110,6 +132,15 @@ fn main() {
             commands::share_list,
             commands::import_share,
             commands::preview_share,
+            commands::server_discover,
+            commands::auth_status,
+            commands::auth_sign_in_start,
+            commands::auth_sign_in_reopen,
+            commands::auth_sign_in_cancel,
+            commands::auth_sign_out,
+            commands::auth_me,
+            commands::auth_sessions,
+            commands::auth_session_revoke,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ReqHarbor");

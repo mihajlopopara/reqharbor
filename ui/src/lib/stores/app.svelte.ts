@@ -6,7 +6,9 @@ import {
   call,
   listen,
   toCommandError,
+  type AuthStatus,
   type BodyKind,
+  type KnownServer,
   type Collection,
   type CommandError,
   type Environment,
@@ -54,6 +56,29 @@ export interface ResponseView {
   bodyError: string | null;
 }
 
+export const DEFAULT_AUTH: AuthStatus = {
+  enabled: false,
+  account: null,
+  signInRequired: false,
+  keychain: "system",
+  keychainNote: null,
+  keychainUnreadable: false,
+  server: null,
+  offline: false,
+  signIn: { state: "idle", serverUrl: null, method: null, startedAt: null, error: null, message: null, authorizeUrl: null },
+};
+
+/** Most recent first, at most this many suggestions. */
+export const KNOWN_SERVERS_MAX = 8;
+
+/** Upsert one `knownServers` entry (pure, for tests). */
+export function mergeKnownServer(list: KnownServer[] | undefined, url: string, patch: Partial<KnownServer>, now: number): KnownServer[] {
+  const all = Array.isArray(list) ? list.filter((k) => k && typeof k.url === "string") : [];
+  const prev = all.find((k) => k.url === url);
+  const next: KnownServer = { ...(prev ?? { url, lastUsedAt: now }), ...patch, url };
+  return [next, ...all.filter((k) => k.url !== url)].sort((a, b) => b.lastUsedAt - a.lastUsedAt).slice(0, KNOWN_SERVERS_MAX);
+}
+
 export type MiddleView = { kind: "request" } | { kind: "collection"; id: string } | { kind: "environment"; id: string };
 
 const defaultSync: SyncStatus = {
@@ -97,6 +122,8 @@ class AppStore {
   variables = $state.raw<VariableInfo[]>([]);
   history = $state.raw<HistorySummary[]>([]);
   sync = $state.raw<SyncStatus>(defaultSync);
+  /** Sign-in state (`auth://status`). */
+  auth = $state.raw<AuthStatus>(DEFAULT_AUTH);
   now = $state(Date.now());
 
   // editor
@@ -143,6 +170,7 @@ class AppStore {
     try {
       // QA-R2-007: subscribe before the startup load so an early pull isn't missed.
       await listen("sync://status", (s) => (this.sync = s));
+      await listen("auth://status", (s) => this.onAuth(s));
       await listen("sync://changed", (r) => {
         void this.reloadAll();
         for (const c of r.conflicts) toasts.warning(`Sync conflict: kept your edit as “${c.name}”`);
@@ -156,6 +184,14 @@ class AppStore {
       this.projects = b.projects;
       this.environments = b.environments;
       this.sync = b.sync;
+      this.auth = { ...this.auth, enabled: !!b.accounts };
+      if (b.accounts) {
+        try {
+          this.auth = await call("auth_status", {});
+        } catch {
+          /* signed out */
+        }
+      }
       const extra = b.settings as Settings & { sidebarTab?: string; exportKeepVariables?: boolean };
       if (extra.sidebarTab === "activity" || extra.sidebarTab === "collections" || extra.sidebarTab === "env") ui.sidebarTab = extra.sidebarTab;
       this.exportKeepVariables = !!extra.exportKeepVariables;
@@ -321,6 +357,47 @@ class AppStore {
     };
     if (immediate) void run();
     else this.settingsTimer = setTimeout(() => void run(), 300);
+  }
+
+  /** Apply an auth status; a fresh sign-in toasts and is remembered as a known server. */
+  onAuth(next: AuthStatus) {
+    const prev = this.auth;
+    this.auth = next;
+    if (next.signIn.state === "success" && prev.signIn.state !== "success" && next.account) {
+      toasts.success(`Signed in as ${next.account.name || next.account.email}`);
+      this.rememberServer(next.account.serverUrl, { name: next.account.serverName, lastUsedAt: Date.now() });
+    }
+  }
+
+  /** AC-AUTH-11 "Sign out on this device", after the UX §4.3 confirm. */
+  async signOut(): Promise<boolean> {
+    const pending = this.sync.connected ? this.sync.pendingChanges : 0;
+    const extra = pending > 0 ? ` ${pending} ${pending === 1 ? "change hasn't" : "changes haven't"} synced yet. They'll sync when you sign back in.` : "";
+    const ok = await ui.confirm({
+      title: "Sign out on this device?",
+      body: `Your projects stay on this device. Syncing pauses until you sign in again.${extra}`,
+      confirmLabel: "Sign out",
+      danger: false,
+    });
+    if (!ok) return false;
+    try {
+      this.auth = await call("auth_sign_out", {});
+      toasts.info("Signed out on this device");
+      return true;
+    } catch (e) {
+      this.reportError(e);
+      return false;
+    }
+  }
+
+  get knownServers(): KnownServer[] {
+    const list = (this.settings as Settings & { knownServers?: KnownServer[] }).knownServers;
+    return Array.isArray(list) ? list : [];
+  }
+
+  /** Remember a server for suggestions and its per-origin choices (06 §9). */
+  rememberServer(url: string, patch: Partial<KnownServer> = {}) {
+    this.updateSettings({ knownServers: mergeKnownServer(this.knownServers, url, patch, Date.now()) }, true);
   }
 
   /** QA-R2-002: options a share was last uploaded with (kept client-side in settings.json). */

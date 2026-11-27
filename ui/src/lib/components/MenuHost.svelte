@@ -10,7 +10,7 @@
   let typeTimer: ReturnType<typeof setTimeout> | null = null;
 
   const menu = $derived(ui.menu);
-  const actionable = (it: MenuItem) => !it.separator && !it.disabled;
+  const actionable = (it: MenuItem) => !it.separator && !it.disabled && !it.heading;
 
   $effect(() => {
     const m = menu;
@@ -95,6 +95,11 @@
     {#each menu.items as it, i (i)}
       {#if it.separator}
         <div class="sep" role="separator"></div>
+      {:else if it.heading}
+        <div class="mh" role="presentation" data-testid={it.testid}>
+          <span class="lbl">{it.label}</span>
+          {#if it.sublabel}<span class="sub">{it.sublabel}</span>{/if}
+        </div>
       {:else}
         <div
           class="mi"
@@ -135,5 +140,17 @@
   .lbl {
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .mh {
+    display: flex;
+    flex-direction: column;
+    padding: var(--sp-3) var(--sp-5);
+    font-weight: var(--fw-semibold);
+    cursor: default;
+  }
+  .mh .sub {
+    font-weight: var(--fw-regular);
+    font-size: var(--fs-sm);
+    color: var(--text-3);
   }
 </style>

@@ -10,6 +10,8 @@
   import CollectionsTree from "./CollectionsTree.svelte";
   import EnvList from "./EnvList.svelte";
   import Icon from "./Icon.svelte";
+  import Avatar from "./Avatar.svelte";
+  import { serverHost } from "../util/account";
 
   let { collapsed, onexpand }: { collapsed: boolean; onexpand: () => void } = $props();
 
@@ -33,6 +35,24 @@
   $effect(() => {
     if (ui.renaming?.kind === "project") projectName = app.project?.name ?? "";
   });
+
+  const account = $derived(app.auth.enabled && !app.auth.keychainUnreadable ? app.auth.account : null);
+
+  function accountMenu(e: MouseEvent) {
+    const a = account;
+    if (!a) return;
+    ui.openMenu(
+      [
+        { heading: true, label: a.name || a.email, sublabel: [a.email, serverHost(a.serverUrl)].filter(Boolean).join(" · "), testid: "account-menu-heading" },
+        { separator: true },
+        { label: "Account settings…", testid: "account-menu-settings", action: () => (ui.settingsDialog = { section: "account" }) },
+        { separator: true },
+        { label: "Sign out…", testid: "account-menu-signout", action: () => void app.signOut() },
+      ],
+      e.currentTarget as HTMLElement,
+      { alignRight: true },
+    );
+  }
 
   function setTab(t: SidebarTab) {
     ui.sidebarTab = t;
@@ -278,6 +298,11 @@
             data-testid="sync-indicator"><Icon name="cloud" small />{sync.state === "syncing" ? "Syncing" : "Synced"}</button
           >
         {/if}
+      {/if}
+      {#if account}
+        <button class="icon-btn avatar-btn" type="button" aria-label="Account: {account.name || account.email}" title="{account.name}{account.email ? ` · ${account.email}` : ''}" onclick={accountMenu} data-testid="account-avatar"
+          ><Avatar name={account.name} email={account.email} /></button
+        >
       {/if}
       <button class="icon-btn" type="button" aria-label="Settings" title="Settings  {shortcutText('Mod+,', app.platform)}" onclick={() => (ui.settingsDialog = { section: "general" })} data-testid="settings-button"><Icon name="gear" /></button>
     </div>

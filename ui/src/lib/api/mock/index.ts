@@ -6,7 +6,8 @@
  * Query-string switches (browser only): `?seed=empty` (first launch),
  * `?platform=macos|windows|linux`, `?corrupt=1` (one quarantined file),
  * `?newer=1` (adds requests written by a newer ReqHarbor: a gRPC one and one
- * with an unknown body type, AC-FWD-3).
+ * with an unknown body type, AC-FWD-3), `?mockAccounts=off` (hides sign-in,
+ * like a release build). Sign-in switches are documented in ./account.ts.
  */
 import { dynamicCatalogue, dynamicMemo } from "../../util/dynamic";
 import type { Backend, Unlisten } from "../index";
@@ -47,6 +48,7 @@ import { skippedWarning } from "../../util/format";
 import { applyDefaultScheme, paramsToUrl, urlToParams, encodeQueryValue } from "../../util/urlx";
 import { prettyJson, jsonErrorPosition } from "../../util/json";
 import { MockError, fail } from "./errors";
+import { MockAccounts, type MockAccountOptions } from "./account";
 import { seed, defaultSettings } from "./seed";
 import { importCurl, looksLikeCurl, exportCurl } from "./curl";
 import { convertSpec, reportOf } from "./openapi";
@@ -278,6 +280,10 @@ export interface MockOptions {
   now?: () => number;
   /** Seed requests from a newer ReqHarbor (AC-FWD-3). */
   newer?: boolean;
+  /** The `accounts` flag (default on). */
+  accountsEnabled?: boolean;
+  /** Sign-in switches (see ./account.ts). */
+  accounts?: MockAccountOptions;
 }
 
 export class MockServer {
@@ -311,11 +317,19 @@ export class MockServer {
     warning: null,
   };
   syncToken: string | null = null;
+  accounts: MockAccounts;
   private clock = 0;
   private opts: MockOptions;
 
   constructor(opts: MockOptions = {}) {
     this.opts = opts;
+    this.accounts = new MockAccounts(opts.accounts ?? {}, {
+      emit: (e, p) => this.emit(e, p),
+      delay: (ms) => this.delay(ms),
+      now: () => this.now(),
+      settings: () => this.settings,
+    });
+    this.accounts.status.enabled = opts.accountsEnabled ?? true;
     const now = this.now();
     const s = seed(now, opts.empty);
     this.workspace = s.workspace;
@@ -937,6 +951,7 @@ export class MockServer {
         platform,
         dataDir: "/mock/reqharbor",
         appVersion: MOCK_APP_VERSION,
+        accounts: this.accounts.status.enabled,
       });
     },
     get_settings: () => clone(this.settings),
@@ -1606,6 +1621,16 @@ export class MockServer {
       };
     },
 
+    server_discover: ({ serverUrl }) => this.accounts.discover(serverUrl),
+    auth_status: () => clone(this.accounts.status),
+    auth_sign_in_start: (args) => this.accounts.signInStart(args),
+    auth_sign_in_reopen: () => this.accounts.reopen(),
+    auth_sign_in_cancel: () => this.accounts.cancel(),
+    auth_sign_out: () => this.accounts.signOut(),
+    auth_me: () => this.accounts.me(),
+    auth_sessions: () => this.accounts.listSessions(),
+    auth_session_revoke: ({ sessionId }) => this.accounts.revoke(sessionId),
+
     share_preview: ({ kind, entityId, includeCredentials, environmentId }) => this.snapshotFor(kind, entityId, includeCredentials, environmentId).preview,
     share_create: async ({ kind, entityId, includeCredentials, environmentId }) => {
       this.requireSync();
@@ -1741,6 +1766,14 @@ export function getMockServer(): MockServer {
       platform: qs.get("platform") ?? undefined,
       corrupt: qs.get("corrupt") === "1",
       newer: qs.get("newer") === "1",
+      accountsEnabled: qs.get("mockAccounts") !== "off",
+      accounts: {
+        server: (qs.get("mockServer") ?? undefined) as MockAccountOptions["server"],
+        methods: qs.get("mockMethods")?.split(",").map((m) => m.trim()).filter(Boolean),
+        auth: (qs.get("mockAuth") ?? undefined) as MockAccountOptions["auth"],
+        authDelay: qs.get("mockAuthDelay") !== null ? Number(qs.get("mockAuthDelay")) : undefined,
+        account: (qs.get("mockAccount") ?? undefined) as MockAccountOptions["account"],
+      },
     });
     if (typeof window !== "undefined") (window as unknown as { __mock?: MockServer }).__mock = singleton;
   }

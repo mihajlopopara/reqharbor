@@ -1,6 +1,7 @@
 //! The single error shape every command rejects with:
 //! `{ code: string, message: string, details?: unknown }`.
 
+use reqharbor_core::auth::AuthError;
 use reqharbor_core::curl::CurlError;
 use reqharbor_core::format::FormatError;
 use reqharbor_core::openapi::OpenApiError;
@@ -94,6 +95,29 @@ impl From<SyncError> for CommandError {
     }
 }
 
+impl From<AuthError> for CommandError {
+    fn from(e: AuthError) -> Self {
+        let code = match e {
+            AuthError::Offline(_) => "server_unreachable",
+            AuthError::Cancelled => "sign_in_cancelled",
+            AuthError::Timeout => "sign_in_timeout",
+            AuthError::Denied(_) => "sign_in_denied",
+            AuthError::LoopbackUnavailable(_) => "loopback_unavailable",
+            AuthError::InvalidGrant => "sign_in_failed",
+            AuthError::SignInRequired | AuthError::Unauthorized(_) => "sign_in_required",
+            AuthError::ClientTooOld => "client_too_old",
+            AuthError::RateLimited => "rate_limited",
+            AuthError::ServerFull => "server_full",
+            AuthError::Server(_) | AuthError::Protocol(_) => "server_error",
+            AuthError::Rejected(_) => "auth_rejected",
+            AuthError::Keychain(_) => "keychain_unavailable",
+            AuthError::NotSignedIn => "not_signed_in",
+            AuthError::Store(_) => "io",
+        };
+        CommandError::new(code, e.to_string())
+    }
+}
+
 impl From<FormatError> for CommandError {
     fn from(e: FormatError) -> Self {
         let mut err = CommandError::new("format_error", e.to_string());
@@ -105,5 +129,63 @@ impl From<FormatError> for CommandError {
 impl From<std::io::Error> for CommandError {
     fn from(e: std::io::Error) -> Self {
         CommandError::new("io", e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_errors_have_stable_codes_and_no_secrets() {
+        let cases = [
+            (
+                AuthError::Offline("connection failed".into()),
+                "server_unreachable",
+            ),
+            (AuthError::Timeout, "sign_in_timeout"),
+            (AuthError::Denied("access_denied".into()), "sign_in_denied"),
+            (
+                AuthError::LoopbackUnavailable("AddrInUse".into()),
+                "loopback_unavailable",
+            ),
+            (AuthError::InvalidGrant, "sign_in_failed"),
+            (AuthError::SignInRequired, "sign_in_required"),
+            (AuthError::Keychain("denied".into()), "keychain_unavailable"),
+            (AuthError::RateLimited, "rate_limited"),
+            (AuthError::ServerFull, "server_full"),
+        ];
+        for (e, code) in cases {
+            let c = CommandError::from(e);
+            assert_eq!(c.code, code);
+            assert!(!c.message.contains("rha_") && !c.message.contains("rhr_"));
+        }
+        assert_eq!(
+            CommandError::from(AuthError::Timeout).message,
+            "Sign-in timed out. Try again."
+        );
+    }
+
+    #[test]
+    fn a_real_loopback_bind_failure_is_loopback_unavailable() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(reqharbor_core::auth::PendingSignIn::start_on(
+                ("127.0.0.1", port),
+                "https://rh.acme.dev",
+                None,
+                "x",
+            ))
+            .err()
+            .expect("a taken port can't be bound");
+        assert!(matches!(err, AuthError::LoopbackUnavailable(_)), "{err:?}");
+        let c = CommandError::from(err);
+        assert_eq!(c.code, "loopback_unavailable");
+        assert!(c.message.contains("Sync › Advanced"), "{}", c.message);
     }
 }

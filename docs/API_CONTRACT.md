@@ -42,6 +42,16 @@ Backend: `src-tauri/src/commands.rs` (thin wrappers) over `crates/core` (`reqhar
 | Per-change push results: `SkippedEntity.reason` is the server's reason (`invalid_json_value`, `forbidden_role`, … ; `entity_too_large` is reported as `too_large`); `clock_skew` and statuses this build doesn't know leave the change pending; a rejected delete stays pending. | §3.9 |
 | Shares without "Include credentials" leave out every field this build doesn't know (each block counts in `credentialsReplaced`), and refuse (`read_only_newer`) a collection or request share that holds an item from a newer ReqHarbor. | §3.10 |
 
+### Accounts: discovery and sign-in (accounts plan M1-client C1)
+
+| Change | Where |
+|---|---|
+| New commands `server_discover`, `auth_status`, `auth_sign_in_start`, `auth_sign_in_reopen`, `auth_sign_in_cancel`, `auth_sign_out`, `auth_me`, `auth_sessions`, `auth_session_revoke`; new event `auth://status`. | §3.11 |
+| `Bootstrap` gains `accounts` (the `accounts` flag). | §3.1 |
+| New error codes for discovery and sign-in. | §1 |
+| `settings.json` may hold `knownServers` (UI-managed suggestions and per-origin choices, never secret). New files `account.json` and `secrets.json` (0600 fallback store). | §3.11, §4 |
+| Sync › Advanced: the field is labelled "Server URL"; a bad URL now reads "Server URL must start with https:// or http://". | §3.9 |
+
 ## 1. Calling convention
 
 ```ts
@@ -83,6 +93,15 @@ try { await call("save_request", { request }); } catch (e) { const err = e as Co
 | `sync_not_found`, `sync_rejected`, `sync_protocol` | other Worker errors (message includes the Worker's `code: message`) |
 | `share_gone` | share link revoked (410) |
 | `read_only_newer` | the request was made by a newer ReqHarbor (non-HTTP `kind`, unknown `body.type`, `auth.type`, `auth.apiKey.in` or form field `kind`, or `minClientVersion` above `appVersion`): `save_request`, `rename_request`, `duplicate_request`, `move_node` (request), `create_request` (from such a template), `send_request` and `export_curl` refuse it. Container actions that would rewrite, copy or remove one refuse too: `move_node` of a folder to another collection, a reorder that can't keep its `sortOrder` (siblings are numbered around read-only requests; two adjacent ones leave no room between them), `duplicate_collection` / `duplicate_folder` / `duplicate_project`, and the cascading `delete_collection` / `delete_folder` / `delete_project` (the message says to delete that request on its own first). `update_collection` refuses changing an unknown auth or setting one. `delete_request` works. The same applies to a project, collection, folder or environment whose `minClientVersion` is newer than `appVersion`: `rename_project`, `set_active_environment`, `move_project` (other projects are numbered around it), `update_collection`, `rename_folder`, `update_environment`, `move_node` of it (siblings are numbered around it), duplicates of it or of a container holding it, and cascading deletes holding it refuse; `create_folder` / `create_request` inside it and deleting it on its own work. `share_preview` / `share_create` / `share_update` without `includeCredentials` refuse a collection or request share holding any such item (the message says to turn on Include credentials). Show the message as an info toast (in the Share dialog, inline). |
+| `server_unreachable` | discovery or an account call could not reach the server (network, DNS, 5xx) |
+| `token_sync_only`, `not_reqharbor`, `client_too_old`, `no_sign_in_methods` | `auth_sign_in_start` refused the server; `message` is the 06 §9 copy |
+| `insecure_unconfirmed` | plain http to a non-loopback host without `insecureConfirmed` or a `knownServers[].insecureAck` |
+| `loopback_unavailable` | no `127.0.0.1` port could be opened for the browser redirect |
+| `sign_in_cancelled`, `sign_in_timeout`, `sign_in_denied`, `sign_in_failed` | the browser sign-in was cancelled here, timed out (10 min), came back with an error, or the code exchange failed (`invalid_grant`) |
+| `sign_in_required` | the session can no longer be refreshed (AC-AUTH-9); local data is untouched |
+| `not_signed_in` | an account command without an account |
+| `keychain_unavailable` | the session could not be written to (or read from) the secret store |
+| `rate_limited`, `server_full`, `server_error`, `auth_rejected` | 429, 507, other 5xx / unexpected answer, other refusals (`message` from the server) |
 | `internal` | unexpected |
 
 ## 2. Data model
@@ -111,7 +130,7 @@ Mutating commands persist atomically before resolving (AC-COL-6) and, when sync 
 
 | command | args | result | notes |
 |---|---|---|---|
-| `bootstrap` | – | `Bootstrap` | First call on startup. First launch already contains "My Workspace" / project "Default" / Global env (AC-COL-1). Show a persistent error toast for each `corruptFiles[]` entry (AC-COL-6). `platform` drives ⌘ vs Ctrl. `appVersion` is compared with `Request.minClientVersion`. |
+| `bootstrap` | – | `Bootstrap` | First call on startup. First launch already contains "My Workspace" / project "Default" / Global env (AC-COL-1). Show a persistent error toast for each `corruptFiles[]` entry (AC-COL-6). `platform` drives ⌘ vs Ctrl. `appVersion` is compared with `Request.minClientVersion`. `accounts` is the accounts flag: show Settings › Account only when true (on in debug builds; `REQHARBOR_ACCOUNTS=1/0` overrides). |
 | `get_settings` | – | `Settings` | |
 | `save_settings` | `settings: Settings` | `Settings` | Whole object; unknown keys are preserved, so UI-only prefs can be added freely. Store `activeProjectId`, `lastOpenedRequestId`, pane sizes, theme here. Pixel sizes may be fractional (rounded to integers); the result echoes the normalised values. |
 
@@ -223,7 +242,7 @@ Import preview summary ("3 headers · JSON body · Basic auth") is derived from 
 | command | args | result |
 |---|---|---|
 | `get_sync_status` | – | `SyncStatus` |
-| `sync_create_workspace` | `workerUrl, name?` | `CreatedWorkspace` — creates the remote workspace, connects, runs the first sync. Show `token` once with Copy (AC-SYNC-1). |
+| `sync_create_workspace` | `workerUrl, name?` (labelled "Server URL"; plain http off loopback needs "Continue anyway" in the UI) | `CreatedWorkspace` — creates the remote workspace, connects, runs the first sync. Show `token` once with Copy (AC-SYNC-1). |
 | `sync_connect` | `workerUrl, token` | `SyncStatus` — validates the token (`sync_unauthorized` if wrong), connects, runs the first sync (a fresh device adopts the remote tree; its empty default project is dropped) |
 | `sync_disconnect` | – | `SyncStatus` (local data untouched) |
 | `sync_rotate_token` | – | `{ token }` (old token invalid immediately; show once) |
@@ -267,9 +286,43 @@ Limits: pushes are batched by ≤ 500 changes and ≤ 4 MB per request. An entit
 
 Sanitising (AC-SHARE-2): secret variables are always removed from the attached environment; unless `includeCredentials`, `Authorization` / `Proxy-Authorization` / `Cookie` header values become `{{authorization}}` / `{{proxyAuthorization}}` / `{{cookie}}` and auth values become `{{username}}`, `{{password}}`, `{{token}}`, `{{apiKey}}`. Also unless `includeCredentials`, every field this build doesn't know (unknown keys at any level of the collection, its folders and requests, their auth, headers, params, form rows and the attached environment's variables) is left out, because a newer ReqHarbor may keep secrets there (e.g. gRPC metadata); each such block counts once in `credentialFields` / `credentialsReplaced`. A collection or request share holding an item from a newer ReqHarbor (§2: a read-only request, or a container with a newer `minClientVersion`) is refused with `read_only_newer` unless `includeCredentials`; the Share dialog shows the message inline and disables "Create link" until the preview succeeds. A request share inlines its collection's auth when it uses Inherit. The UI must remember `shareId` per entity for "Update share" — use `share_list` (`entityId`) to find it.
 
+### 3.11 Accounts (Settings → Account)
+
+There is no default server: the user types an address. The account is **inert for sync** in this milestone (personal spaces come with C2); token sync under Sync › Advanced is unchanged and may be used at the same time, even with another server.
+
+| command | args | result |
+|---|---|---|
+| `server_discover` | `serverUrl` | `ServerDiscovery`. The address is normalised (trim, `https://` added when missing, scheme and host lowercased, default port and trailing `/` dropped); a path, query or fragment rejects with `invalid` "Enter the server's address without a path". Then `GET {origin}/v1/server` (10 s). `status`: network error or 5xx → `unreachable`; 404 `not_found` (the Worker) → `token_sync_only`; not `software: "reqharbor-server"` / unparsable / `apiVersion` < 1 → `not_reqharbor`; `minClientVersion` above `appVersion` → `client_too_old`; `features.accounts: false` → `token_sync_only` (message "no sync enabled yet" when `legacyWorkspaces` is `off`); a higher `apiVersion` is compatible. `setupRequired` keeps `canSignIn` with the setup notice; no methods → `canSignIn: false` with the admin hint. `canonicalUrl` is the normalised `publicUrl` when it differs (offer "Use that address?"; "Keep what I typed" is remembered as `knownServers[].keepTyped`). `insecure` = plain http to a host other than `localhost`, 127/8 or `::1`. For the signed-in account's server an unreachable answer falls back to the cached one (≤ 24 h, `cached: true`). |
+| `auth_status` | – | `AuthStatus` |
+| `auth_sign_in_start` | `serverUrl, method?, insecureConfirmed?` | `AuthStatus` with `signIn.state = "waiting"`, once the system browser was asked to open the link. If it couldn't be opened, `signIn.message` is "Couldn't open your browser. Copy the sign-in link and open it in your browser." and `signIn.authorizeUrl` holds the link for **Copy link** (both `null` otherwise; a later successful "Open browser again" clears them). Rediscovers first (errors above), refuses an insecure origin unless `insecureConfirmed` or `knownServers[].insecureAck` (`insecure_unconfirmed`), binds `127.0.0.1:0` (`loopback_unavailable`) and opens `{origin}/auth/authorize?client_id=reqharbor-desktop&redirect_uri=http://127.0.0.1:P/cb&code_challenge=…&code_challenge_method=S256&state=…&device_name=…[&method=…]`. The rest arrives on `auth://status`: `exchanging` when the browser comes back, then `success` (account set) or `error` (`signIn.error` holds the code). Starting again cancels a pending sign-in, except while `exchanging` (`invalid` "Sign-in is finishing. Try again in a moment."). |
+| `auth_sign_in_reopen` | – | `null` — "Open browser again" with the same URL (`not_found` when nothing is pending) |
+| `auth_sign_in_cancel` | – | `AuthStatus` (idle). Closes the listener and drops the verifier. While `exchanging` it does nothing (the sign-in finishes as one unit); a sign-out during the exchange undoes the new sign-in on disk too (revoked, keychain entry and `account.json` entry removed). |
+| `auth_sign_out` | – | `AuthStatus` — revokes the session on the server (best effort, ≤ 5 s), deletes the keychain entry and the account from `account.json`. Projects stay. |
+| `auth_me` | – | `AuthStatus` — refreshes name, email and method from `GET /v1/me`; offline keeps the cached profile and sets `offline`. |
+| `auth_sessions` | – | `SessionInfo[]` (Devices, AC-AUTH-10) |
+| `auth_session_revoke` | `sessionId` | `null` — another device's session (this device: `invalid`, use `auth_sign_out`) |
+
+Event `auth://status` (`AuthStatus`): every sign-in step, sign-out, `signInRequired` changes. On a fresh `success` the UI toasts "Signed in as {name}" and adds the server to `knownServers`.
+
+Loopback listener (06 §9, QA 9b): at most 8 connections are handled at once (more wait in the backlog), each with a 5 s read timeout; anything but `GET /cb` gets 404, a `/cb` with a wrong `state` gets 400, and the listener keeps going until the matching `state` arrives (302 to `{origin}/auth/done`, the main window is raised), `?error=` comes back (`sign_in_denied`), 10 minutes pass (`sign_in_timeout`) or the sign-in is cancelled.
+
+Tokens (06 §5.8): `POST /v1/auth/token` with a form body and RFC 6749 names (`grant_type=authorization_code`, `client_id=reqharbor-desktop`, `code`, `code_verifier`, `redirect_uri`; or `grant_type=refresh_token`, `client_id`, `refresh_token`), reading `access_token`, `refresh_token`, `expires_in`, `session_id` and `user`. Errors keep the ReqHarbor envelope `{"error":{"code":"invalid_grant",…}}` (the one deliberate departure from RFC 6749 §5.2). Every call sends `X-ReqHarbor-Version`. The access token (1 h) is refreshed 60 s before it expires; concurrent callers share one refresh; a 401 refreshes once and retries once; a refresh refused by the server (`invalid_grant`, 401 `session_revoked`) sets `signInRequired` and never touches local data. New tokens are written to the secret store **before** they are used (on a failed write the old pair stays in memory and the server's 60 s grace window returns the same new pair next time). At sign-in the order is: secret store, then `GET /v1/me`, then `account.json`.
+
+Secrets (AC-AUTH-7): one keychain entry per session, service `dev.reqharbor.desktop`, entry `session:<serverOrigin>:<userId>`, value `{accessToken, accessExpiresAt, refreshToken, sessionId}`. macOS builds use the file store unless built with `REQHARBOR_MACOS_KEYCHAIN=1`; `REQHARBOR_SECRET_STORE=file` forces it; the keychain is probed (set/get/delete, ≤ 5 s) lazily, on the first real use: loading a saved account with the accounts flag on, or the first sign-in, never at a plain app start; a failed probe (no Secret Service, locked keychain) falls back to it, and `AuthStatus.keychain` / `keychainNote` say so. A keychain read denied twice gives `keychainUnreadable` (signed-out view with a banner). Tokens never appear in `account.json`, `settings.json`, `workspace.json`, logs, errors or `AuthStatus`.
+
+Per-server identity: `account.json` holds `{schemaVersion: 1, account: {serverUrl, serverInstanceId, serverName, userId, email, name, method, sessionId}, server: ServerDiscovery, signInRequired?}`; unknown keys are kept. The account's server is rediscovered at app start and before each sign-in; a changed `instanceId` for the same origin counts as a different server (`signInRequired`). One signed-in account at a time: signing in as another account replaces it and deletes the old keychain entry.
+
+Device name (`device_name`, AC-AUTH-10): the computer name plus ` (macOS|Windows|Linux)`, at most 64 characters, keeping only Unicode general categories L* and N* plus ` ()._-` — the server's `^[\p{L}\p{N} ()._-]*$`. Combining marks (Mn/Mc/Me, e.g. Devanagari or Thai vowel signs) are dropped; a name with nothing left becomes `ReqHarbor (…)`.
+
+Plain-http acknowledgement: "Continue anyway" is stored per origin as `knownServers[].insecureAck` by both the sign-in flow and Sync › Advanced (token sync), and is pre-checked from there for the same origin.
+
+`secrets.json` (file store) that can't be parsed is renamed to `secrets.corrupt-<ts>.json` before a new one is started, like `account.json`.
+
+Mock backend switches (browser only): `?mockServer=ok|tokenOnly|legacyOnly|futureApi|otherPublicUrl|unreachable|notReqharbor|insecure|setup|tooOld` (also picked by a host containing the word, e.g. `https://tokenonly.example`), `?mockMethods=password,github,oidc`, `?mockAuth=ok|timeout|offline|denied|email_in_use|no_port|no_browser|keychain`, `?mockAuthDelay=<ms>` (0 = wait for `window.__mock.accounts.finishBrowser()`), `?mockAccount=signedIn|signInRequired|keychainUnreadable|file`, `?mockAccounts=off`.
+
 ## 4. Storage (for reference)
 
-App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping, incl. `unknownChanges`), `history.jsonl`. Unknown keys in these files are preserved on rewrite (AC-FWD-1). Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
+App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping, incl. `unknownChanges`), `history.jsonl`, `account.json` (signed in only; no tokens), `secrets.json` (only when the 0600 file store is used). Unknown keys in these files are preserved on rewrite (AC-FWD-1). Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
 
 ## 5. Not provided by the backend (UI responsibility)
 

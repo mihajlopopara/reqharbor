@@ -301,6 +301,37 @@ export type CommandErrorCode =
   | "share_gone"
   /** The request was made by a newer ReqHarbor: it can't be edited or sent here (AC-FWD-3/4). */
   | "read_only_newer"
+  // ── accounts: discovery and sign-in (06-go-server §9) ──
+  /** Network error, DNS or 5xx: "Can't reach rh.acme.dev. Check the address and your connection." */
+  | "server_unreachable"
+  /** The Worker, or a server without accounts: "This server only supports token sync. Use Sync › Advanced." */
+  | "token_sync_only"
+  | "not_reqharbor"
+  /** "This server needs ReqHarbor X or newer." Sign-in is blocked. */
+  | "client_too_old"
+  /** The server lists no sign-in methods. */
+  | "no_sign_in_methods"
+  /** Plain http to a non-loopback host without "Continue anyway". */
+  | "insecure_unconfirmed"
+  /** No local port could be opened for the browser redirect (mock: `?mockAuth=no_port`). */
+  | "loopback_unavailable"
+  | "sign_in_cancelled"
+  /** 10 minutes passed without the browser coming back. */
+  | "sign_in_timeout"
+  /** The browser came back with an error (cancelled or denied at the provider). */
+  | "sign_in_denied"
+  /** The code exchange failed (`invalid_grant`). */
+  | "sign_in_failed"
+  /** The session ended (AC-AUTH-9): sign in again; local data is untouched. */
+  | "sign_in_required"
+  | "not_signed_in"
+  /** The session could not be saved to (or read from) the keychain. */
+  | "keychain_unavailable"
+  | "rate_limited"
+  | "server_full"
+  | "server_error"
+  /** Any other refusal from an account endpoint (message from the server). */
+  | "auth_rejected"
   | "internal";
 
 export type PrepareErrorDetails =
@@ -340,6 +371,8 @@ export interface Bootstrap {
   dataDir: string;
   /** This build's version, e.g. "0.1.0"; compared with `Request.minClientVersion`. */
   appVersion: string;
+  /** The `accounts` flag: show Settings › Account and sign-in (off in release builds until personal sync ships). */
+  accounts: boolean;
 }
 
 export interface ChildCounts {
@@ -632,6 +665,126 @@ export interface ShareSnapshot {
   environment: { name: string; variables: Variable[] } | null;
 }
 
+// ───────────────────────────── Accounts (06-go-server §5, §9) ─────────────────────────────
+
+/** One sign-in method of a server. Unknown ids get a generic "Continue with {label}" button. */
+export interface AuthMethod {
+  id: "password" | "github" | "google" | "oidc" | (string & {});
+  label: string;
+}
+
+/** `GET /v1/server` (unknown fields from a newer server may appear and are kept). */
+export interface ServerInfo {
+  software: string;
+  version: string;
+  apiVersion: number;
+  instanceId: string;
+  syncEpoch: string;
+  name: string;
+  publicUrl: string;
+  minClientVersion: string | null;
+  auth: {
+    methods: AuthMethod[];
+    signup: "open" | "invite" | "closed";
+    passwordReset: "email" | "admin";
+    setupRequired: boolean;
+  };
+  features: { accounts: boolean; teams: boolean; legacyWorkspaces: "open" | "existing" | "off" };
+  sync: { types: string[]; requestKinds: string[] };
+}
+
+export type DiscoveryStatus = "ok" | "unreachable" | "token_sync_only" | "not_reqharbor" | "client_too_old";
+
+/** Result of `server_discover` (the 06 §9 table). */
+export interface ServerDiscovery {
+  /** The normalised origin that was asked, e.g. "https://rh.acme.dev". */
+  serverUrl: string;
+  status: DiscoveryStatus;
+  /** Error or notice copy (unreachable, token sync only, setup required, no methods…). */
+  message: string | null;
+  info: ServerInfo | null;
+  /** `publicUrl` when it differs from `serverUrl`: offer "Use that address?". */
+  canonicalUrl: string | null;
+  /** Plain http to a non-loopback host: warn, and require "Continue anyway". */
+  insecure: boolean;
+  /** Whether Sign in may be enabled. */
+  canSignIn: boolean;
+  fetchedAt: number;
+  /** The server is unreachable; this is the cached answer (≤ 24 h old). */
+  cached: boolean;
+}
+
+/** The signed-in account (account.json; never holds a token). */
+export interface Account {
+  serverUrl: string;
+  serverInstanceId: string;
+  serverName: string;
+  userId: string;
+  email: string;
+  name: string;
+  /** "password" | "github" | "google" | "oidc" | … */
+  method: string;
+  sessionId: string;
+}
+
+export type SignInStateName = "idle" | "checking" | "waiting" | "exchanging" | "success" | "error";
+
+export interface SignInStatus {
+  state: SignInStateName;
+  serverUrl: string | null;
+  method: string | null;
+  /** When the browser was opened (the "Waiting 0:42" timer). */
+  startedAt: number | null;
+  /** Set when `state` is "error". */
+  error: CommandErrorCode | null;
+  /** The error's copy; while "waiting", "Couldn't open your browser…" when the browser didn't open. */
+  message: string | null;
+  /** While "waiting", when the system browser couldn't be opened: the sign-in link for "Copy link". */
+  authorizeUrl: string | null;
+}
+
+/** `auth_status` and the `auth://status` event. */
+export interface AuthStatus {
+  /** The `accounts` flag. */
+  enabled: boolean;
+  account: Account | null;
+  /** AC-AUTH-9: "Your session ended. Sign in again to keep syncing." */
+  signInRequired: boolean;
+  keychain: "system" | "file" | "unavailable";
+  /** Shown as a warning when the 0600 file store is used. */
+  keychainNote: string | null;
+  /** The keychain refused to return the session: signed-out view with a banner. */
+  keychainUnreadable: boolean;
+  /** Last discovery of the account's server. */
+  server: ServerDiscovery | null;
+  /** The last profile refresh couldn't reach the server ("Offline · showing what was last synced"). */
+  offline: boolean;
+  signIn: SignInStatus;
+}
+
+/** One device (session) of the account (AC-AUTH-10). */
+export interface SessionInfo {
+  id: string;
+  deviceName: string;
+  createdAt: number | null;
+  /** Unix ms of the day it was last used. */
+  lastUsedDay: number | null;
+  /** This device. */
+  current: boolean;
+}
+
+/** `settings.json` → `knownServers[]`: suggestions and per-origin choices (not secret). */
+export interface KnownServer {
+  /** Normalised origin. */
+  url: string;
+  name?: string;
+  lastUsedAt: number;
+  /** "Continue anyway" was checked for this plain-http origin. */
+  insecureAck?: boolean;
+  /** "Keep what I typed" was chosen over the server's publicUrl. */
+  keepTyped?: boolean;
+}
+
 // ───────────────────────────── Events ─────────────────────────────
 
 export interface Events {
@@ -639,6 +792,8 @@ export interface Events {
   "sync://status": SyncStatus;
   /** A pull changed local data: reload project trees + environments; toast conflicts. */
   "sync://changed": SyncReport;
+  /** Sign-in progress, sign-out, session ended (AC-AUTH-9). */
+  "auth://status": AuthStatus;
 }
 
 // ───────────────────────────── Command map ─────────────────────────────
@@ -756,6 +911,22 @@ export interface Commands {
     args: { url: string };
     result: { kind: ShareKind; snapshot: ShareSnapshot; warnings: string[] };
   };
+
+  /** Rejects with "invalid" for an address with a path ("Enter the server's address without a path"). */
+  server_discover: { args: { serverUrl: string }; result: ServerDiscovery };
+  auth_status: { args: {}; result: AuthStatus };
+  /** Resolves once the browser is open (signIn.state "waiting"); the rest arrives on `auth://status`. */
+  auth_sign_in_start: {
+    args: { serverUrl: string; method?: string | null; insecureConfirmed?: boolean | null };
+    result: AuthStatus;
+  };
+  auth_sign_in_reopen: { args: {}; result: null };
+  auth_sign_in_cancel: { args: {}; result: AuthStatus };
+  auth_sign_out: { args: {}; result: AuthStatus };
+  auth_me: { args: {}; result: AuthStatus };
+  auth_sessions: { args: {}; result: SessionInfo[] };
+  /** Another device's session; this device signs out with auth_sign_out. */
+  auth_session_revoke: { args: { sessionId: string }; result: null };
 }
 
 export type CommandName = keyof Commands;

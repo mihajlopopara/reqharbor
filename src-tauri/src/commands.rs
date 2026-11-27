@@ -1,15 +1,18 @@
 //! Thin `#[tauri::command]` wrappers over `reqharbor-core`.
 //! Every command is documented in docs/API_CONTRACT.md; keep them in sync.
 
+use crate::auth_rt::{self, AuthState, AuthStatus};
 use crate::error::{CmdResult, CommandError};
 use crate::state::{AppState, SyncStatus};
 use crate::sync_rt::{run_sync, schedule_push};
+use reqharbor_core::auth::SessionInfo;
 use reqharbor_core::curl::{self, CurlImport, ExportOptions};
 use reqharbor_core::history::HistorySummary;
 use reqharbor_core::model::*;
 use reqharbor_core::openapi::{self, ImportReport, SpecInfo};
 use reqharbor_core::prepare::PrepareError;
 use reqharbor_core::send::{ResponseMeta, send_request as core_send};
+use reqharbor_core::server_info::Discovery;
 use reqharbor_core::share::{self, ShareOptions, SharePreview};
 use reqharbor_core::storage::{ChildCounts, CorruptFile, NodeKind};
 use reqharbor_core::sync::{
@@ -59,6 +62,8 @@ pub struct Bootstrap {
     /// This build's version; requests whose `minClientVersion` is newer are
     /// read-only (AC-FWD-4).
     pub app_version: String,
+    /// The `accounts` flag: show Settings › Account and sign-in.
+    pub accounts: bool,
 }
 
 #[tauri::command]
@@ -77,6 +82,7 @@ pub fn bootstrap(state: S<'_>) -> CmdResult<Bootstrap> {
         platform: std::env::consts::OS.to_string(),
         data_dir: store.dir().to_string_lossy().into_owned(),
         app_version: CLIENT_VERSION.to_string(),
+        accounts: crate::auth_rt::accounts_enabled(),
     })
 }
 
@@ -887,4 +893,69 @@ pub async fn preview_share(url: String) -> CmdResult<serde_json::Value> {
     Ok(
         serde_json::json!({ "kind": public.kind, "snapshot": public.snapshot, "warnings": warnings }),
     )
+}
+
+// ----------------------------------------------------------------- accounts
+
+/// Normalise a typed server address and ask `GET /v1/server` (06 §9).
+#[tauri::command]
+pub async fn server_discover(app: AppHandle, server_url: String) -> CmdResult<Discovery> {
+    auth_rt::discover(&app, &server_url).await
+}
+
+#[tauri::command]
+pub fn auth_status(auth: State<'_, AuthState>) -> AuthStatus {
+    auth.status()
+}
+
+/// Start the browser sign-in (04 §2.2). Resolves once the browser is open;
+/// progress arrives as `auth://status` events.
+#[tauri::command]
+pub async fn auth_sign_in_start(
+    app: AppHandle,
+    server_url: String,
+    method: Option<String>,
+    insecure_confirmed: Option<bool>,
+) -> CmdResult<AuthStatus> {
+    auth_rt::sign_in_start(
+        &app,
+        &server_url,
+        method.filter(|m| !m.is_empty()),
+        insecure_confirmed.unwrap_or(false),
+    )
+    .await
+}
+
+/// "Open browser again" while waiting.
+#[tauri::command]
+pub fn auth_sign_in_reopen(app: AppHandle) -> CmdResult<()> {
+    auth_rt::sign_in_reopen(&app)
+}
+
+#[tauri::command]
+pub fn auth_sign_in_cancel(app: AppHandle) -> AuthStatus {
+    auth_rt::sign_in_cancel(&app)
+}
+
+/// AC-AUTH-11 "Sign out on this device".
+#[tauri::command]
+pub async fn auth_sign_out(app: AppHandle) -> CmdResult<AuthStatus> {
+    auth_rt::sign_out(&app).await
+}
+
+/// Refresh the signed-in profile (`GET /v1/me`).
+#[tauri::command]
+pub async fn auth_me(app: AppHandle) -> CmdResult<AuthStatus> {
+    auth_rt::refresh_profile(&app).await
+}
+
+/// AC-AUTH-10 Devices.
+#[tauri::command]
+pub async fn auth_sessions(app: AppHandle) -> CmdResult<Vec<SessionInfo>> {
+    auth_rt::sessions(&app).await
+}
+
+#[tauri::command]
+pub async fn auth_session_revoke(app: AppHandle, session_id: String) -> CmdResult<()> {
+    auth_rt::revoke_session(&app, &session_id).await
 }

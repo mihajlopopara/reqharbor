@@ -5,6 +5,10 @@ export type SidebarTab = "activity" | "collections" | "env";
 
 export interface MenuItem {
   label?: string;
+  /** A non-interactive heading row (skipped by focus and type-ahead). */
+  heading?: boolean;
+  /** Second line under the label. */
+  sublabel?: string;
   shortcut?: string;
   danger?: boolean;
   disabled?: boolean;
@@ -38,6 +42,8 @@ export type PickerMode =
   | { kind: "moveRequest"; requestId: string }
   | { kind: "moveFolder"; folderId: string };
 
+export type SettingsSection = "account" | "general" | "sync" | "shares" | "shortcuts" | "about";
+
 export type ImportTab = "curl" | "openapi" | "link";
 
 class UiStore {
@@ -47,7 +53,7 @@ class UiStore {
   confirmState = $state<ConfirmState | null>(null);
   importDialog = $state<{ tab: ImportTab; text?: string; path?: string } | null>(null);
   shareDialog = $state<{ kind: ShareKind; entityId: string; name: string } | null>(null);
-  settingsDialog = $state<{ section: "general" | "sync" | "shares" | "shortcuts" | "about" } | null>(null);
+  settingsDialog = $state<{ section: SettingsSection } | null>(null);
   picker = $state<PickerMode | null>(null);
   envPicker = $state(false);
   exportCurl = $state<{ anchor: HTMLElement | null } | null>(null);

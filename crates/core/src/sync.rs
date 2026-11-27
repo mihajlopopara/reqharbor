@@ -375,7 +375,7 @@ impl SyncClient {
         let base = base_url.trim().trim_end_matches('/').to_string();
         if !(base.starts_with("https://") || base.starts_with("http://")) {
             return Err(SyncError::Rejected(
-                "Worker URL must start with https://".into(),
+                "Server URL must start with https:// or http://".into(),
             ));
         }
         crate::http::install_crypto_provider();

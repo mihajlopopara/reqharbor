@@ -3,19 +3,22 @@
   import Dialog from "../components/Dialog.svelte";
   import Icon from "../components/Icon.svelte";
   import { app } from "../stores/app.svelte";
-  import { ui } from "../stores/ui.svelte";
+  import { ui, type SettingsSection } from "../stores/ui.svelte";
+  import AccountSection from "../components/AccountSection.svelte";
+  import { insecureAckFor, isInsecureUrl, parseServerUrl } from "../util/account";
   import { toasts } from "../stores/toasts.svelte";
   import { call, toCommandError, type RemoteWorkspace, type ShareInfo, type Theme } from "../api";
   import { copyText } from "../api/platform";
   import { formatSize, relativeTime, dateTime, unsupportedNotice } from "../util/format";
   import { SHORTCUT_LIST, shortcutKeys } from "../util/shortcuts";
 
-  type Section = "general" | "sync" | "shares" | "shortcuts" | "about";
+  type Section = SettingsSection;
   let { section: initial }: { section: Section } = $props();
   // svelte-ignore state_referenced_locally
-  let section = $state<Section>(initial);
+  let section = $state<Section>(initial === "account" && !app.auth.enabled ? "general" : initial);
   const close = () => (ui.settingsDialog = null);
   const NAV: { id: Section; label: string }[] = [
+    ...(app.auth.enabled ? [{ id: "account" as const, label: "Account" }] : []),
     { id: "general", label: "General" },
     { id: "sync", label: "Sync" },
     { id: "shares", label: "Shares" },
@@ -57,8 +60,23 @@
     }
   }
 
+  /**
+   * 06 §9: plain http to a non-loopback host needs "Continue anyway" for token sync too. The
+   * choice is kept per origin in settings.json `knownServers[].insecureAck`, as SignInFlow does.
+   */
+  const legacyInsecure = $derived(isInsecureUrl(workerUrl));
+  const legacyAck = $derived(insecureAckFor(app.knownServers, workerUrl));
+
+  function setLegacyAck(on: boolean) {
+    const p = parseServerUrl(workerUrl);
+    if (!p.ok) return;
+    const prev = app.knownServers.find((k) => k.url === p.origin);
+    app.rememberServer(p.origin, { insecureAck: on, lastUsedAt: prev?.lastUsedAt ?? Date.now() });
+  }
+
   async function connectOrCreate() {
     if (!workerUrl.trim()) return;
+    if (legacyInsecure && !legacyAck) return;
     if (mode === "create") {
       const res = await run(() => call("sync_create_workspace", { workerUrl: workerUrl.trim(), name: app.workspaceName }));
       if (res) {
@@ -182,7 +200,9 @@
       {/each}
     </nav>
     <div class="content">
-      {#if section === "general"}
+      {#if section === "account"}
+        <AccountSection ongo={(s) => (section = s)} />
+      {:else if section === "general"}
         <h3>General</h3>
         <div class="field">
           <span>Theme</span>
@@ -244,10 +264,19 @@
             <button class="btn btn-ghost btn-danger" type="button" disabled={busy} onclick={disconnect} data-testid="sync-disconnect">Disconnect</button>
           </div>
         {:else}
+          {#if app.auth.enabled}
+            <p class="faint small" data-testid="sync-advanced-note">Sync without an account: connect this device to a server with a workspace token.</p>
+          {/if}
           <label class="field">
-            <span>Worker URL</span>
-            <input class="input mono" bind:value={workerUrl} placeholder="https://reqharbor.example.workers.dev" data-testid="sync-worker-url" />
+            <span>Server URL</span>
+            <input class="input mono" bind:value={workerUrl} placeholder="https://reqharbor.example.com" data-testid="sync-worker-url" />
           </label>
+          {#if legacyInsecure}
+            <div class="hint warn insecure" data-testid="sync-insecure">
+              <Icon name="alert" /><span>This server doesn't use HTTPS. Your password, tokens and synced data can be read on the network.</span>
+              <label class="checkbox"><input type="checkbox" checked={legacyAck} onchange={(e) => setLegacyAck(e.currentTarget.checked)} data-testid="sync-insecure-ack" />Continue anyway</label>
+            </div>
+          {/if}
           <div class="cards" role="radiogroup" aria-label="Connection mode">
             <label class="card" class:on={mode === "create"}>
               <input type="radio" name="sync-mode" value="create" bind:group={mode} data-testid="sync-mode-create" />
@@ -265,7 +294,7 @@
             </label>
           {/if}
           <div class="row">
-            <button class="btn btn-primary" type="button" disabled={busy || !workerUrl.trim() || (mode === "connect" && !token.trim())} onclick={connectOrCreate} data-testid="sync-connect">
+            <button class="btn btn-primary" type="button" disabled={busy || !workerUrl.trim() || (mode === "connect" && !token.trim()) || (legacyInsecure && !legacyAck)} onclick={connectOrCreate} data-testid="sync-connect">
               {mode === "create" ? "Create workspace" : "Connect"}
             </button>
           </div>
@@ -422,6 +451,12 @@
   }
   .card.on {
     border-color: var(--border-focus);
+  }
+  .insecure {
+    flex-wrap: wrap;
+  }
+  .insecure .checkbox {
+    flex-basis: 100%;
   }
   .token-box {
     display: flex;
