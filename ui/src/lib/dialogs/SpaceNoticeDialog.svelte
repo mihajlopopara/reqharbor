@@ -39,14 +39,25 @@
     const n = Object.entries(all)
       .filter(([, c]) => c === "remove")
       .reduce((acc, [id]) => acc + projectsOf(id).length, 0);
+    // Edge case 3: unsynced edits in a space being removed are offered as a personal copy first.
+    const unsynced = Object.entries(all)
+      .filter(([, c]) => c === "remove")
+      .reduce((acc, [id]) => acc + (spaces.find((s) => s.spaceId === id)?.pendingChanges ?? 0), 0);
+    let save = false;
     if (n > 0) {
-      const ok = await ui.confirm({ title: `Remove ${plural(n, "project")} from this device?`, body: "They are deleted here only. Nothing is deleted on the server.", confirmLabel: "Remove" });
-      if (!ok) return;
+      const r = await ui.confirmEx({
+        title: `Remove ${plural(n, "project")} from this device?`,
+        body: "They are deleted here only. Nothing is deleted on the server.",
+        confirmLabel: "Remove",
+        checkbox: unsynced ? { label: `Save ${plural(unsynced, "change")} as a personal copy`, checked: true, testid: "space-notice-save-changes" } : undefined,
+      });
+      if (!r.ok) return;
+      save = !!r.checked;
     }
     busy = true;
     try {
       for (const [spaceId, c] of Object.entries(all)) {
-        app.onSyncStatus(await call("space_notice_resolve", { spaceId, keep: c === "keep" }));
+        app.onSyncStatus(await call("space_notice_resolve", { spaceId, keep: c === "keep", saveChanges: c === "remove" && save }));
       }
       await app.reloadAll();
       close();
@@ -69,7 +80,15 @@
   }
 
   const title = $derived(
-    mode === "foreign" ? `You signed in as ${who}` : spaces.length === 1 ? (spaces[0].reason === "deleted" ? `${spaces[0].name} was deleted` : `You were removed from ${spaces[0].name}`) : "Spaces you no longer have",
+    mode === "foreign"
+      ? `You signed in as ${who}`
+      : spaces.length === 1
+        ? spaces[0].reason === "deleted"
+          ? `${spaces[0].name} was deleted`
+          : spaces[0].reason === "left"
+            ? `You left ${spaces[0].name}`
+            : `You were removed from ${spaces[0].name}`
+        : "Spaces you no longer have",
   );
 </script>
 

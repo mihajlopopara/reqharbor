@@ -68,6 +68,13 @@ struct State {
     legacy_disabled: bool,
     /// (space or "legacy", pushed changes).
     pushes: Vec<(String, Vec<Value>)>,
+    /// Space id → the caller's role there, enforced like the Go server
+    /// (06 §10 M2): a viewer push is refused whole with 403
+    /// `forbidden_role`; a project tombstone below admin is refused per
+    /// change. No entry: no enforcement.
+    roles: BTreeMap<String, String>,
+    /// Spaces whose push applies but whose response is lost (503).
+    lose_push_response: std::collections::BTreeSet<String>,
 }
 
 impl Default for State {
@@ -91,6 +98,8 @@ impl Default for State {
             legacy_token: "rh_LEGACY".into(),
             legacy_disabled: false,
             pushes: Vec::new(),
+            roles: BTreeMap::new(),
+            lose_push_response: Default::default(),
         }
     }
 }
@@ -142,6 +151,10 @@ fn push(
     let types = st.types.clone();
     let changes = body["changes"].as_array().cloned().unwrap_or_default();
     st.pushes.push((space_id.to_string(), changes.clone()));
+    let below_admin = st
+        .roles
+        .get(space_id)
+        .is_some_and(|r| r != "admin" && r != "owner");
     let space = st.spaces.entry(space_id.to_string()).or_default();
     let mut results = Vec::new();
     for c in changes {
@@ -161,6 +174,12 @@ fn push(
             continue;
         }
         let deleted = c["deleted"].as_bool().unwrap();
+        if below_admin && deleted && t == "project" {
+            results.push(
+                json!({"type": t, "id": id, "status": "rejected", "reason": "forbidden_role"}),
+            );
+            continue;
+        }
         let device = c["deviceId"].as_str().unwrap_or("").to_string();
         space.rev += 1;
         let rev = space.rev;
@@ -278,10 +297,17 @@ impl Respond for Go {
                     let since = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
                     ResponseTemplate::new(200).set_body_json(pull(&st.spaces[id], since, &epoch))
                 }
-                "POST" => match push(&mut st, id, &body, true) {
-                    Ok(v) => ResponseTemplate::new(200).set_body_json(v),
-                    Err(r) => *r,
-                },
+                "POST" => {
+                    if st.roles.get(id).is_some_and(|r| r == "viewer") {
+                        return err(403, "forbidden_role");
+                    }
+                    let lost = st.lose_push_response.contains(id);
+                    match push(&mut st, id, &body, true) {
+                        Ok(_) if lost => err(503, "starting"),
+                        Ok(v) => ResponseTemplate::new(200).set_body_json(v),
+                        Err(r) => *r,
+                    }
+                }
                 _ => err(405, "method_not_allowed"),
             };
         }
@@ -396,6 +422,11 @@ async fn personal_device(server: &MockServer, g: &Go) -> (Device, String) {
 
 fn bind_team(d: &Device, server: &MockServer, role: Role) {
     d.with(|s| {
+        if let Some(b) = s.binding_mut(TEAM) {
+            b.role = Some(role);
+            s.save_bindings().unwrap();
+            return;
+        }
         s.bindings.spaces.push(SpaceBinding {
             space_id: TEAM.into(),
             kind: SpaceKind::Team,
@@ -410,6 +441,7 @@ fn bind_team(d: &Device, server: &MockServer, role: Role) {
             bytes_used: None,
             quota_bytes: None,
             decide_later_at: None,
+            member_count: None,
             extra: Extra::new(),
         });
         s.save_bindings().unwrap();
@@ -1477,8 +1509,19 @@ fn my_spaces_parse_the_final_m1_shape() {
             role: Some("owner".into()),
             bytes_used: Some(1024),
             quota_bytes: Some(104857600),
+            member_count: None,
         }
     );
+    // M2: team rows carry memberCount; departed rows carry team, reason and time.
+    let m2: MySpaces = serde_json::from_value(json!({
+        "spaces": [personal_row(), {"spaceId": TEAM, "kind": "team", "teamId": "T1", "teamName": "Acme",
+                    "role": "viewer", "bytesUsed": 5, "quotaBytes": null, "memberCount": 8}],
+        "departed": [{"spaceId": "S9", "teamId": "T9", "teamName": "Globex", "reason": "deleted", "at": 1700000000000i64}]
+    }))
+    .unwrap();
+    assert_eq!(m2.spaces[1].member_count, Some(8));
+    assert_eq!(m2.departed[0].team_id.as_deref(), Some("T9"));
+    assert_eq!(m2.departed[0].at, Some(1_700_000_000_000));
 }
 
 #[test]
@@ -1762,4 +1805,1045 @@ async fn a_notice_closed_with_x_keeps_the_projects_after_seven_days() {
         assert!(s.project(&pid).is_ok(), "Keep: nothing is deleted");
         assert_eq!(s.global_scope(), None);
     });
+}
+
+// ───────────────────────────── M2: teams (04 §12 M2b) ─────────────────────────────
+
+use reqharbor_core::transfer;
+
+fn server_ent(g: &Go, space: &str, t: &str, id: &str) -> Option<Ent> {
+    g.0.lock()
+        .unwrap()
+        .spaces
+        .get(space)
+        .and_then(|s| s.entities.get(&(t.to_string(), id.to_string())).cloned())
+}
+
+/// A second device of the same account (Personal bound, first run done).
+async fn second_device(server: &MockServer, g: &Go) -> Device {
+    let d = Device::new();
+    d.sign_in(server);
+    d.run(server, g).await;
+    d
+}
+
+/// Make the team exist on the server and in `/v1/me/spaces` with `role`.
+fn team_exists(g: &Go, role: &str) {
+    let mut st = g.0.lock().unwrap();
+    st.spaces.entry(TEAM.into()).or_default();
+    st.listed = Some(vec![personal_row(), team_row(role)]);
+}
+
+fn no_progress(_: usize, _: usize) {}
+
+/// A project in the team with a collection and a request, pushed.
+async fn team_project(d: &Device, server: &MockServer, g: &Go) -> (String, String, String) {
+    let ids = d.with(|s| {
+        let p = s
+            .create_project_at("Payments", Some(TEAM.into()))
+            .unwrap()
+            .project
+            .id;
+        let c = s.create_collection(&p, "Orders").unwrap().id;
+        let r = s
+            .create_request(&c, None, http_req("POST", "https://api/orders"))
+            .unwrap()
+            .id;
+        (p, c, r)
+    });
+    let run = d.run(server, g).await;
+    assert!(run.error().is_none(), "{:?}", run.error());
+    ids
+}
+
+#[tokio::test]
+async fn m2_a_malicious_editor_repush_of_old_ids_leaves_the_personal_copy_untouched() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Admin);
+    team_exists(&g, "admin");
+    let (old_p, _, old_r) = team_project(&a, &server, &g).await;
+    // An admin moves the project out of the team into Personal (new ids).
+    let moved = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &old_p,
+        Some(PERSONAL),
+        &no_progress,
+    )
+    .await
+    .unwrap();
+    a.run(&server, &g).await;
+    let new_p = moved.project_id.clone();
+    assert_ne!(new_p, old_p);
+    let new_r = a.with(|s| s.project(&new_p).unwrap().requests[0].id.clone());
+    assert_ne!(new_r, old_r);
+    // A teammate re-pushes the old ids (and the new project's id) into the team.
+    let later = now_ms() + 10_000;
+    for (pid, name) in [(&old_p, "Resurrected"), (&new_p, "Hijacked")] {
+        seed(
+            &g,
+            TEAM,
+            "project",
+            pid,
+            later,
+            json!({"id": pid, "workspaceId": "x", "name": name, "sortOrder": 0, "createdAt": 1, "updatedAt": later}),
+        );
+    }
+    let mut evil = http_req("DELETE", "https://evil");
+    evil.id = new_r.clone();
+    evil.collection_id = a.with(|s| s.project(&new_p).unwrap().collections[0].id.clone());
+    evil.updated_at = later;
+    seed(&g, TEAM, "request", &new_r, later, serde_json::to_value(&evil).unwrap());
+    a.run(&server, &g).await;
+    a.with(|s| {
+        let t = s.project(&new_p).unwrap();
+        assert_eq!(t.project.name, "Payments");
+        assert_eq!(s.bindings.project_spaces[&new_p], PERSONAL, "binding unchanged");
+        assert!(t.requests.iter().any(|r| r.id == new_r && r.method == "POST"));
+        // The resurrected old id is just a team project of its own.
+        assert_eq!(s.bindings.project_spaces.get(&old_p).map(String::as_str), Some(TEAM));
+        assert!(s.space_sync(&Scope::Space(TEAM.into())).foreign >= 1);
+    });
+}
+
+#[tokio::test]
+/// 04 §12 M2b asked for "the team gets the resurrection"; 06 §10 M2 (never
+/// push orphans) wins: the newer offline edit survives here, held and
+/// frozen, and is offered as a personal copy (04 §12 "M2b client as built").
+async fn m2_a_newer_offline_edit_under_a_moved_out_project_is_held_frozen_and_saved_as_a_personal_copy() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Admin);
+    team_exists(&g, "admin");
+    let (old_p, old_c, old_r) = team_project(&a, &server, &g).await;
+    // B, another device of the same admin, has the team project too.
+    let b = second_device(&server, &g).await;
+    bind_team(&b, &server, Role::Admin);
+    b.run(&server, &g).await;
+    assert!(b.with(|s| s.request(&old_r).is_some()));
+    // A moves it to Personal; B, offline, edits the request afterwards.
+    let moved = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &old_p,
+        Some(PERSONAL),
+        &no_progress,
+    )
+    .await
+    .unwrap();
+    a.run(&server, &g).await;
+    assert!(server_ent(&g, TEAM, "project", &old_p).unwrap().deleted);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    b.with(|s| {
+        let mut r = s.request(&old_r).unwrap().clone();
+        r.url = "https://api/orders/v2".into();
+        s.save_request(&r).unwrap();
+    });
+    let pushes_before = pushed_ids(&g, TEAM).len();
+    b.run(&server, &g).await;
+    b.with(|s| {
+        // The newer offline edit survives; its containers wait for a decision.
+        assert_eq!(s.request(&old_r).unwrap().url, "https://api/orders/v2");
+        assert!(s.project(&old_p).is_ok());
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert!(ss.frozen.contains(&sync_key(EntityType::Request, &old_r)));
+        assert!(ss.held.contains(&sync_key(EntityType::Project, &old_p)));
+        assert!(ss.held.contains(&sync_key(EntityType::Collection, &old_c)));
+        assert_eq!(ss.issue.as_ref().unwrap().code, "heldDelete");
+        // The personal copy arrived untouched.
+        let copy = s.project(&moved.project_id).unwrap();
+        assert_eq!(s.bindings.project_spaces[&moved.project_id], PERSONAL);
+        assert_eq!(copy.requests[0].url, "https://api/orders");
+    });
+    // Nothing was pushed to the team: no orphans under a deleted project.
+    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before);
+    assert!(server_ent(&g, TEAM, "request", &old_r).unwrap().deleted);
+    // Save as personal copy: the edit lands in Personal under new ids.
+    let copies = b.with(|s| s.resolve_frozen(TEAM, true).unwrap());
+    assert_eq!(copies.len(), 1);
+    b.run(&server, &g).await;
+    b.with(|s| {
+        assert!(s.project(&old_p).is_err(), "the held delete applied");
+        let saved = s.project(&copies[0]).unwrap();
+        assert_eq!(saved.project.name, "Payments (my changes)");
+        assert_eq!(saved.requests[0].url, "https://api/orders/v2");
+        assert_eq!(s.bindings.project_spaces[&copies[0]], PERSONAL);
+        assert!(s.space_sync(&Scope::Space(TEAM.into())).frozen.is_empty());
+    });
+    assert!(pushed_ids(&g, PERSONAL).contains(&copies[0]));
+    // A's personal copy is still the original.
+    a.run(&server, &g).await;
+    a.with(|s| {
+        assert_eq!(
+            s.project(&moved.project_id).unwrap().requests[0].url,
+            "https://api/orders"
+        )
+    });
+}
+
+#[tokio::test]
+async fn m2_a_partial_run_during_a_move_does_not_flip_and_converges() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let b = second_device(&server, &g).await;
+    bind_team(&b, &server, Role::Editor);
+    b.run(&server, &g).await;
+    assert!(b.with(|s| s.project(&pid).is_ok()));
+    let moved = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
+    a.run(&server, &g).await;
+    assert!(server_ent(&g, PERSONAL, "project", &pid).unwrap().deleted);
+    // B: Personal answers (with the tombstones), the team is down.
+    g.0.lock()
+        .unwrap()
+        .fail
+        .insert(TEAM.into(), (503, "starting".into()));
+    b.run(&server, &g).await;
+    b.with(|s| {
+        assert!(s.project(&pid).is_ok(), "no flip: the delete waits");
+        assert!(s.project(&moved.project_id).is_err());
+    });
+    g.0.lock().unwrap().fail.clear();
+    let run = b.run(&server, &g).await;
+    assert!(run.error().is_none(), "{:?}", run.error());
+    b.with(|s| {
+        assert!(s.project(&pid).is_err());
+        assert_eq!(s.bindings.project_spaces[&moved.project_id], TEAM);
+        assert_eq!(
+            s.project(&moved.project_id).unwrap().requests.len(),
+            1,
+            "the copy arrived whole"
+        );
+    });
+}
+
+#[tokio::test]
+async fn m2_a_move_resumes_after_a_crash_with_the_same_ids() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    // The push lands but its response is lost: the move fails, nothing moved.
+    g.0.lock()
+        .unwrap()
+        .lose_push_response
+        .insert(TEAM.into());
+    let err = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, transfer::TransferError::Sync(SyncError::Server(_))), "{err:?}");
+    let plan = a.with(|s| {
+        assert!(s.project(&pid).is_ok(), "nothing was moved");
+        assert_eq!(s.bindings.project_spaces[&pid], PERSONAL);
+        s.pending_moves().pop().unwrap()
+    });
+    let landed = g.0.lock().unwrap().spaces[TEAM].live("project");
+    assert_eq!(landed, vec![plan.id_map[&pid].clone()]);
+    // "Crash": a fresh store from disk keeps the plan.
+    let reopened = a.reopen();
+    assert_eq!(reopened.pending_moves(), vec![plan.clone()]);
+    *a.store.lock().unwrap() = reopened;
+    a.with(|s| {
+        s.set_account(Some(ident(&server)));
+    });
+    g.0.lock().unwrap().lose_push_response.clear();
+    let done = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
+    assert_eq!(done.project_id, plan.id_map[&pid], "same ids after the retry");
+    assert_eq!(done.move_id, plan.move_id);
+    assert_eq!(
+        g.0.lock().unwrap().spaces[TEAM].live("project"),
+        vec![done.project_id.clone()],
+        "no duplicate in the team"
+    );
+    a.run(&server, &g).await;
+    a.with(|s| {
+        assert!(s.project(&pid).is_err());
+        assert!(s.pending_moves().is_empty());
+        assert_eq!(s.bindings.project_spaces[&done.project_id], TEAM);
+        assert_eq!(
+            space_sync::pending_total(s),
+            0,
+            "the copy is synced in the team"
+        );
+    });
+    assert!(server_ent(&g, PERSONAL, "project", &pid).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn m2_a_failed_move_changes_nothing_and_cancel_tombstones_what_landed() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    g.0.lock()
+        .unwrap()
+        .lose_push_response
+        .insert(TEAM.into());
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap_err();
+    let mut plan = a.with(|s| s.pending_moves().pop().unwrap());
+    // Pretend the first batch was acknowledged, then cancel.
+    plan.applied.insert(sync_key(EntityType::Project, &plan.id_map[&pid]), 1);
+    a.with(|s| s.record_move_progress(&plan).unwrap());
+    g.0.lock().unwrap().lose_push_response.clear();
+    transfer::cancel_move(&a.store, Some(session(&server, &g)), &plan.move_id)
+        .await
+        .unwrap();
+    assert!(server_ent(&g, TEAM, "project", &plan.id_map[&pid]).unwrap().deleted);
+    a.with(|s| {
+        assert!(s.pending_moves().is_empty());
+        assert_eq!(s.bindings.project_spaces[&pid], PERSONAL);
+    });
+}
+
+#[tokio::test]
+async fn m2_only_admins_move_out_and_viewers_cant_move_in() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (tp, _, _) = team_project(&a, &server, &g).await;
+    let e = a.with(|s| s.move_check(&tp, Some(PERSONAL)).unwrap_err());
+    assert!(e.to_string().contains("Only admins can move a project out of Acme"), "{e}");
+    let e = a.with(|s| s.delete_project(&tp).unwrap_err());
+    assert!(e.to_string().contains("Only admins can delete team projects"), "{e}");
+    a.with(|s| {
+        s.binding_mut(TEAM).unwrap().role = Some(Role::Viewer);
+        assert!(matches!(
+            s.move_check(&pid, Some(TEAM)).unwrap_err(),
+            reqharbor_core::storage::StoreError::ReadOnlyRole(_)
+        ));
+        assert!(s.create_project_at("x", Some(TEAM.into())).is_err());
+    });
+}
+
+#[tokio::test]
+async fn m2_the_viewer_guard_blocks_mutators_and_makes_no_conflict_copies() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (tp, tc, tr) = team_project(&a, &server, &g).await;
+    // V is a viewer on another device.
+    let v = second_device(&server, &g).await;
+    bind_team(&v, &server, Role::Viewer);
+    team_exists(&g, "viewer");
+    v.run(&server, &g).await;
+    v.with(|s| {
+        assert!(s.rename_project(&tp, "x").is_err());
+        assert!(s.create_collection(&tp, "c").is_err());
+        assert!(s.delete_collection(&tc).is_err());
+        let mut r = s.request(&tr).unwrap().clone();
+        r.url = "https://mine".into();
+        assert!(matches!(
+            s.save_request(&r).unwrap_err(),
+            reqharbor_core::storage::StoreError::ReadOnlyRole(_)
+        ));
+        assert!(s.move_node(reqharbor_core::storage::NodeKind::Request, &tr, Some(&tc), None, 0).is_err());
+        assert!(s.delete_project(&tp).is_err());
+        // Copying out is allowed: Duplicate to personal.
+        let copy = s.duplicate_to_space(&tp, Some(PERSONAL), Some("Payments copy")).unwrap();
+        assert_eq!(s.bindings.project_spaces[&copy.project.id], PERSONAL);
+        // Make the request look locally changed (e.g. written by an older build).
+        let k = sync_key(EntityType::Request, &tr);
+        s.space_state_mut(&Scope::Space(TEAM.into()))
+            .synced
+            .insert(k, 1);
+    });
+    // An editor changes it; the viewer's pull takes it without a conflict copy.
+    let mut theirs = a.with(|s| s.request(&tr).unwrap().clone());
+    theirs.url = "https://api/orders/v3".into();
+    theirs.updated_at = now_ms() + 1_000;
+    seed(&g, TEAM, "request", &tr, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    let pushes_before = pushed_ids(&g, TEAM).len();
+    let run = v.run(&server, &g).await;
+    assert!(run.report.conflicts.is_empty());
+    v.with(|s| {
+        assert_eq!(s.request(&tr).unwrap().url, "https://api/orders/v3");
+        let t = s.project(&tp).unwrap();
+        assert!(!t.requests.iter().any(|r| r.name.contains("(conflict)")));
+        assert_eq!(sync::collect_push_in(s, &Scope::Space(TEAM.into())).len(), 0);
+    });
+    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before, "a viewer pushes nothing");
+}
+
+#[tokio::test]
+async fn m2_a_role_downgrade_freezes_dirty_keys() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (tp, _, tr) = team_project(&a, &server, &g).await;
+    // An unsynced edit, then an admin makes us a viewer and edits the same request.
+    a.with(|s| {
+        let mut r = s.request(&tr).unwrap().clone();
+        r.url = "https://mine".into();
+        s.save_request(&r).unwrap();
+    });
+    let mut theirs = a.with(|s| s.request(&tr).unwrap().clone());
+    theirs.url = "https://theirs".into();
+    theirs.updated_at = now_ms() + 1_000;
+    seed(&g, TEAM, "request", &tr, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    team_exists(&g, "viewer");
+    g.0.lock().unwrap().roles.insert(TEAM.into(), "viewer".into());
+    let pushes_before = pushed_ids(&g, TEAM).len();
+    let run = a.run(&server, &g).await;
+    assert!(run.error().is_none(), "{:?}", run.error());
+    assert!(run.report.conflicts.is_empty());
+    let key = sync_key(EntityType::Request, &tr);
+    a.with(|s| {
+        assert_eq!(s.binding(TEAM).unwrap().role, Some(Role::Viewer));
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert_eq!(ss.frozen, vec![key.clone()]);
+        let issue = ss.issue.clone().unwrap();
+        assert_eq!(issue.code, "roleChanged");
+        assert_eq!(
+            issue.message,
+            "Your role in Acme changed to Viewer. You have 1 unsynced change."
+        );
+        assert_eq!(s.request(&tr).unwrap().url, "https://mine", "frozen: not overwritten");
+        let st = space_sync::space_statuses(s);
+        assert_eq!(st.iter().find(|x| x.space_id == TEAM).unwrap().frozen, 1);
+    });
+    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before);
+    // Discard: unfreeze and take the server's version.
+    a.with(|s| assert!(s.resolve_frozen(TEAM, false).unwrap().is_empty()));
+    a.run(&server, &g).await;
+    a.with(|s| {
+        assert_eq!(s.request(&tr).unwrap().url, "https://theirs");
+        assert!(s.project(&tp).is_ok());
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert!(ss.frozen.is_empty() && ss.issue.is_none());
+    });
+}
+
+#[tokio::test]
+async fn m2_a_viewer_push_refused_as_a_whole_freezes_and_shows_the_banner() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (_, _, tr) = team_project(&a, &server, &g).await;
+    a.with(|s| {
+        let mut r = s.request(&tr).unwrap().clone();
+        r.name = "Renamed".into();
+        s.save_request(&r).unwrap();
+    });
+    // The server already enforces viewer; /v1/me/spaces still says editor.
+    g.0.lock().unwrap().roles.insert(TEAM.into(), "viewer".into());
+    let run = a.run(&server, &g).await;
+    assert!(run.error().is_none(), "a refused push is the banner, not an error");
+    a.with(|s| {
+        assert_eq!(s.binding(TEAM).unwrap().role, Some(Role::Viewer));
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert_eq!(ss.frozen, vec![sync_key(EntityType::Request, &tr)]);
+        assert_eq!(ss.issue.as_ref().unwrap().code, "roleChanged");
+    });
+    // Save as personal copy keeps the edit under new ids in Personal.
+    let copies = a.with(|s| s.resolve_frozen(TEAM, true).unwrap());
+    a.with(|s| {
+        let t = s.project(&copies[0]).unwrap();
+        assert_eq!(t.requests[0].name, "Renamed");
+        assert_ne!(t.requests[0].id, tr);
+    });
+}
+
+#[tokio::test]
+async fn m2_a_project_delete_refused_with_forbidden_role_is_discarded_back() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Admin);
+    team_exists(&g, "admin");
+    let (tp, _, tr) = team_project(&a, &server, &g).await;
+    a.with(|s| s.delete_project(&tp).unwrap());
+    // Demoted to editor before the push: the project tombstone is refused.
+    team_exists(&g, "editor");
+    g.0.lock().unwrap().roles.insert(TEAM.into(), "editor".into());
+    a.run(&server, &g).await;
+    let pk = sync_key(EntityType::Project, &tp);
+    a.with(|s| {
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert_eq!(ss.frozen, vec![pk.clone()]);
+        assert!(ss.issue.as_ref().unwrap().message.contains("Only admins can delete projects in Acme"));
+        assert!(
+            s.space_state(&Scope::Space(TEAM.into()))
+                .tombstones
+                .iter()
+                .any(|t| t.id == tp),
+            "the tombstone is kept"
+        );
+    });
+    assert!(!server_ent(&g, TEAM, "project", &tp).unwrap().deleted);
+    assert!(
+        !server_ent(&g, TEAM, "request", &tr).unwrap().deleted,
+        "the children's tombstones wait with the refused project tombstone"
+    );
+    a.with(|s| s.resolve_frozen(TEAM, false).unwrap());
+    a.run(&server, &g).await;
+    a.with(|s| {
+        let t = s.project(&tp).expect("Discard brings the project back");
+        assert_eq!(s.bindings.project_spaces[&tp], TEAM);
+        assert!(t.requests.iter().any(|r| r.id == tr), "with its content");
+        assert!(s.space_state(&Scope::Space(TEAM.into())).tombstones.is_empty());
+    });
+    assert!(!server_ent(&g, TEAM, "request", &tr).unwrap().deleted);
+}
+
+#[tokio::test]
+async fn m2_team_pushes_leave_device_local_paths_here() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (_, c, _) = team_project(&a, &server, &g).await;
+    let rid = a.with(|s| {
+        let mut r = http_req("POST", "https://api/upload");
+        r.body.body_type = BodyType::Binary;
+        r.body.binary_path = Some("/Users/priya/secret.bin".into());
+        s.create_request(&c, None, r).unwrap().id
+    });
+    a.run(&server, &g).await;
+    let pushed = server_ent(&g, TEAM, "request", &rid).unwrap().data.unwrap();
+    assert_eq!(pushed["body"]["binaryPath"], "");
+    // A pulled version keeps this device's path.
+    let mut theirs: Request = serde_json::from_value(pushed).unwrap();
+    theirs.name = "Upload v2".into();
+    theirs.updated_at = now_ms() + 1_000;
+    seed(&g, TEAM, "request", &rid, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    a.run(&server, &g).await;
+    a.with(|s| {
+        let r = s.request(&rid).unwrap();
+        assert_eq!(r.name, "Upload v2");
+        assert_eq!(r.body.binary_path.as_deref(), Some("/Users/priya/secret.bin"));
+    });
+}
+
+#[tokio::test]
+async fn m2_copy_to_project_and_duplicate_use_new_ids_and_leave_the_source() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (tp, tc, tr) = team_project(&a, &server, &g).await;
+    let (cid, rid) = a.with(|s| {
+        let t = s.project(&pid).unwrap();
+        (t.collections[0].id.clone(), t.requests[0].id.clone())
+    });
+    a.with(|s| {
+        let (t, copy) = s.copy_to_project("collection", &tc, &pid, None, None).unwrap();
+        assert_ne!(copy, tc);
+        let col = t.collections.iter().find(|c| c.id == copy).unwrap();
+        assert_eq!(col.name, "Orders");
+        assert!(t.requests.iter().any(|r| r.collection_id == copy && r.id != tr));
+        let (t, copy) = s
+            .copy_to_project("request", &rid, &tp, Some(&tc), None)
+            .unwrap();
+        assert!(t.requests.iter().any(|r| r.id == copy && r.collection_id == tc));
+        // Without a target collection, one named after the source's is made.
+        let (t, _) = s.copy_to_project("request", &tr, &pid, None, None).unwrap();
+        assert_eq!(t.collections.iter().filter(|c| c.name == "Orders").count(), 2);
+        assert!(s.project(&pid).unwrap().collections.iter().any(|c| c.id == cid));
+        let p = s.copy_preview("request", &rid, &tp).unwrap();
+        assert_eq!(p.target_kind, "team");
+    });
+    a.run(&server, &g).await;
+    assert!(pushed_ids(&g, TEAM).len() >= 4);
+}
+
+// ───────────────────────────── M2 QA round 1 regressions ─────────────────────────────
+
+/// QA blocker: with B7 deferring the team's deletes (another space failed),
+/// a stale edit under a pulled tombstone was pushed as an orphan and lost on
+/// the next run.
+#[tokio::test]
+async fn qa1_deferred_deletes_still_hold_a_newer_edit_and_push_no_orphan() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Admin);
+    team_exists(&g, "admin");
+    let (old_p, old_c, old_r) = team_project(&a, &server, &g).await;
+    let b = second_device(&server, &g).await;
+    bind_team(&b, &server, Role::Admin);
+    b.run(&server, &g).await;
+    transfer::move_project(&a.store, Some(session(&server, &g)), &old_p, Some(PERSONAL), &no_progress)
+        .await
+        .unwrap();
+    a.run(&server, &g).await;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    b.with(|s| {
+        let mut r = s.request(&old_r).unwrap().clone();
+        r.url = "https://api/orders/v2".into();
+        s.save_request(&r).unwrap();
+    });
+    // Personal is briefly down: B7 defers the team's deletes.
+    g.0.lock().unwrap().fail.insert(PERSONAL.into(), (503, "starting".into()));
+    let pushes_before = pushed_ids(&g, TEAM).len();
+    b.run(&server, &g).await;
+    g.0.lock().unwrap().fail.clear();
+    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before, "nothing pushed to the team");
+    assert!(server_ent(&g, TEAM, "request", &old_r).unwrap().deleted);
+    let rk = sync_key(EntityType::Request, &old_r);
+    b.with(|s| {
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert!(ss.frozen.contains(&rk), "the edit is frozen at once");
+        assert!(ss.held.contains(&sync_key(EntityType::Project, &old_p)));
+        assert!(ss.held.contains(&sync_key(EntityType::Collection, &old_c)));
+    });
+    // The next run applies the deletes: the edit is still held, not lost.
+    b.run(&server, &g).await;
+    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before);
+    b.with(|s| {
+        assert_eq!(s.request(&old_r).unwrap().url, "https://api/orders/v2");
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert!(ss.frozen.contains(&rk));
+        assert!(ss.held.contains(&sync_key(EntityType::Project, &old_p)));
+        assert!(ss.deferred_deletes.is_empty());
+    });
+}
+
+/// QA blocker, the other half: an older dirty edit under a deferred
+/// tombstone isn't pushed either (it would land as an orphan).
+#[tokio::test]
+async fn qa1_nothing_under_a_deferred_tombstone_is_pushed() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Admin);
+    team_exists(&g, "admin");
+    let (tp, _, tr) = team_project(&a, &server, &g).await;
+    // An older local edit, then the project is deleted on the server.
+    a.with(|s| {
+        let mut r = s.request(&tr).unwrap().clone();
+        r.url = "https://older".into();
+        s.save_request(&r).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let later = now_ms() + 1_000;
+    tombstone(&g, TEAM, "request", &tr, later);
+    tombstone(&g, TEAM, "project", &tp, later);
+    g.0.lock().unwrap().fail.insert(PERSONAL.into(), (503, "starting".into()));
+    let pushes_before = pushed_ids(&g, TEAM).len();
+    a.run(&server, &g).await;
+    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before);
+    a.with(|s| {
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert!(ss.deferred_deletes.contains(&sync_key(EntityType::Project, &tp)));
+        assert!(sync::collect_push_in(s, &Scope::Space(TEAM.into())).is_empty());
+    });
+    g.0.lock().unwrap().fail.clear();
+    a.run(&server, &g).await;
+    a.with(|s| assert!(s.project(&tp).is_err(), "the older edit loses to the delete"));
+    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before);
+}
+
+/// QA major: a sync between a failed move (push landed, answer lost) and
+/// its resume pulled the partial copy as a second project; the resume then
+/// duplicated the environment.
+#[tokio::test]
+async fn qa1_a_sync_between_a_failed_move_and_its_resume_makes_no_duplicates() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    let env_id = a.with(|s| s.create_environment(Some(&pid), "Dev").unwrap().id);
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap_err();
+    g.0.lock().unwrap().lose_push_response.clear();
+    let projects_before = a.with(|s| s.project_list().len());
+    a.run(&server, &g).await;
+    let plan = a.with(|s| s.pending_moves().pop().unwrap());
+    let copy_pid = plan.id_map[&pid].clone();
+    let copy_env = plan.id_map[&env_id].clone();
+    a.with(|s| {
+        assert_eq!(s.project_list().len(), projects_before, "no partial copy pulled");
+        assert!(s.project(&copy_pid).is_err());
+        assert_eq!(s.pending_move_list()[0].project_name, "Work");
+    });
+    let done = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap();
+    assert_eq!(done.project_id, copy_pid);
+    a.run(&server, &g).await;
+    a.with(|s| {
+        assert_eq!(s.environments.iter().filter(|e| e.id == copy_env).count(), 1);
+        assert_eq!(s.project_list().iter().filter(|p| p.name == "Work").count(), 1);
+    });
+    let reopened = a.reopen();
+    assert_eq!(reopened.environments.iter().filter(|e| e.id == copy_env).count(), 1);
+}
+
+/// QA major: a move to another target first undoes the older plan.
+#[tokio::test]
+async fn qa1_a_move_to_another_target_cancels_the_older_plan() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap_err();
+    g.0.lock().unwrap().lose_push_response.clear();
+    let mut plan = a.with(|s| s.pending_moves().pop().unwrap());
+    // The project landed; pretend its acknowledgement was recorded.
+    let copy_key = sync_key(EntityType::Project, &plan.id_map[&pid]);
+    plan.applied.insert(copy_key, 1);
+    a.with(|s| s.record_move_progress(&plan).unwrap());
+    // Now to this device only instead.
+    let moved = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, None, &no_progress)
+        .await
+        .unwrap();
+    assert!(server_ent(&g, TEAM, "project", &plan.id_map[&pid]).unwrap().deleted, "the older plan was undone");
+    a.with(|s| {
+        assert!(s.pending_moves().is_empty());
+        assert!(!s.bindings.project_spaces.contains_key(&moved.project_id));
+    });
+}
+
+/// QA major: the copy is saved before the source is removed, and a resume
+/// after a crash between the two steps finishes without losing anything.
+#[tokio::test]
+async fn qa1_a_crash_between_saving_the_copy_and_removing_the_source_loses_nothing() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.with(|s| {
+        let env = s.create_environment(Some(&pid), "Dev").unwrap();
+        let mut e = env.clone();
+        e.variables = vec![serde_json::from_value(json!({"key": "token", "value": "s3cret", "enabled": true, "secret": true})).unwrap()];
+        s.update_environment(&e).unwrap();
+    });
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    // Push the copy, then "crash" right after step one of the local step.
+    g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap_err();
+    g.0.lock().unwrap().lose_push_response.clear();
+    let plan = a.with(|s| s.pending_moves().pop().unwrap());
+    let copy = a.with(|s| s.finish_move_copy(&plan).unwrap());
+    let reopened = a.reopen();
+    assert!(reopened.project(&pid).is_ok(), "the source is still here");
+    assert!(reopened.project(&copy).is_ok(), "and so is the saved copy");
+    assert!(
+        reopened
+            .environments
+            .iter()
+            .any(|e| e.project_id.as_deref() == Some(copy.as_str()) && e.variables[0].value == "s3cret"),
+        "with its secret value"
+    );
+    *a.store.lock().unwrap() = reopened;
+    a.with(|s| {
+        s.set_account(Some(ident(&server)));
+    });
+    let done = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap();
+    assert_eq!(done.project_id, copy);
+    a.with(|s| {
+        assert!(s.project(&pid).is_err());
+        assert_eq!(s.project_list().iter().filter(|p| p.name == "Work").count(), 1);
+        assert_eq!(s.environments.iter().filter(|e| e.project_id.as_deref() == Some(copy.as_str())).count(), 1);
+        assert!(s.pending_moves().is_empty());
+    });
+    // Idempotent: finishing the same plan again only drops it.
+    a.with(|s| {
+        s.record_move_progress(&plan).unwrap();
+        assert_eq!(s.finish_move(&plan).unwrap(), copy);
+        assert!(s.pending_moves().is_empty());
+        assert_eq!(s.project_list().iter().filter(|p| p.name == "Work").count(), 1);
+    });
+}
+
+/// QA minor 13: an entity deleted between a failed move and its resume is
+/// removed from the target too.
+#[tokio::test]
+async fn qa1_an_entity_deleted_before_the_resume_is_removed_from_the_target() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let rid = a.with(|s| s.project(&pid).unwrap().requests[0].id.clone());
+    g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap_err();
+    g.0.lock().unwrap().lose_push_response.clear();
+    let mut plan = a.with(|s| s.pending_moves().pop().unwrap());
+    let copy_r = plan.id_map[&rid].clone();
+    // Record what landed (as a lost answer would have).
+    let landed: Vec<(String, i64)> = {
+        let st = g.0.lock().unwrap();
+        st.spaces[TEAM].entities.iter().map(|((t, id), e)| (format!("{t}:{id}"), e.updated_at)).collect()
+    };
+    plan.applied.extend(landed);
+    a.with(|s| s.record_move_progress(&plan).unwrap());
+    a.with(|s| s.delete_request(&rid).unwrap());
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap();
+    assert!(server_ent(&g, TEAM, "request", &copy_r).unwrap().deleted);
+    a.run(&server, &g).await;
+    a.with(|s| assert!(s.request(&copy_r).is_none(), "not pulled back"));
+}
+
+/// QA minor 8: a viewer may pick an environment, locally only.
+#[tokio::test]
+async fn qa1_a_viewer_choosing_an_environment_changes_nothing_to_sync() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (tp, _, _) = team_project(&a, &server, &g).await;
+    let env = a.with(|s| s.create_environment(Some(&tp), "Prod").unwrap().id);
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Viewer);
+    a.with(|s| {
+        let before = s.project(&tp).unwrap().project.updated_at;
+        let p = s.set_active_environment(&tp, Some(&env)).unwrap();
+        assert_eq!(p.active_environment_id.as_deref(), Some(env.as_str()));
+        assert_eq!(p.updated_at, before, "not marked changed");
+        assert!(sync::dirty_keys_in(s, &Scope::Space(TEAM.into())).is_empty());
+    });
+}
+
+/// QA minor 12: a held collection is saved on its own, not with the whole
+/// team project.
+#[tokio::test]
+async fn qa1_saving_a_held_collection_copies_only_that_collection() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (tp, tc, tr) = team_project(&a, &server, &g).await;
+    let other = a.with(|s| s.create_collection(&tp, "Billing").unwrap().id);
+    a.run(&server, &g).await;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // An older delete on the server, a newer edit here.
+    let deleted_at = now_ms() - 1;
+    a.with(|s| {
+        let mut r = s.request(&tr).unwrap().clone();
+        r.url = "https://mine".into();
+        s.save_request(&r).unwrap();
+    });
+    tombstone(&g, TEAM, "request", &tr, deleted_at);
+    tombstone(&g, TEAM, "collection", &tc, deleted_at);
+    a.run(&server, &g).await;
+    a.with(|s| {
+        let ss = s.space_sync(&Scope::Space(TEAM.into()));
+        assert_eq!(ss.held, vec![sync_key(EntityType::Collection, &tc)]);
+    });
+    let copies = a.with(|s| s.resolve_frozen(TEAM, true).unwrap());
+    a.with(|s| {
+        let t = s.project(&copies[0]).unwrap();
+        assert_eq!(t.project.name, "Payments (my changes)");
+        assert_eq!(t.collections.len(), 1, "only the held collection");
+        assert_eq!(t.collections[0].name, "Orders");
+        assert_eq!(t.requests[0].url, "https://mine");
+        assert_eq!(s.bindings.project_spaces[&copies[0]], PERSONAL);
+        assert!(s.project(&tp).unwrap().collections.iter().any(|c| c.id == other));
+    });
+}
+
+// ───────────────────────────── M2 QA round 2 regressions ─────────────────────────────
+
+/// A failed move whose batches were all acknowledged: the plan holds them.
+async fn acknowledged_failed_move(server: &MockServer, g: &Go, a: &Device, pid: &str) -> transfer::MovePlan {
+    g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
+    transfer::move_project(&a.store, Some(session(server, g)), pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap_err();
+    g.0.lock().unwrap().lose_push_response.clear();
+    let mut plan = a.with(|s| s.pending_moves().pop().unwrap());
+    let changes = a.with(|s| s.move_changes(&mut plan.clone()).unwrap());
+    for c in &changes {
+        plan.applied.insert(sync_key(c.entity_type, &c.id), c.updated_at);
+    }
+    a.with(|s| s.record_move_progress(&plan).unwrap());
+    plan
+}
+
+/// QA2 major (the probe): a teammate's edit of the partial copy, skipped by
+/// pulls while the move was pending, applies once the move finishes.
+#[tokio::test]
+async fn qa2_a_teammate_edit_of_an_acknowledged_pending_copy_applies_after_the_move() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let plan = acknowledged_failed_move(&server, &g, &a, &pid).await;
+    let rid = a.with(|s| s.project(&pid).unwrap().requests[0].id.clone());
+    let new_r = plan.id_map[&rid].clone();
+    let mut theirs: Request =
+        serde_json::from_value(server_ent(&g, TEAM, "request", &new_r).unwrap().data.unwrap()).unwrap();
+    theirs.url = "https://teammate".into();
+    theirs.updated_at = now_ms() + 1_000;
+    seed(&g, TEAM, "request", &new_r, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    a.run(&server, &g).await; // skipped: the copy isn't here yet
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap();
+    a.run(&server, &g).await;
+    assert_eq!(a.with(|s| s.request(&new_r).map(|r| r.url.clone())).as_deref(), Some("https://teammate"));
+    // And a later local edit doesn't overwrite it blindly: it builds on it.
+    let srv = server_ent(&g, TEAM, "request", &new_r).unwrap().data.unwrap()["url"].clone();
+    assert_eq!(srv, "https://teammate");
+}
+
+/// QA2 major: a teammate's delete in the partial copy applies too.
+#[tokio::test]
+async fn qa2_a_teammate_delete_in_a_pending_copy_applies_after_the_move() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let plan = acknowledged_failed_move(&server, &g, &a, &pid).await;
+    let rid = a.with(|s| s.project(&pid).unwrap().requests[0].id.clone());
+    let new_r = plan.id_map[&rid].clone();
+    tombstone(&g, TEAM, "request", &new_r, now_ms() + 1_000);
+    a.run(&server, &g).await;
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap();
+    a.run(&server, &g).await;
+    a.with(|s| {
+        assert!(s.request(&new_r).is_none(), "the teammate's delete applied");
+        assert!(s.project(&plan.id_map[&pid]).is_ok());
+    });
+    assert!(server_ent(&g, TEAM, "request", &new_r).unwrap().deleted, "not resurrected");
+}
+
+/// QA3 minor: a crash after the source's removal but before the cursor
+/// rewind was saved still rewinds on resume, so the teammate's edit applies.
+#[tokio::test]
+async fn qa3_a_crash_after_removing_the_source_still_rewinds_the_target() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let plan = acknowledged_failed_move(&server, &g, &a, &pid).await;
+    let rid = a.with(|s| s.project(&pid).unwrap().requests[0].id.clone());
+    let new_r = plan.id_map[&rid].clone();
+    let mut theirs: Request =
+        serde_json::from_value(server_ent(&g, TEAM, "request", &new_r).unwrap().data.unwrap()).unwrap();
+    theirs.url = "https://teammate".into();
+    theirs.updated_at = now_ms() + 1_000;
+    seed(&g, TEAM, "request", &new_r, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    a.run(&server, &g).await; // skipped: the copy isn't here yet
+    // The interrupted finish: copy saved, source removed, plan still there,
+    // cursor never rewound.
+    a.with(|s| {
+        s.finish_move_copy(&plan).unwrap();
+        s.delete_project(&pid).unwrap();
+        assert!(s.move_source_gone(&plan));
+        assert_eq!(s.pending_move_list().len(), 1);
+    });
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap();
+    a.with(|s| assert!(s.pending_move_list().is_empty()));
+    a.run(&server, &g).await;
+    assert_eq!(a.with(|s| s.request(&new_r).map(|r| r.url.clone())).as_deref(), Some("https://teammate"));
+}
+
+/// QA2 minor 2: finishing a move whose copy was already saved keeps the
+/// copy's later edits (it isn't rebuilt from the source).
+#[tokio::test]
+async fn qa2_finishing_keeps_edits_made_to_an_already_saved_copy() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let plan = acknowledged_failed_move(&server, &g, &a, &pid).await;
+    let copy = a.with(|s| s.finish_move_copy(&plan).unwrap());
+    let rid = a.with(|s| s.project(&pid).unwrap().requests[0].id.clone());
+    let new_r = plan.id_map[&rid].clone();
+    a.with(|s| {
+        let mut r = s.request(&new_r).unwrap().clone();
+        r.url = "https://edited-copy".into();
+        s.save_request(&r).unwrap();
+    });
+    let pushes_before = pushed_ids(&g, TEAM).len();
+    let done = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap();
+    assert_eq!(done.project_id, copy);
+    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before, "the source isn't pushed over the copy");
+    a.with(|s| {
+        assert!(s.project(&pid).is_err());
+        assert_eq!(s.request(&new_r).unwrap().url, "https://edited-copy");
+    });
+    a.run(&server, &g).await;
+    assert_eq!(server_ent(&g, TEAM, "request", &new_r).unwrap().data.unwrap()["url"], "https://edited-copy");
+}
+
+/// QA2 minor 3: a move whose copy is already saved can be finished, not
+/// cancelled, and a move to another target is refused until it is.
+#[tokio::test]
+async fn qa2_a_move_with_a_saved_copy_must_be_finished_first() {
+    let (server, g) = go().await;
+    let (a, pid) = personal_device(&server, &g).await;
+    a.run(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let plan = acknowledged_failed_move(&server, &g, &a, &pid).await;
+    a.with(|s| s.finish_move_copy(&plan).unwrap());
+    a.with(|s| {
+        let p = &s.pending_move_list()[0];
+        assert!(p.copy_saved);
+        assert_eq!(p.target_name, "Acme");
+    });
+    let err = transfer::cancel_move(&a.store, Some(session(&server, &g)), &plan.move_id)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Finish it instead"), "{err}");
+    let err = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, None, &no_progress)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Finish the move to Acme first: its copy is already saved here.");
+    a.with(|s| {
+        assert!(s.project(&pid).is_ok() && s.project(&plan.id_map[&pid]).is_ok(), "nothing changed");
+        assert_eq!(s.pending_moves().len(), 1);
+    });
+    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
+        .await
+        .unwrap();
+    a.with(|s| assert!(s.pending_moves().is_empty()));
 }

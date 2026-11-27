@@ -63,6 +63,8 @@ pub struct SyncStatus {
     pub legacy: Option<LegacyStatus>,
     /// The first-sync checklist is waiting for an answer (UX §10).
     pub first_sync_pending: bool,
+    /// Moves that didn't finish (UX §9): Finish move or Cancel move.
+    pub pending_moves: Vec<reqharbor_core::transfer::PendingMove>,
 }
 
 impl SyncStatus {
@@ -107,6 +109,7 @@ impl SyncStatus {
             spaces: Vec::new(),
             legacy: None,
             first_sync_pending: false,
+            pending_moves: Vec::new(),
         }
     }
 
@@ -134,6 +137,7 @@ impl SyncStatus {
             spaces: Vec::new(),
             legacy,
             first_sync_pending: false,
+            pending_moves: Vec::new(),
         };
         refresh_spaces(&mut s, store);
         s.last_sync_at = s.spaces.iter().filter_map(|x| x.last_sync_at).max();
@@ -151,6 +155,7 @@ pub fn refresh_spaces(s: &mut SyncStatus, store: &Store) {
     s.legacy = space_sync::legacy_status(store);
     s.first_sync_pending =
         store.bindings.first_sync_pending && !store.first_sync_candidates().is_empty();
+    s.pending_moves = store.pending_move_list();
     s.connected = store.sync_active();
     s.worker_url = s.legacy.as_ref().map(|l| l.worker_url.clone());
     s.remote_workspace_id = s.legacy.as_ref().map(|l| l.remote_workspace_id.clone());
@@ -395,6 +400,7 @@ mod tests {
             spaces: vec![],
             legacy: None,
             first_sync_pending: false,
+            pending_moves: Vec::new(),
         }
     }
 

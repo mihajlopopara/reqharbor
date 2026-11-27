@@ -50,6 +50,8 @@ export interface MockAccountOptions {
   /** ms the fake browser takes; 0 = wait for finishBrowser(). */
   authDelay?: number;
   account?: "signedIn" | "signInRequired" | "keychainUnreadable" | "file";
+  /** `features.teams` in discovery (default on; `?mockTeams=off`). */
+  teams?: boolean;
 }
 
 const MODES: MockServerMode[] = ["tokenOnly", "legacyOnly", "futureApi", "otherPublicUrl", "unreachable", "notReqharbor", "insecure", "setup", "tooOld", "ok"];
@@ -96,7 +98,9 @@ interface Hooks {
 }
 
 export class MockAccounts {
-  opts: Required<Omit<MockAccountOptions, "account">> & { account?: MockAccountOptions["account"] };
+  opts: Required<Omit<MockAccountOptions, "account" | "teams">> & { account?: MockAccountOptions["account"] };
+  /** `features.teams` of the mock server. */
+  teamsFeature: boolean;
   status: AuthStatus;
   sessions: SessionInfo[] = [];
   /** Every authorize URL "opened in the browser" (for tests). */
@@ -114,6 +118,7 @@ export class MockAccounts {
       authDelay: opts.authDelay ?? 1200,
       account: opts.account,
     };
+    this.teamsFeature = opts.teams ?? true;
     this.status = {
       enabled: true,
       account: null,
@@ -157,7 +162,7 @@ export class MockAccounts {
       publicUrl: mode === "otherPublicUrl" ? "https://rh.acme.dev" : origin,
       minClientVersion: mode === "tooOld" ? "9.0.0" : null,
       auth: { methods: mode === "legacyOnly" ? [] : methods, signup: "invite", passwordReset: "admin", setupRequired: mode === "setup" },
-      features: { accounts: mode !== "legacyOnly", teams: false, legacyWorkspaces: mode === "legacyOnly" ? "open" : "off" },
+      features: { accounts: mode !== "legacyOnly", teams: mode !== "legacyOnly" && this.teamsFeature, legacyWorkspaces: mode === "legacyOnly" ? "open" : "off" },
       sync: { types: ["project", "collection", "folder", "request", "environment"], requestKinds: ["http"] },
     };
     if (mode === "futureApi") (info as ServerInfo & { somethingNew?: unknown }).somethingNew = { x: 1 };
@@ -212,7 +217,11 @@ export class MockAccounts {
     this.emit();
   }
 
-  async signInStart(args: { serverUrl: string; method?: string | null; insecureConfirmed?: boolean | null }): Promise<AuthStatus> {
+  /** The last signup ticket passed to a sign-in (tests). */
+  lastTicket: string | null = null;
+
+  async signInStart(args: { serverUrl: string; method?: string | null; insecureConfirmed?: boolean | null; inviteTicket?: string | null }): Promise<AuthStatus> {
+    this.lastTicket = args.inviteTicket ?? null;
     const method = args.method || null;
     if (this.status.signIn.state === "exchanging") return fail("invalid", "Sign-in is finishing. Try again in a moment.");
     this.clearTimer();
@@ -239,7 +248,7 @@ export class MockAccounts {
     if (d.insecure && !args.insecureConfirmed && !this.insecureAcked(origin)) reject("insecure_unconfirmed", MSG_INSECURE);
     if (this.opts.auth === "no_port") reject("loopback_unavailable", errorMessages.loopback_unavailable!);
     if (gen !== this.generation) return fail("sign_in_cancelled", "Sign-in was cancelled.");
-    const url = `${origin}/auth/authorize?client_id=reqharbor-desktop&redirect_uri=${encodeURIComponent("http://127.0.0.1:53682/cb")}&code_challenge_method=S256${method ? `&method=${encodeURIComponent(method)}` : ""}`;
+    const url = `${origin}/auth/authorize?client_id=reqharbor-desktop&redirect_uri=${encodeURIComponent("http://127.0.0.1:53682/cb")}&code_challenge_method=S256${method ? `&method=${encodeURIComponent(method)}` : ""}${args.inviteTicket ? `&ticket=${encodeURIComponent(args.inviteTicket)}` : ""}`;
     const opened = this.opts.auth !== "no_browser";
     if (opened) this.opened.push(url);
     this.status.signIn = { ...idle(), state: "waiting", serverUrl: origin, method, startedAt: this.hooks.now(), ...(opened ? {} : { message: MSG_BROWSER_FAILED, authorizeUrl: url }) };

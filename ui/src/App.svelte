@@ -29,6 +29,12 @@
   const FirstSyncDialog = () => import("./lib/dialogs/FirstSyncDialog.svelte");
   const MergeLegacyDialog = () => import("./lib/dialogs/MergeLegacyDialog.svelte");
   const SpaceNoticeDialog = () => import("./lib/dialogs/SpaceNoticeDialog.svelte");
+  const JoinTeamDialog = () => import("./lib/dialogs/JoinTeamDialog.svelte");
+  const CreateTeamDialog = () => import("./lib/dialogs/CreateTeamDialog.svelte");
+  const InviteDialog = () => import("./lib/dialogs/InviteDialog.svelte");
+  const TransferOwnershipDialog = () => import("./lib/dialogs/TransferOwnershipDialog.svelte");
+  const MoveToTeamDialog = () => import("./lib/dialogs/MoveToTeamDialog.svelte");
+  const CopyToProjectDialog = () => import("./lib/dialogs/CopyToProjectDialog.svelte");
 
   const SIDEBAR = { def: 300, min: 220, max: 480, snap: 160, rail: 44 };
   const PANE_MIN = 360;
@@ -265,7 +271,7 @@
   {#await ShareDialog() then M}<M.default kind={ui.shareDialog.kind} entityId={ui.shareDialog.entityId} name={ui.shareDialog.name} />{/await}
 {/if}
 {#if ui.settingsDialog}
-  {#await SettingsDialog() then M}<M.default section={ui.settingsDialog.section} />{/await}
+  {#await SettingsDialog() then M}<M.default section={ui.settingsDialog.section} teamId={ui.settingsDialog.teamId ?? null} />{/await}
 {/if}
 {#if ui.picker}
   {#await PickerDialog() then M}<M.default mode={ui.picker} />{/await}
@@ -288,6 +294,24 @@
 {/if}
 {#if ui.spaceNotice}
   {#await SpaceNoticeDialog() then M}<M.default mode={ui.spaceNotice?.mode ?? "foreign"} spaceIds={ui.spaceNotice?.spaceIds ?? []} />{/await}
+{/if}
+{#if ui.joinTeam}
+  {#await JoinTeamDialog() then M}<M.default url={ui.joinTeam?.url ?? ""} />{/await}
+{/if}
+{#if ui.createTeam}
+  {#await CreateTeamDialog() then M}<M.default />{/await}
+{/if}
+{#if ui.invite}
+  {#await InviteDialog() then M}<M.default teamId={ui.invite?.teamId ?? ""} teamName={ui.invite?.teamName ?? ""} role={ui.invite?.role ?? "viewer"} />{/await}
+{/if}
+{#if ui.transferOwnership}
+  {#await TransferOwnershipDialog() then M}<M.default teamId={ui.transferOwnership?.teamId ?? ""} />{/await}
+{/if}
+{#if ui.moveToTeam}
+  {#await MoveToTeamDialog() then M}<M.default projectId={ui.moveToTeam?.projectId ?? ""} spaceId={ui.moveToTeam?.spaceId ?? null} />{/await}
+{/if}
+{#if ui.copyToProject}
+  {#await CopyToProjectDialog() then M}<M.default kind={ui.copyToProject?.kind ?? "request"} id={ui.copyToProject?.id ?? ""} name={ui.copyToProject?.name ?? ""} mode={ui.copyToProject?.mode ?? "copy"} targetProjectId={ui.copyToProject?.targetProjectId} />{/await}
 {/if}
 <ConfirmDialog />
 

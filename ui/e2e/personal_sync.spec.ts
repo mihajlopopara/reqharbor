@@ -214,7 +214,9 @@ test("the footer chip lists every space and flags issues", async ({ page }) => {
   await expect(page.getByTestId("project-group-01JSPACEACME0000000000000")).toContainText("Acme");
   await expect(page.getByTestId("project-group-01JSPACEACME0000000000000")).toContainText("Editor");
   await page.getByTestId("project-new").click();
-  await expect(page.locator("[data-testid=new-project-location] option[disabled]")).toHaveText("Acme (team projects arrive with teams)");
+  // M2: an editor may create projects in the team.
+  await expect(page.locator("[data-testid=new-project-location] option[disabled]")).toHaveCount(0);
+  await expect(page.locator(`[data-testid=new-project-location] option[value="01JSPACEACME0000000000000"]`)).toHaveText("Acme");
 });
 
 test("sharing a device-only project offers Sync to Personal", async ({ page }) => {

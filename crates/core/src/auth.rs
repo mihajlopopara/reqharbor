@@ -92,6 +92,11 @@ pub enum AuthError {
     NotSignedIn,
     #[error("Local storage error: {0}")]
     Store(String),
+    /// A 4xx from a team or invite endpoint with the server's error code
+    /// (`forbidden_role`, `last_owner`, `transfer_required`, `limit_teams`,
+    /// `invite_invalid`, …): the UI words it by code.
+    #[error("{message}")]
+    Refused { code: String, message: String },
 }
 
 impl AuthError {
@@ -639,9 +644,13 @@ pub struct MySpace {
     pub bytes_used: Option<u64>,
     #[serde(default)]
     pub quota_bytes: Option<u64>,
+    /// Team spaces (M2): how many members can see it.
+    #[serde(default)]
+    pub member_count: Option<u64>,
 }
 
-/// A space this account left or lost (M2 fills it).
+/// A space this account left or lost (M2): `reason` is `removed`, `left`
+/// or `deleted`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Departed {
@@ -649,7 +658,11 @@ pub struct Departed {
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
     pub team_name: Option<String>,
+    #[serde(default, deserialize_with = "lenient_ms")]
+    pub at: Option<i64>,
 }
 
 /// `GET /v1/me/spaces`.
@@ -896,6 +909,70 @@ impl AuthClient {
     pub async fn spaces(&self, access: &str) -> Result<MySpaces, AuthError> {
         self.json(self.http.get(self.url("/v1/me/spaces")).bearer_auth(access))
             .await
+    }
+
+    /// A JSON call to a team or invite endpoint (M2). `access` is `None` for
+    /// the unauthenticated invite preview and ticket. An empty body (204)
+    /// reads as JSON `null`. A 4xx with an error code becomes
+    /// [`AuthError::Refused`] so the caller can word it; 401 stays
+    /// [`AuthError::Unauthorized`] for the refresh-and-retry.
+    pub async fn api<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        access: Option<&str>,
+        body: Option<&serde_json::Value>,
+    ) -> Result<T, AuthError> {
+        let mut rb = self
+            .http
+            .request(method, self.url(path))
+            .header(reqwest::header::ACCEPT, "application/json");
+        if let Some(a) = access {
+            rb = rb.bearer_auth(a);
+        }
+        if let Some(b) = body {
+            rb = rb.json(b);
+        }
+        let resp = rb
+            .send()
+            .await
+            .map_err(|e| AuthError::Offline(without_url(&e)))?;
+        let status = resp.status().as_u16();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| AuthError::Offline(without_url(&e)))?;
+        if (200..300).contains(&status) {
+            let raw: &[u8] = if bytes.iter().all(u8::is_ascii_whitespace) {
+                b"null"
+            } else {
+                &bytes
+            };
+            return serde_json::from_slice(raw).map_err(|e| AuthError::Protocol(e.to_string()));
+        }
+        let parsed = serde_json::from_slice::<ErrorBody>(&bytes).ok();
+        let code = parsed
+            .as_ref()
+            .map(|b| b.error.code.clone())
+            .unwrap_or_default();
+        let message = parsed
+            .as_ref()
+            .map(|b| b.error.message.clone())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        Err(match (status, code.as_str()) {
+            (401, _) => AuthError::Unauthorized(if code.is_empty() {
+                "unauthorized".into()
+            } else {
+                code
+            }),
+            (426, _) | (_, "client_too_old") => AuthError::ClientTooOld,
+            (429, _) => AuthError::RateLimited,
+            (507, _) => AuthError::ServerFull,
+            (500..=599, _) => AuthError::Server(message),
+            (_, "") => AuthError::Rejected(message),
+            _ => AuthError::Refused { code, message },
+        })
     }
 
     pub async fn revoke_session(&self, access: &str, id: &str) -> Result<(), AuthError> {
@@ -1383,6 +1460,18 @@ impl PendingSignIn {
 
     pub fn port(&self) -> u16 {
         self.loopback.port()
+    }
+
+    /// Add a signup ticket from `POST /v1/invites/ticket` (06 §10 M2), so a
+    /// not-yet-registered invitee can sign up while signup is invite-only.
+    /// The invite token itself never appears in a URL (PRIV-4).
+    pub fn with_ticket(mut self, ticket: Option<&str>) -> Self {
+        if let Some(t) = ticket.map(str::trim).filter(|t| !t.is_empty()) {
+            let mut q = url::form_urlencoded::Serializer::new(String::new());
+            q.append_pair("ticket", t);
+            self.authorize_url = format!("{}&{}", self.authorize_url, q.finish());
+        }
+        self
     }
 
     pub fn peak_concurrency(&self) -> Arc<AtomicUsize> {

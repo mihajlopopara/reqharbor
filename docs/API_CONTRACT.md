@@ -61,6 +61,14 @@ Backend: `src-tauri/src/commands.rs` (thin wrappers) over `crates/core` (`reqhar
 | New error codes `read_only_role`, `space_unavailable`, `forbidden_role`; sync errors `sign_in_required`, `client_too_old`, `server_full` (retried), `rate_limited` (retried). A legacy 403 `legacy_disabled` reads "This server no longer accepts token sync. Sign in instead." | §1, §3.12 |
 | New file `sync-spaces.json` (+ backup); `account.json` holds the bindings. Signing in removes `sync` from `workspace.json`. | §3.12, §4 |
 
+### Accounts: teams (accounts plan M2-client)
+
+| Change | Where |
+|---|---|
+| New commands `teams_list`, `team_create`, `team_get`, `team_rename`, `team_delete`, `team_set_role`, `team_remove_member`, `team_leave`, `team_transfer`, `invite_create`, `invite_list`, `invite_revoke`, `invite_preview`, `invite_accept`, `invite_ticket`, `move_preview`, `move_project_to_space`, `move_cancel`, `copy_preview`, `copy_to_project`, `project_duplicate_to`, `request_edited_by`, `role_change_resolve`; event `sync://move-progress`. `auth_sign_in_start` gains `inviteTicket?`; `space_notice_resolve` gains `saveChanges?`. | §3.14 |
+| `SpaceStatus` gains `teamId`, `memberCount`, `frozen`, `held`; `SpaceIssue.code` gains `roleChanged` and `heldDelete`. `SyncStatus` gains `pendingMoves`. `ShareInfo` gains `createdBy?` and `options?`. | §3.12, §3.14 |
+| New error codes `teams_disabled`, `last_owner`, `transfer_required`, `limit_teams`, `limit_members`, `limit_invites`, `invite_invalid`, `invite_not_a_link`, `invite_other_server`, `not_a_member`, `team_not_found`, `member_not_found`, `invite_not_found`, `validation_failed`, `quota_exceeded`, `clock_skew`. `read_only_role` now also covers deleting a team project below admin and adding projects to a viewer's team. | §1, §3.14 |
+
 ### WebSocket and Socket.IO (next features §3)
 
 | Change | Where |
@@ -121,6 +129,13 @@ try { await call("save_request", { request }); } catch (e) { const err = e as Co
 | `not_signed_in` | an account command without an account |
 | `keychain_unavailable` | the session could not be written to (or read from) the secret store |
 | `rate_limited`, `server_full`, `server_error`, `auth_rejected` | 429, 507, other 5xx / unexpected answer, other refusals (`message` from the server) |
+| `teams_disabled` | a team or invite command while the server doesn't advertise `features.teams` (or answers 403 `teams_disabled`) |
+| `last_owner`, `transfer_required` | the change would leave the team without an owner ("A team needs at least one owner") / the target is the billing owner ("Transfer ownership first") |
+| `limit_teams`, `limit_members`, `limit_invites`, `validation_failed`, `quota_exceeded` | server limits and validation; `message` is the server's (it names the configured limits) |
+| `invite_invalid` | an expired, revoked, used-up or pre-removal invite link (one generic message, AC-INV-5) |
+| `invite_not_a_link` | the pasted text isn't an `https://<server>/i#<token>` link ("That isn't a ReqHarbor invite link.") |
+| `invite_other_server` | `invite_accept` with a link for another server than the signed-in one |
+| `not_a_member`, `team_not_found`, `member_not_found`, `invite_not_found` | the team, member or invite is gone (or never was) |
 | `ws_not_connected` | `ws_send` on a connection that isn't open (unknown id, still connecting, or closed) |
 | `ws_invalid_message` | `ws_send` refused the message: invalid JSON or base64, no or reserved Socket.IO event name, binary in Socket.IO mode (`message` says which) |
 | `internal` | unexpected |
@@ -360,19 +375,53 @@ Mock backend switches (browser only): `?mockServer=ok|tokenOnly|legacyOnly|futur
 |---|---|---|
 | `create_project` | `name, location?` | `ProjectTree`. `location` omitted/null: Personal when signed in (D11), legacy with only token sync, else local; `"local"`; or a space id (`not_found` if unknown). |
 | `project_locations` | – | `ProjectLocation[]` in switcher order (pure-legacy: `legacy` when token sync is on, else `local`). |
-| `project_set_location` | `projectId, spaceId \| null` | `ProjectLocation[]`. To Personal: binds and stamps every entity newer (so an earlier "stop syncing" tombstone can't hide it). To `null`: tombstones in the old space for what it holds ("Removes it from your other devices. This copy stays."). Team moves arrive with teams (`invalid`). A legacy-bound project can't move to Personal here (`invalid`, B6: only `legacy_merge` does that, stopping token sync in the same step); legacy → `null` is allowed. |
+| `project_set_location` | `projectId, spaceId \| null` | `ProjectLocation[]`. To Personal: binds and stamps every entity newer (so an earlier "stop syncing" tombstone can't hide it). To `null`: tombstones in the old space for what it holds ("Removes it from your other devices. This copy stays."). Moves into or out of a team are `move_project_to_space` (new ids, §3.14); here they are `invalid`. A legacy-bound project can't move to Personal here (`invalid`, B6: only `legacy_merge` does that, stopping token sync in the same step); legacy → `null` is allowed. |
 | `first_sync_candidates` | – | `FirstSyncCandidate[]` (unbound projects while `firstSyncPending`) |
 | `first_sync_apply` | `projectIds` | `SyncStatus`. The listed projects bind to Personal, the rest stay local; `[]` = "Keep all on this device". Nothing uploads before this, the Global included; it binds with the first checked project. |
-| `space_notice_resolve` | `spaceId, keep` | `SyncStatus`. For a paused or removed space: keep → its projects become local-only (team projects renamed "X (from Team)"); remove → they are dropped from this device. No tombstone either way. A Global held by that space stays local. |
+| `space_notice_resolve` | `spaceId, keep, saveChanges?` | `SyncStatus`. For a paused or removed space: keep → its projects become local-only (team projects renamed "X (from Team)"); remove → they are dropped from this device. No tombstone either way. A Global held by that space stays local. `saveChanges`: first copies each project with unsynced edits to Personal as "X (my changes)" (new ids; edge case 3). |
 | `space_notice_later` | `spaceIds` | `SyncStatus`. × on the notice ("decide later", UX §6.9): the first × is remembered; after 7 days, while signed in, Keep applies by itself. |
 | `legacy_merge` | – | `LegacyMergeResult` `{ merged, report, syncError }`: the merge is local and done once it returns; the follow-up sync is reported on its own (`syncError` set, the merged data syncs later). Legacy projects and the Global rebind to Personal with the **same ids** and are re-sent (with their original device ids, so a second device's merge converges without duplicates); legacy switches to `sharesOnly` (no more pulls or pushes; share calls keep working). Idempotent. |
 | `legacy_disconnect` | – | `SyncStatus`. Forgets the legacy token; projects still bound to it become local-only. |
 
 Shares in account mode go to the entity's project space (`sync_not_connected` "Sharing needs this project to sync. Change its sync location to Personal first." for a local-only project; "This project's sync is paused, so it can't be shared. Resolve it in Settings › Sync first." when its binding isn't an active one of the signed-in account on the session's server — no request is sent then, so one server's tokens never go to another); `share_list` merges every space, tagging `spaceId`.
 
-The viewer guard (04 §6.8): every project-tree mutator refuses with `read_only_role` for a project in a space where the account is a viewer (teams, M2).
+The viewer guard (04 §6.8): every project-tree mutator refuses with `read_only_role` for a project in a space where the account is a viewer; `delete_project` also refuses below admin in a team ("Only admins can delete team projects."), and `create_project` into a viewer's team refuses.
 
-Mock switches: `?mockSpace=quota|server_full|skew|client_too_old|unavailable`, `?mockTeam=1`, `?mockLegacy=1`, `?mockForeign=1` (with `mockAccount=signedIn`).
+Mock switches: `?mockSpace=quota|server_full|skew|client_too_old|unavailable|removed|roleChanged`, `?mockTeam=1`, `?mockRole=viewer|editor|admin|owner`, `?mockTeams=off`, `?mockMove=offline|quota|slow`, `?mockLegacy=1`, `?mockForeign=1` (with `mockAccount=signedIn`). Test hooks: `__mock.teams.removeMe("Acme")`, `__mock.teams.setMyRole("Acme", "viewer")` (then `__mock.emitStatus()`).
+
+### 3.14 Teams, invites, moves and copies (04 §5.3–§5.4, §6.5, §6.8; 06-go-server §10 M2)
+
+Teams exist only when the account's server advertises `features.teams`; every team and invite command (except `invite_preview` and `invite_ticket`, which need no account) rejects with `teams_disabled` otherwise. Server calls use the session (a 401 refreshes once and retries once). Refusals keep the server's code; `last_owner`, `transfer_required`, `invite_invalid`, `forbidden_role` and the not-found codes get the UX copy, the limits keep the server's message. Commands that change which spaces this account has (create, join, leave, delete) sync afterwards so `/v1/me/spaces` binds or releases the team space.
+
+**Role changes in sync** (04 §6.8). In a space where the account is a viewer nothing is pushed and pulled versions always win (no conflict copies). When `/v1/me/spaces` lowers the role below editor, or the server refuses a whole push with 403 `forbidden_role`, the space's unsynced changes are frozen (`SpaceStatus.frozen`, issue `roleChanged` "Your role in Acme changed to Viewer. You have 3 unsynced changes."). A per-change `forbidden_role` (e.g. an editor's project tombstone) freezes that change and keeps the tombstone. A pulled tombstone of a project, collection or folder that still holds unsynced edits newer than the delete is held (`SpaceStatus.held`, issue `heldDelete`): the container stays, nothing under it is pushed (no orphans), and its edits are frozen. Frozen keys are never pushed and their pulled versions are skipped until `role_change_resolve`. A per-change `global_env_not_allowed` is dropped silently. Team pushes blank `body.binaryPath` and form file values; pulls keep this device's.
+
+**Moves** (04 §6.5). Every move into, out of or between teams uses new ids. `move_project_to_space` persists a plan (old → new ids) in `sync-spaces.json` (`pendingMoves`), pushes the copy to the target (progress on `sync://move-progress`), and only when every entity is accepted inserts the copy bound to the target (marked synced there), deletes the original (tombstones in its space) and drops the plan; `settings.activeProjectId` follows the copy. On any failure the local project is unchanged ("Nothing was moved"); calling it again resumes with the same ids (the server converges), `move_cancel` pushes tombstones for what already landed and forgets the plan. Unfinished moves are listed in `SyncStatus.pendingMoves` (`PendingMove { moveId, projectId, projectName, to, targetName, done, total, copySaved }`). While a plan is pending, pulled copies of its new ids are skipped, and finishing rewinds the target's cursor to where it was when the plan was made, so a teammate's edit or delete of the partial copy applies afterwards; the local step saves the copy first and removes the source second (idempotent after a crash; a copy already saved is kept as it is, never rebuilt from the source). With `copySaved`, the move can only be finished: `move_cancel` and a move to another target are refused ("Finish the move to Acme first"); a resume removes from the target what was deleted here meanwhile; moving to another target first cancels the older plan. Shares of the original stay in its space. Only admins and owners move a project out of a team; viewers can't move one in; a token-synced project must be merged first.
+
+| command | args | result |
+|---|---|---|
+| `teams_list` | – | `TeamsOverview { teams, ownedCount, limits {ownedTeams, teamMembers, teamInvites}, owner }` (personal teams never appear; a `null` limit = no cap). Create team is disabled when `ownedCount >= limits.ownedTeams`. |
+| `team_create` | `name` | `TeamSummary`; 1–80 characters (`invalid`), 409 `limit_teams` |
+| `team_get` | `teamId` | `TeamDetail { team, members, invites (admins and owners; else null), me }` |
+| `team_rename` | `teamId, name` | `null` (admin) |
+| `team_delete` | `teamId` | `SyncStatus` (billing owner). This device keeps local copies "X (from Acme)". |
+| `team_set_role` | `teamId, userId, role` | `null`; `forbidden_role`, `last_owner`, `transfer_required` |
+| `team_remove_member` | `teamId, userId, revokeInvites` | `null`; the member's own links are always revoked, `revokeInvites` revokes the rest |
+| `team_leave` | `teamId, keepCopy` | `SyncStatus`; `keepCopy` keeps its projects as local copies; `transfer_required` (billing owner), `last_owner` |
+| `team_transfer` | `teamId, userId` | `null`; I become admin; `quota_exceeded`, `limit_teams` with the server's message |
+| `invite_create` | `teamId, role, maxUses \| null, expiresInDays` | `CreatedInvite { invite, url }` (the link, shown once); admin links need an owner and `maxUses: 1`; `expiresInDays` 1, 7 or 30 |
+| `invite_list` | `teamId` | `InviteInfo[]` (active links; admin) |
+| `invite_revoke` | `teamId, inviteId` | `null` |
+| `invite_preview` | `url, insecureConfirmed?` | `InviteCheck { serverUrl, otherServer, preview }`; `invite_not_a_link`, `invite_invalid`, `insecure_unconfirmed` (plain http to a non-loopback server, until `insecureConfirmed` or a remembered "Continue anyway") |
+| `invite_accept` | `url` | `JoinResult { teamId, teamName, role, spaceId, alreadyMember, projects }`; `invite_other_server`, `invite_invalid`, `limit_members` |
+| `invite_ticket` | `url, insecureConfirmed?` | the signup ticket for `auth_sign_in_start`'s `inviteTicket`; the same plain-http rule |
+| `move_preview` | `projectId, spaceId \| null` | `TransferPreview` (secret variables, file paths, plain-text `credentials[]` from headers (disabled ones too), request and collection auth (`tab: "collection"`), Socket.IO auth, and fields from a newer ReqHarbor (`tab: "request"`), member count) |
+| `move_project_to_space` | `projectId, spaceId \| null` | `MoveResult { moveId, projectId (the copy), items }` |
+| `move_cancel` | `projectId` | `null`. Removes from the target what already landed and forgets the plan; a plan whose copy was already saved here is finished instead. |
+| `copy_preview` | `kind, id, targetProjectId` | `TransferPreview` with `unresolvedVariables` |
+| `copy_to_project` | `kind, id, targetProjectId, targetCollectionId?, targetFolderId?` | `CopyResult { tree, copyId }`: new ids; the source is untouched (viewers may copy out); without a target collection a request or folder lands in a new collection named after its own |
+| `project_duplicate_to` | `projectId, spaceId \| null, name?` | `ProjectTree`: the whole project with new ids (Duplicate to personal…) |
+| `request_edited_by` | `requestId` | `EditedBy \| null` ("Edited by Sam · 3h"; null in personal and local projects and after my own edit) |
+| `role_change_resolve` | `spaceId, action: "savePersonal" \| "discard"` | `RoleChangeResult { status, copies }`: `savePersonal` copies the affected projects to Personal as "X (my changes)"; then both unfreeze, drop refused tombstones, apply held deletes and re-pull the space from 0 |
 
 ### 3.13 WebSocket and Socket.IO (AC-WS-*)
 

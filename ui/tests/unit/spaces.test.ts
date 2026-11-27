@@ -50,6 +50,10 @@ const space = (spaceId: string, kind: SpaceStatus["kind"], extra: Partial<SpaceS
   quotaBytes: null,
   unsupported: 0,
   accountEmail: "priya@acme.dev",
+  teamId: kind === "team" ? "T1" : null,
+  memberCount: kind === "team" ? 4 : null,
+  frozen: 0,
+  held: [],
   ...extra,
 });
 
@@ -111,6 +115,7 @@ describe("status lines (UX §6.6, §6.7)", () => {
     spaces: [],
     legacy: null,
     firstSyncPending: false,
+    pendingMoves: [],
   };
 
   it("one line per space under the overall line", () => {
@@ -198,8 +203,8 @@ describe("mock personal sync (04 §6, §7)", () => {
     expect((await call("project_locations", {})).find((l) => l.projectId === personal.projectId)?.kind).toBe("local");
     await call("project_set_location", { projectId: personal.projectId, spaceId: personal.spaceId });
     expect((await call("project_locations", {})).find((l) => l.projectId === personal.projectId)?.kind).toBe("personal");
-    expect((await rejects(call("project_set_location", { projectId: team.projectId, spaceId: null }))).message).toContain("arrives with teams");
-    expect((await rejects(call("project_set_location", { projectId: personal.projectId, spaceId: team.spaceId! }))).message).toContain("arrives with teams");
+    expect((await rejects(call("project_set_location", { projectId: team.projectId, spaceId: null }))).message).toMatch(/Move/);
+    expect((await rejects(call("project_set_location", { projectId: personal.projectId, spaceId: team.spaceId! }))).message).toMatch(/Move/);
   });
 
   it("another account's spaces pause; Keep makes local copies, Remove drops them", async () => {

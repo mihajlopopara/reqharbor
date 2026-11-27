@@ -24,7 +24,10 @@ import {
   type Settings,
   type SyncStatus,
   type VariableInfo,
+  type MoveResult,
+  type NodeKind,
 } from "../api";
+import { teamsAvailable, projectPermissions } from "../util/teams";
 import { copyText } from "../api/platform";
 import { indexTree, ancestorsOf, requestsInSubtree, type TreeIndex } from "../util/tree";
 import { makeLookup, setDynamicCatalogue } from "../util/vars";
@@ -106,6 +109,7 @@ const defaultSync: SyncStatus = {
   spaces: [],
   legacy: null,
   firstSyncPending: false,
+  pendingMoves: [],
 };
 
 /** A key of what decides the project switcher's groups (bindings and space states). */
@@ -182,6 +186,15 @@ class AppStore {
   locationById = $derived(new Map(this.locations.map((l) => [l.projectId, l] as const)));
   /** Signed in with a readable session (the account part of the UI is on). */
   signedIn = $derived(this.auth.enabled && !!this.auth.account && !this.auth.keychainUnreadable);
+  /** The account's server advertises `features.teams` (06 §10). */
+  teamsOn = $derived(teamsAvailable(this.auth));
+  /** The active project is in a team where I'm a viewer (AC-ROLE-1, UX §6.2). */
+  viewerHere = $derived(!!projectPermissions(this.activeProjectId ? this.locationById.get(this.activeProjectId) : undefined).edit);
+  /** The active project's space status (role, frozen changes for the banner). */
+  activeSpace = $derived.by(() => {
+    const l = this.activeProjectId ? this.locationById.get(this.activeProjectId) : undefined;
+    return l?.spaceId ? (this.sync.spaces.find((s) => s.spaceId === l.spaceId) ?? null) : null;
+  });
 
   private settingsTimer: ReturnType<typeof setTimeout> | null = null;
   private tick: ReturnType<typeof setInterval> | null = null;
@@ -589,6 +602,15 @@ class AppStore {
     if (this.middle.kind !== "request") return;
     if (this.readOnly) {
       toasts.info(`${NEEDS_NEWER_VERSION}. Update ReqHarbor to edit it.`);
+      return;
+    }
+    if (this.viewerHere && !this.isScratch) {
+      // UX §6.2: edits in a viewer's team project are scratch; ⌘S explains and offers a copy.
+      const id = this.request.id;
+      toasts.info("Viewers can't change team projects. Duplicate to personal to experiment.", {
+        actionLabel: "Duplicate to personal",
+        action: () => (ui.copyToProject = { kind: "request", id, name: this.request.name, mode: "duplicate" }),
+      });
       return;
     }
     if (this.isScratch) {
@@ -1110,6 +1132,77 @@ class AppStore {
     }
   }
 
+  /**
+   * Move to team / move out (04 §6.5): online; on failure nothing moved and this rejects with the
+   * CommandError so the dialog can show it. Switches to the moved copy (it has new ids).
+   */
+  async moveProjectTo(projectId: string, spaceId: string | null): Promise<MoveResult> {
+    const res = await call("move_project_to_space", { projectId, spaceId });
+    this.projects = await call("list_projects", {});
+    this.environments = await call("list_environments", {});
+    await this.loadLocations();
+    this.onSyncStatus(await call("get_sync_status", {}));
+    if (this.activeProjectId === projectId) {
+      this.activeProjectId = null;
+      await this.switchProject(res.projectId);
+    }
+    return res;
+  }
+
+  /** Undo an unfinished move (what already reached the target is removed there). */
+  async cancelMove(projectId: string): Promise<boolean> {
+    try {
+      await call("move_cancel", { projectId });
+      this.onSyncStatus(await call("get_sync_status", {}));
+      await this.reloadAll();
+      return true;
+    } catch (e) {
+      this.reportError(e);
+      return false;
+    }
+  }
+
+  /** Copy to project… / Duplicate to personal… (UX §6.1): new ids, the source is untouched. */
+  async copyNodeTo(kind: NodeKind, id: string, targetProjectId: string, targetCollectionId: string | null): Promise<string | null> {
+    try {
+      const r = await call("copy_to_project", { kind, id, targetProjectId, targetCollectionId });
+      if (r.tree.project.id === this.activeProjectId) this.setTree(r.tree);
+      return r.copyId;
+    } catch (e) {
+      this.reportError(e);
+      return null;
+    }
+  }
+
+  /** A whole project copied to a space (Duplicate to personal…). */
+  async duplicateProjectTo(projectId: string, spaceId: string | null, name: string): Promise<string | null> {
+    try {
+      const t = await call("project_duplicate_to", { projectId, spaceId, name });
+      this.projects = await call("list_projects", {});
+      this.environments = await call("list_environments", {});
+      await this.loadLocations();
+      return t.project.id;
+    } catch (e) {
+      this.reportError(e);
+      return null;
+    }
+  }
+
+  /** The role-changed banner (UX §6.8). */
+  async resolveRoleChange(spaceId: string, action: "savePersonal" | "discard"): Promise<boolean> {
+    try {
+      const r = await call("role_change_resolve", { spaceId, action });
+      this.onSyncStatus(r.status);
+      await this.reloadAll();
+      if (action === "savePersonal") toasts.success(r.copies.length === 1 ? "Saved your changes as a personal copy" : `Saved your changes as ${r.copies.length} personal copies`);
+      else toasts.info("Discarded your unsynced changes");
+      return true;
+    } catch (e) {
+      this.reportError(e);
+      return false;
+    }
+  }
+
   /** Sync location… (AC-PROJ-3): a space id, or null for this device only. */
   async setProjectLocation(projectId: string, spaceId: string | null): Promise<boolean> {
     try {
@@ -1215,8 +1308,9 @@ class AppStore {
   // ───────────── misc ─────────────
   reportError(e: unknown) {
     const err: CommandError = toCommandError(e);
-    // AC-FWD-3: a refusal to touch a request from a newer ReqHarbor is an explanation, not a failure.
-    if (err.code === "read_only_newer") toasts.info(err.message);
+    // AC-FWD-3: a refusal to touch a request from a newer ReqHarbor is an explanation, not a failure;
+    // so is a viewer's refused edit (AC-ROLE-1).
+    if (err.code === "read_only_newer" || err.code === "read_only_role") toasts.info(err.message);
     else toasts.error(err.message);
   }
 }

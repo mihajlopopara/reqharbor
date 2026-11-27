@@ -16,6 +16,8 @@
   import WsSettings from "./WsSettings.svelte";
   import { ws } from "../stores/ws.svelte";
   import { isSocketIo } from "../util/ws";
+  import { call, type EditedBy } from "../api";
+  import { editedByText } from "../util/teams";
 
   type ReqTab = "query" | "headers" | "auth" | "body" | "tests" | "prerun" | "message" | "saved" | "settings";
   let tab = $state<ReqTab>("query");
@@ -60,6 +62,26 @@
   const roReason = $derived(
     ro ? (readOnlyReason(r, app.appVersion) ?? readOnlyReason(app.index?.requestById.get(r.id) ?? r, app.appVersion) ?? "It was made with a newer version of ReqHarbor") : null,
   );
+
+  /** "Edited by Sam · 3h" (UX §6.5): team projects only, not my own last edit. */
+  let editedBy = $state<EditedBy | null>(null);
+  $effect(() => {
+    const id = r.id;
+    const saved = app.isScratch ? null : app.index?.requestById.get(id);
+    void saved?.updatedAt;
+    void app.sync.lastSyncAt;
+    if (!saved || app.locationById.get(app.activeProjectId ?? "")?.kind !== "team") {
+      editedBy = null;
+      return;
+    }
+    call("request_edited_by", { requestId: id }).then(
+      (e) => (editedBy = id === r.id ? e : editedBy),
+      () => (editedBy = null),
+    );
+  });
+  const edited = $derived(editedBy ? editedByText(editedBy, app.now) : null);
+  /** UX §6.2: a viewer's edits are scratch; Save explains instead of saving. */
+  const VIEWER_SAVE = "Viewers can't change team projects. Duplicate to personal to experiment.";
 
   // Pick a sensible tab when switching requests (or between HTTP and WebSocket).
   let lastWs = false;
@@ -192,14 +214,19 @@
         {#if app.dirty}<span class="unsaved" title="Unsaved changes" data-testid="dirty-dot"></span>{/if}
       {/if}
     </div>
-    <button
-      class="btn btn-ghost btn-sm"
-      type="button"
-      disabled={ro || (!app.isScratch && !app.dirty)}
-      onclick={() => void app.save()}
-      title={ro ? `${NEEDS_NEWER_VERSION}: it can't be saved here` : app.isScratch ? "Save to a collection" : "Save request"}
-      data-testid="save-request">Save<span class="kbd-inline">{shortcutText("Mod+S", app.platform)}</span></button
-    >
+    {#if edited}<span class="edited-by" title={edited.title} data-testid="edited-by">{edited.label}</span>{/if}
+    {#if app.viewerHere && !app.isScratch}
+      <button class="btn btn-ghost btn-sm" type="button" aria-disabled="true" title={VIEWER_SAVE} onclick={() => void app.save()} data-testid="save-request">Save<span class="kbd-inline">{shortcutText("Mod+S", app.platform)}</span></button>
+    {:else}
+      <button
+        class="btn btn-ghost btn-sm"
+        type="button"
+        disabled={ro || (!app.isScratch && !app.dirty)}
+        onclick={() => void app.save()}
+        title={ro ? `${NEEDS_NEWER_VERSION}: it can't be saved here` : app.isScratch ? "Save to a collection" : "Save request"}
+        data-testid="save-request">Save<span class="kbd-inline">{shortcutText("Mod+S", app.platform)}</span></button
+      >
+    {/if}
     <button class="icon-btn" type="button" aria-label="More actions" aria-haspopup="menu" bind:this={menuBtn} onclick={openMenu} data-testid="request-menu"><Icon name="more" /></button>
   </div>
 
@@ -383,6 +410,17 @@
 </main>
 
 <style>
+  .edited-by {
+    color: var(--text-3);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  @media (max-width: 900px) {
+    .edited-by {
+      display: none;
+    }
+  }
   .req {
     display: flex;
     flex-direction: column;

@@ -47,6 +47,8 @@ pub const UNSUPPORTED_TYPE: &str = "unsupported_type";
 /// Per-change push reason: the change's `updatedAt` is too far ahead of the
 /// server clock. The change stays dirty (M1 restamps it, 04 §6.9).
 pub const CLOCK_SKEW: &str = "clock_skew";
+/// Per-change rejection of a Global environment pushed to a team (B4).
+pub const GLOBAL_ENV_NOT_ALLOWED: &str = "global_env_not_allowed";
 /// Per-change push reason: the caller's role may not change the entity.
 pub const FORBIDDEN_ROLE: &str = "forbidden_role";
 /// Per-change push reason: the data holds a value the server can't store
@@ -407,6 +409,14 @@ pub struct ShareInfo {
     /// sync). Set by the client, not the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_id: Option<String>,
+    /// Who created it (space shares, AC-TSHARE-2): `name` is null for a
+    /// former member. Absent on legacy shares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<crate::teams::UserRef>,
+    /// The options it was uploaded with (space shares, AC-TSHARE-3):
+    /// `{includeCredentials, environmentId}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Value>,
 }
 
 impl ShareInfo {
@@ -1044,6 +1054,243 @@ pub fn collect_push_in(store: &Store, scope: &Scope) -> Vec<Change> {
     if store.account_mode() && !store.scope_syncable(scope) {
         return Vec::new();
     }
+    // A viewer pushes nothing: the server refuses the whole push (04 §6.2).
+    if store.read_only_scope(scope) {
+        return Vec::new();
+    }
+    let mut changes = collect_dirty(store, scope);
+    if store.account_mode() {
+        let ss = store.space_sync(scope);
+        // Children of a project whose own tombstone waits (refused with
+        // `forbidden_role`, or one this role can't send): their tombstones
+        // stay here, so Discard brings the whole project back.
+        let waiting_projects: std::collections::BTreeSet<String> = st(store, scope)
+            .tombstones
+            .iter()
+            .filter(|t| {
+                t.entity_type == EntityType::Project
+                    && (ss.frozen.contains(&sync_key(EntityType::Project, &t.id))
+                        || project_delete_refused(store, scope))
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        if !ss.frozen.is_empty()
+            || !ss.held.is_empty()
+            || !ss.deferred_deletes.is_empty()
+            || !waiting_projects.is_empty()
+        {
+            let frozen: std::collections::BTreeSet<&str> =
+                ss.frozen.iter().map(String::as_str).collect();
+            let held: std::collections::BTreeSet<&str> = ss
+                .held
+                .iter()
+                .chain(ss.deferred_deletes.iter())
+                .map(String::as_str)
+                .collect();
+            let child_of_waiting = |c: &Change| {
+                c.deleted
+                    && c.entity_type != EntityType::Project
+                    && tombstone_project(store, scope, c).is_some_and(|p| waiting_projects.contains(p))
+            };
+            changes.retain(|c| {
+                let key = sync_key(c.entity_type, &c.id);
+                !frozen.contains(key.as_str())
+                    && !held.contains(key.as_str())
+                    && !child_of_waiting(c)
+                    && !ancestors(store, c.entity_type, &c.id)
+                        .iter()
+                        .any(|a| held.contains(a.as_str()))
+            });
+        }
+        if is_team_scope(store, scope) {
+            for c in &mut changes {
+                if c.entity_type == EntityType::Request
+                    && let Some(d) = c.data.as_mut()
+                {
+                    strip_device_local_paths(d);
+                }
+            }
+        }
+    }
+    changes
+}
+
+/// The project a pushed tombstone belonged to (recorded when the project
+/// was deleted, `Tombstone.extra.projectId`).
+fn tombstone_project<'a>(store: &'a Store, scope: &Scope, c: &Change) -> Option<&'a str> {
+    st(store, scope)
+        .tombstones
+        .iter()
+        .find(|t| t.id == c.id && t.entity_type == c.entity_type)
+        .and_then(|t| t.extra.get(TOMBSTONE_PROJECT))
+        .and_then(Value::as_str)
+}
+
+/// The tombstone field naming the project a child was deleted with.
+pub const TOMBSTONE_PROJECT: &str = "projectId";
+
+/// This account can't delete projects in `scope` (a team below admin): the
+/// server will refuse the project tombstone, so its children's wait.
+fn project_delete_refused(store: &Store, scope: &Scope) -> bool {
+    is_team_scope(store, scope)
+        && !matches!(
+            store.scope_role(scope),
+            Some(crate::spaces::Role::Admin | crate::spaces::Role::Owner)
+        )
+}
+
+/// `"type:id"` of every unsynced change of `scope` (entities and
+/// tombstones), whatever the role: what a role downgrade freezes.
+pub fn dirty_keys_in(store: &Store, scope: &Scope) -> Vec<String> {
+    collect_dirty(store, scope)
+        .iter()
+        .map(|c| sync_key(c.entity_type, &c.id))
+        .collect()
+}
+
+/// A team space (or one of a kind from a newer server).
+fn is_team_scope(store: &Store, scope: &Scope) -> bool {
+    match scope {
+        Scope::Legacy => false,
+        Scope::Space(id) => store.binding(id).is_some_and(|b| {
+            matches!(
+                b.kind,
+                crate::spaces::SpaceKind::Team | crate::spaces::SpaceKind::Unknown
+            )
+        }),
+    }
+}
+
+/// Team pushes leave device-local paths out (AC-TSYNC-8): a binary body's
+/// path and the value of each form file field stay on this device.
+pub fn strip_device_local_paths(data: &mut Value) {
+    let Some(body) = data.get_mut("body").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(p) = body.get_mut("binaryPath")
+        && p.is_string()
+    {
+        *p = Value::String(String::new());
+    }
+    if let Some(form) = body.get_mut("form").and_then(Value::as_array_mut) {
+        for f in form {
+            if f.get("kind").and_then(Value::as_str) == Some("file")
+                && let Some(v) = f.get_mut("value")
+            {
+                *v = Value::String(String::new());
+            }
+        }
+    }
+}
+
+/// The containers above a local entity, as `"type:id"`: its folders,
+/// collection and project (a project environment: its project).
+pub fn ancestors(store: &Store, t: EntityType, id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let tree_of = |pid: &str| store.projects.get(pid);
+    match t {
+        EntityType::Project => {}
+        EntityType::Environment => {
+            if let Some(pid) = store.environment(id).and_then(|e| e.project_id.clone()) {
+                out.push(sync_key(EntityType::Project, &pid));
+            }
+        }
+        EntityType::Collection => {
+            if let Some(c) = store.collection(id) {
+                out.push(sync_key(EntityType::Project, &c.project_id));
+            }
+        }
+        EntityType::Folder | EntityType::Request => {
+            let (collection, mut folder) = if t == EntityType::Request {
+                match store.request(id) {
+                    Some(r) => (r.collection_id.clone(), r.folder_id.clone()),
+                    None => return out,
+                }
+            } else {
+                let Some(f) = store
+                    .projects
+                    .values()
+                    .flat_map(|t| t.folders.iter())
+                    .find(|f| f.id == id)
+                else {
+                    return out;
+                };
+                (f.collection_id.clone(), f.parent_folder_id.clone())
+            };
+            let pid = store.collection(&collection).map(|c| c.project_id.clone());
+            let mut guard = 0;
+            while let Some(fid) = folder.take() {
+                out.push(sync_key(EntityType::Folder, &fid));
+                guard += 1;
+                if guard > 256 {
+                    break;
+                }
+                folder = pid
+                    .as_deref()
+                    .and_then(tree_of)
+                    .and_then(|t| t.folders.iter().find(|f| f.id == fid))
+                    .and_then(|f| f.parent_folder_id.clone());
+            }
+            out.push(sync_key(EntityType::Collection, &collection));
+            if let Some(p) = pid {
+                out.push(sync_key(EntityType::Project, &p));
+            }
+        }
+    }
+    out
+}
+
+/// Everything under a container (not the container itself).
+pub fn descendants(store: &Store, t: EntityType, id: &str) -> Vec<(EntityType, String)> {
+    match t {
+        EntityType::Project => store
+            .project_entities(id)
+            .into_iter()
+            .filter(|(et, x)| !(*et == EntityType::Project && x == id))
+            .collect(),
+        EntityType::Collection => store
+            .projects
+            .values()
+            .find(|tr| tr.collections.iter().any(|c| c.id == id))
+            .map(|tr| {
+                tr.folders
+                    .iter()
+                    .filter(|f| f.collection_id == id)
+                    .map(|f| (EntityType::Folder, f.id.clone()))
+                    .chain(
+                        tr.requests
+                            .iter()
+                            .filter(|r| r.collection_id == id)
+                            .map(|r| (EntityType::Request, r.id.clone())),
+                    )
+                    .collect()
+            })
+            .unwrap_or_default(),
+        EntityType::Folder => store
+            .projects
+            .values()
+            .find(|tr| tr.folders.iter().any(|f| f.id == id))
+            .map(|tr| {
+                let ids = descendant_folders(tr, id);
+                ids.iter()
+                    .filter(|f| f.as_str() != id)
+                    .map(|f| (EntityType::Folder, f.clone()))
+                    .chain(
+                        tr.requests
+                            .iter()
+                            .filter(|r| r.folder_id.as_ref().is_some_and(|f| ids.contains(f)))
+                            .map(|r| (EntityType::Request, r.id.clone())),
+                    )
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Dirty entities and tombstones of `scope`, before any role or freeze
+/// filtering.
+fn collect_dirty(store: &Store, scope: &Scope) -> Vec<Change> {
     let device = store.device_id().to_string();
     let state = st(store, scope);
     let mut changes: Vec<Change> = local_entities(store, scope)
@@ -1300,6 +1547,8 @@ pub struct PushApplied {
     pub clock_skew: usize,
     /// Results with a status this build doesn't know: left dirty.
     pub unknown: usize,
+    /// Changes refused with `forbidden_role`: frozen for the banner.
+    pub forbidden: usize,
 }
 
 /// The reason recorded in `sync_skipped` for a rejected upsert: the
@@ -1347,6 +1596,7 @@ pub fn apply_push_results_in(
     let mut out = PushApplied::default();
     let now = now_ms();
     store.record_server_time(scope, server_time, now);
+    let mut forbidden_projects = 0;
     for r in results {
         let Some(change) = pushed
             .iter()
@@ -1364,6 +1614,38 @@ pub fn apply_push_results_in(
             state.server_types = Some(types);
             state.server_checked_at = None;
             out.unsupported += 1;
+            continue;
+        }
+        if r.status == PushStatus::Rejected
+            && r.reason.as_deref() == Some(FORBIDDEN_ROLE)
+            && store.account_mode()
+        {
+            // 04 §6.4: the change stays dirty (or the tombstone is kept) and
+            // waits for the role-changed banner instead of being re-sent.
+            let ss = store.space_sync_mut(scope);
+            if !ss.frozen.contains(&key) {
+                ss.frozen.push(key.clone());
+            }
+            if change.deleted && change.entity_type == EntityType::Project {
+                forbidden_projects += 1;
+            }
+            out.forbidden += 1;
+            out.rejected += 1;
+            continue;
+        }
+        if r.status == PushStatus::Rejected
+            && r.reason.as_deref() == Some(GLOBAL_ENV_NOT_ALLOWED)
+        {
+            // Only a buggy client sends this (B4): dropped silently.
+            let state = st_mut(store, scope);
+            if change.deleted {
+                state
+                    .tombstones
+                    .retain(|t| !(t.id == change.id && t.entity_type == change.entity_type));
+            } else {
+                state.synced.insert(key.clone(), change.updated_at);
+            }
+            out.rejected += 1;
             continue;
         }
         match (change.deleted, r.status) {
@@ -1426,6 +1708,30 @@ pub fn apply_push_results_in(
             PushStatus::Stale => {}
         }
     }
+    if out.forbidden > 0
+        && let Scope::Space(id) = scope
+    {
+        let name = store
+            .binding(id)
+            .map(|b| b.name())
+            .unwrap_or_else(|| "this team".into());
+        let frozen = store.space_sync(scope).frozen.len();
+        let message = if forbidden_projects > 0 {
+            format!(
+                "Only admins can delete projects in {name}. Discard to bring the project back."
+            )
+        } else {
+            format!(
+                "Your role in {name} doesn't allow {}. Save them as a personal copy or discard them.",
+                if frozen == 1 {
+                    "this change".to_string()
+                } else {
+                    format!("these {frozen} changes")
+                }
+            )
+        };
+        store.space_sync_mut(scope).issue = Some(SpaceIssue::new("roleChanged", message));
+    }
     out
 }
 
@@ -1455,6 +1761,31 @@ pub struct PullReport {
     pub foreign: usize,
     /// Deletes held back because another space's pull failed (B7).
     pub deferred: usize,
+    /// Pulled changes skipped because their key waits for the role-changed
+    /// banner (04 §6.8).
+    pub frozen: usize,
+    /// Containers deleted on the server that were kept because they hold
+    /// newer unsynced edits (06 §10 M2).
+    pub held: usize,
+}
+
+/// "“Payments API” was deleted in Acme. 2 unsynced changes in it are kept
+/// until you decide."
+pub fn held_delete_message(name: &str, space: &str, n: usize) -> String {
+    let what = if name.is_empty() {
+        "An item".to_string()
+    } else {
+        format!("\u{201c}{name}\u{201d}")
+    };
+    format!(
+        "{what} was deleted in {space}. {} in it {} kept until you decide.",
+        if n == 1 {
+            "1 unsynced change".to_string()
+        } else {
+            format!("{n} unsynced changes")
+        },
+        if n == 1 { "is" } else { "are" }
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1647,7 +1978,7 @@ fn conflict_copy(store: &mut Store, t: EntityType, id: &str) -> Option<String> {
     Some(copy_id)
 }
 
-fn remove_local(store: &mut Store, t: EntityType, id: &str) -> Vec<(EntityType, String)> {
+pub(crate) fn remove_local(store: &mut Store, t: EntityType, id: &str) -> Vec<(EntityType, String)> {
     let mut removed = Vec::new();
     match t {
         EntityType::Project => {
@@ -1812,6 +2143,13 @@ fn upsert_remote(store: &mut Store, scope: &Scope, change: &Change) -> Result<()
         EntityType::Request => {
             let mut r: Request = serde_json::from_value(data).map_err(err)?;
             r.updated_at = change.updated_at;
+            // Team spaces never carry device-local paths (AC-TSYNC-8): keep
+            // this device's file choices, as secrets are kept.
+            if is_team_scope(store, scope)
+                && let Some(local) = store.request(&r.id)
+            {
+                keep_local_paths(&mut r, local);
+            }
             let pid = store
                 .project_of(crate::storage::NodeKind::Collection, &r.collection_id)
                 .map_err(|_| format!("request {} has no collection", r.id))?;
@@ -1888,6 +2226,28 @@ fn upsert_remote(store: &mut Store, scope: &Scope, change: &Change) -> Result<()
     Ok(())
 }
 
+/// Keep `local`'s binary path and form file values where `r` (pulled from a
+/// team space) has them blank.
+fn keep_local_paths(r: &mut Request, local: &Request) {
+    let blank = |v: &Option<String>| v.as_deref().is_none_or(str::is_empty);
+    if blank(&r.body.binary_path) && !blank(&local.body.binary_path) {
+        r.body.binary_path = local.body.binary_path.clone();
+    }
+    if let (Some(form), Some(lform)) = (r.body.form.as_mut(), local.body.form.as_ref()) {
+        for f in form
+            .iter_mut()
+            .filter(|f| f.kind == FormFieldKind::File && f.value.is_empty())
+        {
+            if let Some(l) = lform
+                .iter()
+                .find(|l| l.kind == FormFieldKind::File && l.key == f.key && !l.value.is_empty())
+            {
+                f.value = l.value.clone();
+            }
+        }
+    }
+}
+
 /// How [`apply_pull_in`] treats one pull.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PullOptions {
@@ -1926,12 +2286,36 @@ pub fn apply_pull_in(
     upserts.sort_by_key(|c| c.entity_type.depth());
     deletes.sort_by_key(|c| std::cmp::Reverse(c.entity_type.depth()));
     let had_remote_projects = upserts.iter().any(|c| c.entity_type == EntityType::Project);
+    // 04 §6.8: in a space this account can only read, the server's version
+    // always wins and no conflict copy is made; keys frozen for the
+    // role-changed banner (and held deletes) wait for the user's choice.
+    let viewer = account && store.read_only_scope(scope);
+    let frozen: std::collections::BTreeSet<String> = if account {
+        let ss = store.space_sync(scope);
+        ss.frozen.iter().chain(ss.held.iter()).cloned().collect()
+    } else {
+        Default::default()
+    };
 
+    let moving = if account {
+        store.unfinished_move_ids()
+    } else {
+        Default::default()
+    };
     let my_device = store.device_id().to_string();
     for change in &upserts {
         let key = sync_key(change.entity_type, &change.id);
         if !accepts_upsert(store, scope, change) {
             report.foreign += 1;
+            continue;
+        }
+        if frozen.contains(&key) {
+            report.frozen += 1;
+            continue;
+        }
+        // The copy of a move that hasn't finished (its push landed, the
+        // answer didn't): it arrives here with the move, not as a pull.
+        if moving.contains(&change.id) {
             continue;
         }
         if account && let Some(by) = &change.updated_by {
@@ -1945,7 +2329,8 @@ pub fn apply_pull_in(
         match local_meta(store, change.entity_type, &change.id) {
             Some((local_updated, _)) => {
                 let resend = is_resend(store, scope, &key, local_updated);
-                let dirty = synced_at != Some(local_updated)
+                let dirty = !viewer
+                    && synced_at != Some(local_updated)
                     && !resend
                     && !read_only_entity(store, change.entity_type, &change.id);
                 let local_device = if dirty {
@@ -2038,32 +2423,98 @@ pub fn apply_pull_in(
         && (!account || store.space_sync(scope).deferred_runs < MAX_DEFERRED_RUNS);
     if defer {
         report.deferred = deletes.len();
-        deletes.clear();
     }
+    // Deferred tombstones of this space's entities: nothing under them is
+    // pushed until they apply, so a stale edit never reaches the server as
+    // an orphan in the meantime (B7 with 06 §10 M2).
+    let mut deferred_keys: Vec<String> = Vec::new();
     for change in &deletes {
         let key = sync_key(change.entity_type, &change.id);
         let Some((local_updated, _)) = local_meta(store, change.entity_type, &change.id) else {
-            let state = st_mut(store, scope);
-            state.synced.remove(&key);
-            state.tombstones.retain(|t| t.id != change.id);
+            if !defer {
+                let state = st_mut(store, scope);
+                state.synced.remove(&key);
+                state.tombstones.retain(|t| t.id != change.id);
+            }
             continue;
         };
         // B5: a pulled tombstone only touches this space's entities.
         if account && scope_of_local(store, change.entity_type, &change.id).as_ref() != Some(scope)
         {
-            let state = st_mut(store, scope);
-            state.synced.remove(&key);
-            state.tombstones.retain(|t| t.id != change.id);
-            report.foreign += 1;
+            if !defer {
+                let state = st_mut(store, scope);
+                state.synced.remove(&key);
+                state.tombstones.retain(|t| t.id != change.id);
+                report.foreign += 1;
+            }
             continue;
         }
-        let dirty = st(store, scope).synced.get(&key) != Some(&local_updated)
+        if frozen.contains(&key) {
+            report.frozen += 1;
+            continue;
+        }
+        let dirty = !viewer
+            && st(store, scope).synced.get(&key) != Some(&local_updated)
             && !read_only_entity(store, change.entity_type, &change.id);
         let remote_device = change.device_id.clone().unwrap_or_default();
         if dirty
             && (local_updated, my_device.as_str()) > (change.updated_at, remote_device.as_str())
         {
             continue; // local edit after the remote delete wins
+        }
+        // 06 §10 M2: a container deleted on the server that still holds
+        // unsynced edits newer than the delete is kept (and nothing under it
+        // is pushed, so no orphans reach the server) until the banner is
+        // resolved. Older edits lose to the delete, as before.
+        if account && change.entity_type != EntityType::Request {
+            let newer: Vec<String> = descendants(store, change.entity_type, &change.id)
+                .into_iter()
+                .filter_map(|(t, id)| {
+                    let k = sync_key(t, &id);
+                    if frozen.contains(&k) {
+                        return Some(k);
+                    }
+                    let (updated, _) = local_meta(store, t, &id)?;
+                    let kid_dirty = !viewer
+                        && st(store, scope).synced.get(&k) != Some(&updated)
+                        && !read_only_entity(store, t, &id);
+                    (kid_dirty
+                        && (updated, my_device.as_str())
+                            > (change.updated_at, remote_device.as_str()))
+                    .then_some(k)
+                })
+                .collect();
+            if !newer.is_empty() {
+                let name = local_meta(store, change.entity_type, &change.id)
+                    .map(|m| m.1)
+                    .unwrap_or_default();
+                let space = match scope {
+                    Scope::Space(id) => store.binding(id).map(|b| b.name()),
+                    Scope::Legacy => None,
+                }
+                .unwrap_or_else(|| "the workspace".into());
+                let ss = store.space_sync_mut(scope);
+                for k in newer {
+                    if !ss.frozen.contains(&k) {
+                        ss.frozen.push(k);
+                    }
+                }
+                if !ss.held.contains(&key) {
+                    ss.held.push(key.clone());
+                }
+                let n = ss.frozen.len();
+                ss.issue = Some(SpaceIssue::new(
+                    "heldDelete",
+                    held_delete_message(&name, &space, n),
+                ));
+                report.held += 1;
+                continue;
+            }
+        }
+        if defer {
+            // Held back (B7): evaluated above, applied on a later run.
+            deferred_keys.push(key);
+            continue;
         }
         for (t, id) in remove_local(store, change.entity_type, &change.id) {
             let k = sync_key(t, &id);
@@ -2127,6 +2578,7 @@ pub fn apply_pull_in(
     }
     if account {
         let ss = store.space_sync_mut(scope);
+        ss.deferred_deletes = deferred_keys;
         ss.deferred_runs = if defer { ss.deferred_runs + 1 } else { 0 };
         ss.foreign += report.foreign as u64;
     }

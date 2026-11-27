@@ -9,6 +9,7 @@ mod secret_store;
 mod state;
 mod sync_policy;
 mod sync_rt;
+mod teams_rt;
 mod ws_rt;
 
 use reqharbor_core::storage::Store;
@@ -165,6 +166,29 @@ fn main() {
             commands::ws_send,
             commands::ws_ping,
             commands::ws_close,
+            teams_rt::teams_list,
+            teams_rt::team_create,
+            teams_rt::team_get,
+            teams_rt::team_rename,
+            teams_rt::team_delete,
+            teams_rt::team_set_role,
+            teams_rt::team_remove_member,
+            teams_rt::team_leave,
+            teams_rt::team_transfer,
+            teams_rt::invite_create,
+            teams_rt::invite_list,
+            teams_rt::invite_revoke,
+            teams_rt::invite_preview,
+            teams_rt::invite_accept,
+            teams_rt::invite_ticket,
+            teams_rt::move_preview,
+            teams_rt::move_project_to_space,
+            teams_rt::move_cancel,
+            teams_rt::copy_preview,
+            teams_rt::copy_to_project,
+            teams_rt::project_duplicate_to,
+            teams_rt::role_change_resolve,
+            teams_rt::request_edited_by,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ReqHarbor")

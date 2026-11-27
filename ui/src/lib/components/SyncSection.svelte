@@ -329,6 +329,9 @@
             <span class="grow"></span>
             {#if usageText(sp, formatSize)}<span class="faint small tabular">{usageText(sp, formatSize)}</span>{/if}
             {#if pct(sp) !== null}<span class="meter mini"><span class="fill" class:high={(pct(sp) ?? 0) > 85} style:width="{pct(sp)}%"></span></span>{/if}
+            {#if sp.kind === "team" && sp.teamId && sp.state === "active" && app.teamsOn}
+              <button class="link small" type="button" onclick={() => (ui.settingsDialog = { section: "teams", teamId: sp.teamId ?? undefined })} data-testid="sync-space-team-{sp.spaceId}">Team settings ›</button>
+            {/if}
           </div>
           {#if sp.issue || sp.state !== "active"}
             <div class="space-msg small" class:warn={!!sp.issue && sp.issue.code !== "clockFixed"} data-testid="sync-space-msg-{sp.spaceId}">
@@ -341,6 +344,19 @@
           {:else if sp.lastSyncAt}
             <div class="faint small">Synced {ago(sp.lastSyncAt)}</div>
           {/if}
+        </div>
+      {/each}
+    </section>
+  {/if}
+  {#if sync.pendingMoves?.length}
+    <section class="block" data-testid="pending-moves">
+      <h4>Unfinished moves</h4>
+      {#each sync.pendingMoves as m (m.moveId)}
+        <div class="space-row pending-move" data-testid="pending-move">
+          <Icon name="alert" />
+          <span class="grow">Moving “{m.projectName}” to {m.targetName} didn't finish ({m.done} of {m.total} items). Nothing changed on this device yet.</span>
+          <button class="btn btn-secondary btn-sm" type="button" onclick={() => (ui.settingsDialog = null, ui.moveToTeam = { projectId: m.projectId, spaceId: m.to ?? "local" })} data-testid="pending-move-finish">Finish move…</button>
+          {#if !m.copySaved}<button class="btn btn-ghost btn-sm" type="button" onclick={() => void app.cancelMove(m.projectId)} data-testid="pending-move-cancel">Cancel move</button>{/if}
         </div>
       {/each}
     </section>

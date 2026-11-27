@@ -287,7 +287,10 @@ pub async fn run(
                     }
                     if s.account_mode() {
                         let ss = s.space_sync_mut(&scope);
-                        if ss.skewed.is_empty() {
+                        // A banner waiting for the user's choice (04 §6.8)
+                        // stays until it is resolved.
+                        let banner = !ss.frozen.is_empty() || !ss.held.is_empty();
+                        if ss.skewed.is_empty() && !banner {
                             ss.issue = None;
                         }
                     }
@@ -329,6 +332,12 @@ pub async fn run(
             .unwrap_or(0);
         match result {
             Ok(n) => out.scopes[idx].report.pushed = n,
+            // A viewer push is refused as a whole (04 §6.2): the role
+            // dropped since the last reconcile. Freeze and show the banner;
+            // the next `/v1/me/spaces` confirms the role.
+            Err(SyncError::Forbidden(m)) if m.starts_with(sync::FORBIDDEN_ROLE) => {
+                store.with(|s| s.role_refused(&scope));
+            }
             Err(e) => {
                 if e == SyncError::SignInRequired {
                     out.sign_in_required = true;
@@ -390,6 +399,14 @@ pub struct SpaceStatus {
     pub unsupported: usize,
     /// The account that bound the space (for "synced by priya@acme.dev").
     pub account_email: String,
+    /// Team spaces: the team id and how many members can see it.
+    pub team_id: Option<String>,
+    pub member_count: Option<u64>,
+    /// Changes waiting for the role-changed banner (04 §6.8).
+    pub frozen: usize,
+    /// `"type:id"` of containers deleted on the server but kept here because
+    /// they hold newer unsynced edits (06 §10 M2).
+    pub held: Vec<String>,
 }
 
 /// The token-sync workspace in account mode (UX §11 "LEGACY WORKSPACE").
@@ -445,6 +462,9 @@ pub fn space_statuses(store: &Store) -> Vec<SpaceStatus> {
             last_sync_at: ss.state.last_sync_at,
             pending_changes: if syncable {
                 sync::pending_count_in(store, &scope)
+            } else if matches!(b.state, crate::spaces::BindingState::Removed { .. }) {
+                // "4 changes hadn't synced yet." on the removal notice (UX §6.9).
+                sync::dirty_keys_in(store, &scope).len()
             } else {
                 0
             },
@@ -457,6 +477,10 @@ pub fn space_statuses(store: &Store) -> Vec<SpaceStatus> {
                 0
             },
             account_email: b.user_email.clone(),
+            team_id: b.team_id.clone(),
+            member_count: b.member_count,
+            frozen: ss.frozen.len(),
+            held: ss.held.clone(),
         });
     }
     if let Some(l) = &store.bindings.legacy {
@@ -490,6 +514,10 @@ pub fn space_statuses(store: &Store) -> Vec<SpaceStatus> {
                 0
             },
             account_email: String::new(),
+            team_id: None,
+            member_count: None,
+            frozen: 0,
+            held: Vec::new(),
         });
     }
     out

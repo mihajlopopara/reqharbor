@@ -10,6 +10,8 @@
   import Hl from "./Hl.svelte";
   import Icon from "./Icon.svelte";
   import { ws } from "../stores/ws.svelte";
+  import { toasts } from "../stores/toasts.svelte";
+  import { isConflictCopy, projectPermissions } from "../util/teams";
 
   const ROW = 26;
   const filter = $derived(ui.filters.collections);
@@ -103,8 +105,42 @@
     return app.isContainerReadOnly(row.kind, row.id);
   }
 
+  /** AC-ROLE-1 / UX §6.2: a viewer's team project is read-only here (copy out to change it). */
+  const viewerReason = $derived(projectPermissions(app.activeProjectId ? app.locationById.get(app.activeProjectId) : undefined).edit);
+  const VIEWER_TIP = "Viewers can't change team projects. Duplicate to personal to experiment.";
+
+  function copyItems(row: TreeRow): MenuItem[] {
+    if (app.projects.length < 2 && !viewerReason) return [];
+    const target = { kind: row.kind, id: row.id, name: row.name };
+    return viewerReason
+      ? [{ label: "Duplicate to personal…", action: () => (ui.copyToProject = { ...target, mode: "duplicate" }), testid: "tree-duplicate-personal" }]
+      : [{ label: "Copy to project…", action: () => (ui.copyToProject = { ...target, mode: "copy" }), testid: "tree-copy-to-project" }];
+  }
+
+  /** A viewer's menu: only Open, Settings, Copy as cURL and Duplicate to personal… are enabled. */
+  function viewerMenu(row: TreeRow): MenuItem[] {
+    const no = (label: string, extra: Partial<MenuItem> = {}): MenuItem => ({ label, disabled: true, reason: viewerReason ?? undefined, ...extra });
+    const req = app.index?.requestById.get(row.id);
+    return [
+      ...(row.kind === "request" ? [{ label: "Open", action: () => app.openRequest(row.id) }] : []),
+      ...(row.kind === "collection" ? [{ label: "Settings…", action: () => app.openCollection(row.id) }] : []),
+      ...(row.kind === "request" && req ? [{ label: "Copy as cURL", action: () => void app.copyRequestCurl(row.id === app.request.id ? ($state.snapshot(app.request) as typeof req) : req) }] : []),
+      ...(row.kind !== "folder" ? [no("Share…", { reason: "Viewers can't create share links", testid: "tree-share" })] : []),
+      { separator: true },
+      ...copyItems(row),
+      no("Rename", { testid: "tree-rename" }),
+      no("Duplicate", { testid: "tree-duplicate" }),
+      { separator: true },
+      no("Delete", { danger: true, testid: "tree-delete" }),
+    ];
+  }
+
   function startRename(row: TreeRow) {
     if (newer(row)) return;
+    if (viewerReason) {
+      toasts.info(VIEWER_TIP);
+      return;
+    }
     select(row);
     ui.renaming = { kind: row.kind, id: row.id };
   }
@@ -123,6 +159,7 @@
   function menuFor(row: TreeRow): MenuItem[] {
     const f2 = "F2";
     const ix = app.index!;
+    if (viewerReason && !newer(row)) return viewerMenu(row);
     if (row.kind === "collection" && newer(row)) {
       // AC-FWD-4: a collection from a newer ReqHarbor can't be renamed, set up, copied or moved here.
       return [
@@ -152,6 +189,7 @@
         { separator: true },
         { label: "Rename", shortcut: f2, action: () => startRename(row), testid: "tree-rename" },
         { label: "Duplicate", action: () => void app.duplicate("collection", row.id), testid: "tree-duplicate" },
+        ...copyItems(row),
         { separator: true },
         { label: "Delete", danger: true, action: () => void app.deleteNode("collection", row.id), testid: "tree-delete" },
       ];
@@ -164,6 +202,7 @@
         { label: "Rename", shortcut: f2, action: () => startRename(row), testid: "tree-rename" },
         { label: "Duplicate", action: () => void app.duplicate("folder", row.id), testid: "tree-duplicate" },
         { label: "Move to…", action: () => (ui.picker = { kind: "moveFolder", folderId: row.id }), testid: "tree-move" },
+        ...copyItems(row),
         { separator: true },
         { label: "Delete", danger: true, action: () => void app.deleteNode("folder", row.id), testid: "tree-delete" },
       ];
@@ -185,6 +224,7 @@
       { label: "Rename", shortcut: f2, action: () => startRename(row), testid: "tree-rename" },
       { label: "Duplicate", action: () => void app.duplicate("request", row.id), testid: "tree-duplicate" },
       { label: "Move to…", action: () => (ui.picker = { kind: "moveRequest", requestId: row.id }), testid: "tree-move" },
+      ...copyItems(row),
       { separator: true },
       { label: "Delete", danger: true, action: () => void app.deleteNode("request", row.id), testid: "tree-delete" },
     ];
@@ -206,7 +246,7 @@
   let lastPointerY = 0;
 
   function pointerdown(e: PointerEvent, row: TreeRow) {
-    if (e.button !== 0 || ui.renaming || filter || newer(row)) return;
+    if (e.button !== 0 || ui.renaming || filter || newer(row) || viewerReason) return;
     if ((e.target as HTMLElement).closest("button, input, .chev, .more")) return;
     pending = { row, x: e.clientX, y: e.clientY, id: e.pointerId };
     window.addEventListener("pointermove", pointermove);
@@ -425,6 +465,9 @@
         {:else}
           <span class="name"><Hl text={r.name} query={filter} /></span>
         {/if}
+        {#if isConflictCopy(r.name)}
+          <span class="conflict" title="Conflict copy · Someone's change was newer and kept as the original." aria-label="Conflict copy" role="img" data-testid="conflict-badge"><Icon name="alert" small /></span>
+        {/if}
         {#if newer(r)}
           <span class="newer" title={REQUIRES_NEWER} aria-label={REQUIRES_NEWER} role="img" data-testid="newer-badge"><Icon name="alert" small /></span>
         {/if}
@@ -461,6 +504,11 @@
 {/if}
 
 <style>
+  .conflict {
+    display: inline-flex;
+    color: var(--warning);
+    flex: none;
+  }
   .row {
     display: flex;
     gap: var(--sp-4);

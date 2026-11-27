@@ -6,6 +6,8 @@
   import { ui, type SettingsSection } from "../stores/ui.svelte";
   import AccountSection from "../components/AccountSection.svelte";
   import SyncSection from "../components/SyncSection.svelte";
+  import TeamsSection from "../components/TeamsSection.svelte";
+  import { createdByText, shareLockReason } from "../util/teams";
   import { toasts } from "../stores/toasts.svelte";
   import { call, toCommandError, type ShareInfo, type Theme } from "../api";
   import { copyText } from "../api/platform";
@@ -13,14 +15,24 @@
   import { SHORTCUT_LIST, shortcutKeys } from "../util/shortcuts";
 
   type Section = SettingsSection;
-  let { section: initial }: { section: Section } = $props();
+  let { section: initial, teamId: initialTeam = null }: { section: Section; teamId?: string | null } = $props();
   // svelte-ignore state_referenced_locally
   let section = $state<Section>(initial === "account" && !app.auth.enabled ? "general" : initial);
+  // svelte-ignore state_referenced_locally
+  let teamId = $state<string | null>(initialTeam);
+  // Another part of the app points Settings somewhere (Team settings ›, a new team).
+  $effect(() => {
+    const d = ui.settingsDialog;
+    if (!d) return;
+    section = d.section === "account" && !app.auth.enabled ? "general" : d.section;
+    if (d.teamId !== undefined) teamId = d.teamId ?? null;
+  });
   const close = () => (ui.settingsDialog = null);
   const NAV: { id: Section; label: string }[] = [
     ...(app.auth.enabled ? [{ id: "account" as const, label: "Account" }] : []),
     { id: "general", label: "General" },
     { id: "sync", label: "Sync" },
+    ...(app.teamsOn ? [{ id: "teams" as const, label: "Teams" }] : []),
     { id: "shares", label: "Shares" },
     { id: "shortcuts", label: "Shortcuts" },
     { id: "about", label: "About" },
@@ -39,10 +51,14 @@
       sharesError = err.code === "sync_not_connected" ? "Connect sync to create and manage share links." : err.message;
     }
   }
+  /** My role in the space a share lives in (team shares only). */
+  const roleOfShare = (s: ShareInfo) => app.sync.spaces.find((x) => x.spaceId === s.spaceId && x.kind === "team")?.role ?? null;
+
   /** QA-R2-002: re-upload with the share's original options; if unknown, ask via the Share dialog. */
   async function updateShare(s: ShareInfo) {
     if (!s.kind || !s.entityId) return;
-    const opts = app.shareOptions(s.shareId);
+    // Account spaces keep the options on the server (AC-TSHARE-3).
+    const opts = s.options ?? app.shareOptions(s.shareId);
     if (!opts) {
       ui.settingsDialog = null;
       ui.shareDialog = { kind: s.kind, entityId: s.entityId, name: s.name ?? "Shared item" };
@@ -93,7 +109,16 @@
   <div class="layout">
     <nav aria-label="Settings sections">
       {#each NAV as n (n.id)}
-        <button type="button" class="nav" aria-current={section === n.id ? "page" : undefined} onclick={() => (section = n.id)} data-testid="settings-nav-{n.id}">{n.label}</button>
+        <button
+          type="button"
+          class="nav"
+          aria-current={section === n.id ? "page" : undefined}
+          onclick={() => {
+            section = n.id;
+            if (n.id === "teams") teamId = null;
+          }}
+          data-testid="settings-nav-{n.id}">{n.label}</button
+        >
       {/each}
     </nav>
     <div class="content">
@@ -115,6 +140,8 @@
         </label>
       {:else if section === "sync"}
         <SyncSection ongo={(s) => (section = s)} />
+      {:else if section === "teams"}
+        <TeamsSection bind:teamId />
       {:else if section === "shares"}
         <h3>Shares</h3>
         {#if sharesError}
@@ -125,20 +152,25 @@
           <p class="faint" data-testid="shares-empty">No active shares.</p>
         {:else}
           <table class="tbl" data-testid="shares-table">
-            <thead><tr><th>Name</th><th>Kind</th><th>Created</th><th>Updated</th><th></th></tr></thead>
+            <thead><tr><th>Name</th><th>Kind</th>{#if app.sync.accountMode}<th>Created by</th>{/if}<th>Created</th><th>Updated</th><th></th></tr></thead>
             <tbody>
               {#each shareGroups as g (g.name)}
-              {#if g.name}<tr class="group"><th colspan="5" data-testid="shares-group">{g.name}</th></tr>{/if}
+              {#if g.name}<tr class="group"><th colspan={app.sync.accountMode ? 6 : 5} data-testid="shares-group">{g.name}</th></tr>{/if}
               {#each g.items as s (s.shareId)}
-                <tr>
+                {@const role = roleOfShare(s)}
+                {@const mine = !s.createdBy || s.createdBy.userId === app.auth.account?.userId}
+                {@const updLock = shareLockReason(role, mine, "update")}
+                {@const revLock = shareLockReason(role, mine, "revoke")}
+                <tr data-testid="share-row">
                   <td>{s.name ?? s.shareId}</td>
                   <td class="faint">{s.kind ?? "—"}</td>
+                  {#if app.sync.accountMode}<td class="faint" data-testid="share-created-by">{s.createdBy ? createdByText(s.createdBy, app.auth.account?.userId ?? null) : s.spaceId === "legacy" ? "—" : "You"}</td>{/if}
                   <td class="faint">{s.createdAt ? dateTime(s.createdAt) : "—"}</td>
                   <td class="faint">{s.updatedAt ? dateTime(s.updatedAt) : "—"}</td>
                   <td class="acts">
                     <button class="link" type="button" onclick={async () => { await copyText(s.url); toasts.success("Link copied"); }}>Copy link</button>
-                    <button class="link" type="button" onclick={() => updateShare(s)}>Update</button>
-                    <button class="link danger" type="button" onclick={() => revokeShare(s)}>Revoke</button>
+                    <button class="link" type="button" aria-disabled={!!updLock} title={updLock ?? undefined} onclick={() => (updLock ? toasts.info(updLock) : updateShare(s))} data-testid="share-update">Update</button>
+                    <button class="link danger" type="button" aria-disabled={!!revLock} title={revLock ?? undefined} onclick={() => (revLock ? toasts.info(revLock) : revokeShare(s))} data-testid="share-revoke">Revoke</button>
                   </td>
                 </tr>
               {/each}

@@ -38,6 +38,9 @@ import type {
   SkippedEntity,
   SyncReport,
   SyncStatus,
+  TeamRole,
+  TransferPreview,
+  CredentialRow,
   Variable,
   VariableInfo,
 } from "../types";
@@ -49,7 +52,9 @@ import { applyDefaultScheme, paramsToUrl, urlToParams, encodeQueryValue } from "
 import { prettyJson, jsonErrorPosition } from "../../util/json";
 import { MockError, fail } from "./errors";
 import { MockAccounts, type MockAccountOptions } from "./account";
-import { MockSpaces, type MockSpaceMode, type MockSpacesOptions } from "./spaces";
+import { MockSpaces, LEGACY, type MockSpaceMode, type MockSpacesOptions } from "./spaces";
+import { MockTeams } from "./teams";
+import { isInsecureUrl } from "../../util/account";
 import { seed, defaultSettings } from "./seed";
 import { importCurl, looksLikeCurl, exportCurl } from "./curl";
 import { convertSpec, reportOf } from "./openapi";
@@ -300,6 +305,10 @@ export interface MockOptions {
   legacy?: boolean;
   /** The sync after a legacy merge fails (`?mockMergeSyncFails=1`). */
   mergeSyncFails?: boolean;
+  /** Teams switches (see ./teams.ts). */
+  teams?: { enabled?: boolean; role?: TeamRole; team?: boolean };
+  /** `?mockMove=offline|quota|slow`: how a project move ends ("slow" shows progress for ~2 s). */
+  move?: "offline" | "quota" | "slow";
 }
 
 export class MockServer {
@@ -335,6 +344,7 @@ export class MockServer {
     spaces: [],
     legacy: null,
     firstSyncPending: false,
+    pendingMoves: [],
   };
   syncToken: string | null = null;
   /** WebSocket sessions (AC-WS-*): the echo / Socket.IO server and what each history entry needs. */
@@ -342,6 +352,11 @@ export class MockServer {
   private wsMeta = new Map<string, { request: Request; projectId: string | null; historyId: string; ts: number; displayUrl: string; method: "WS" | "SIO"; sio: boolean }>();
   accounts: MockAccounts;
   spaces: MockSpaces;
+  teams: MockTeams;
+  /** Requests saved on this device (no "Edited by" for them). */
+  private editedHere = new Set<string>();
+  /** Requests created after this were made on this device. */
+  private bootAt = 0;
   private clock = 0;
   private opts: MockOptions;
 
@@ -395,6 +410,28 @@ export class MockServer {
       },
       opts.spaces,
     );
+    this.teams = new MockTeams(
+      {
+        me: () => {
+          const a = this.accounts.status.account;
+          return a ? { userId: a.userId, name: a.name, email: a.email } : null;
+        },
+        serverUrl: () => this.accounts.status.account?.serverUrl ?? null,
+        now: () => this.now(),
+        spaces: this.spaces,
+        addProject: (name, spaceId) => {
+          const ts = this.now();
+          const p: Project = { id: ulid(ts), workspaceId: this.workspace.id, name, sortOrder: this.projects.length, activeEnvironmentId: null, createdAt: ts, updatedAt: ts };
+          this.projects.push(p);
+          this.spaces.bind(p.id, spaceId);
+          const col: Collection = { id: ulid(this.now()), projectId: p.id, name: "API", description: "", auth: { type: "none" }, sortOrder: 0, createdAt: ts, updatedAt: ts };
+          this.collections.push(col);
+          this.requests.push({ id: ulid(this.now()), collectionId: col.id, folderId: null, name: "List accounts", method: "GET", url: "https://api.globex.dev/v1/accounts", params: [], headers: [], auth: { type: "inherit" }, body: { type: "none" }, settings: { followRedirects: true, timeoutMs: 30000, verifyTls: true }, sortOrder: 0, createdAt: ts, updatedAt: ts });
+        },
+        unsynced: () => Math.min(this.sync.pendingChanges, 3),
+      },
+      { enabled: opts.teams?.enabled ?? true, role: opts.teams?.role, team: opts.teams?.team },
+    );
     this.accounts.status.enabled = opts.accountsEnabled ?? true;
     const now = this.now();
     const s = seed(now, opts.empty);
@@ -405,6 +442,7 @@ export class MockServer {
     this.requests = s.requests;
     this.environments = s.environments;
     this.settings = s.settings;
+    this.bootAt = this.now();
     const first = this.collections.find((c) => c.projectId === this.settings.activeProjectId);
     if (opts.newer && first) this.requests.push(...newerRequests(first.id, now));
     for (const h of s.historySends) {
@@ -424,8 +462,11 @@ export class MockServer {
 
   /** The status the UI sees: the token-sync part plus the per-space part (account mode). */
   syncStatus(): SyncStatus {
-    return this.spaces.apply(this.sync);
+    return { ...this.spaces.apply(this.sync), pendingMoves: clone(this.pendingMoves) };
   }
+
+  /** Moves that didn't finish (`?mockMove=offline|quota`): resume or cancel them. */
+  pendingMoves: import("../types").PendingMove[] = [];
 
   emitStatus(): void {
     this.emit("sync://status", this.syncStatus());
@@ -1048,6 +1089,190 @@ export class MockServer {
     return col;
   }
 
+  /** Only the first failure of a move fails (the user's Retry then succeeds). */
+  private moveRecovered = new Set<string>();
+
+  /** Mirrors teams_rt `parse_link`: an invite token goes to plain http only after "Continue anyway". */
+  private inviteInsecureGate(url: string, confirmed: boolean): void {
+    const { origin } = MockTeams.parse(url);
+    const known = (this.settings as Settings & { knownServers?: { url: string; insecureAck?: boolean }[] }).knownServers;
+    const acked = !!known?.some((k) => k.url === origin && k.insecureAck);
+    if (isInsecureUrl(origin) && !confirmed && !acked) fail("insecure_unconfirmed", "This server doesn't use HTTPS. Your password, tokens and synced data can be read on the network.");
+  }
+
+  private emptyReport(): SyncReport {
+    return { pushed: 0, pulled: 0, deleted: 0, conflicts: [], skipped: [], tooLarge: [], unsupported: [], restored: false, cursor: 0 };
+  }
+
+  /** A whole project copied with new ids, bound to `spaceId` (null: this device only). */
+  private copyProject(projectId: string, name: string, spaceId: string | null, sortOrder: number): string {
+    const src = this.project(projectId);
+    const ts = this.now();
+    const p: Project = { ...clone(src), id: ulid(ts), name, sortOrder, createdAt: ts, updatedAt: ts };
+    this.projects.push(p);
+    const envMap = new Map<string, string>();
+    for (const e of this.environments.filter((x) => x.projectId === src.id)) {
+      const ne = { ...clone(e), id: ulid(this.now()), projectId: p.id, createdAt: ts, updatedAt: ts };
+      envMap.set(e.id, ne.id);
+      this.environments.push(ne);
+    }
+    p.activeEnvironmentId = src.activeEnvironmentId ? (envMap.get(src.activeEnvironmentId) ?? null) : null;
+    for (const c of this.collections.filter((x) => x.projectId === src.id)) {
+      this.copyCollectionTree(c, p.id, this.folders.filter((f) => f.collectionId === c.id), this.requests.filter((r) => r.collectionId === c.id), c.name, c.sortOrder);
+    }
+    this.spaces.bind(p.id, spaceId);
+    return p.id;
+  }
+
+  /** Copy a collection, folder or request into another project (new ids); returns the copy's id. */
+  private copyNode(kind: "collection" | "folder" | "request", id: string, targetProjectId: string, targetCollectionId: string | null, targetFolderId: string | null): string {
+    const sort = Math.max(-1, ...this.collections.filter((x) => x.projectId === targetProjectId).map((x) => x.sortOrder)) + 1;
+    if (kind === "collection") {
+      const c = this.collection(id);
+      return this.copyCollectionTree(c, targetProjectId, this.folders.filter((f) => f.collectionId === c.id), this.requests.filter((r) => r.collectionId === c.id), c.name, sort).id;
+    }
+    const sourceCollection = kind === "folder" ? this.folder(id).collectionId : this.request(id).collectionId;
+    let cid = targetCollectionId;
+    if (cid) {
+      if (this.collection(cid).projectId !== targetProjectId) fail("not_found", `Collection ${cid} not found`);
+    } else {
+      const src = this.collection(sourceCollection);
+      const ts = this.now();
+      const col: Collection = { ...clone(src), id: ulid(ts), projectId: targetProjectId, sortOrder: sort, createdAt: ts, updatedAt: ts };
+      this.collections.push(col);
+      cid = col.id;
+    }
+    const ts = this.now();
+    if (kind === "request") {
+      const r = this.request(id);
+      const nr: Request = { ...clone(r), id: ulid(ts), collectionId: cid, folderId: targetFolderId, sortOrder: this.requests.filter((x) => x.collectionId === cid).length, createdAt: ts, updatedAt: ts };
+      this.requests.push(nr);
+      return nr.id;
+    }
+    const top = this.folder(id);
+    const subtree = [top, ...this.descendantFolders(id)];
+    const idMap = new Map(subtree.map((f) => [f.id, ulid(this.now())] as const));
+    for (const f of subtree) {
+      this.folders.push({ ...clone(f), id: idMap.get(f.id)!, collectionId: cid, parentFolderId: f.id === id ? targetFolderId : (idMap.get(f.parentFolderId ?? "") ?? null), createdAt: ts, updatedAt: ts });
+    }
+    for (const r of this.requestsUnderFolder(id)) {
+      this.requests.push({ ...clone(r), id: ulid(this.now()), collectionId: cid, folderId: idMap.get(r.folderId ?? "") ?? null, createdAt: ts, updatedAt: ts });
+    }
+    return idMap.get(id)!;
+  }
+
+  /** Projects of a space copied to Personal as "X (my changes)" (role-changed banner, edge case 3). */
+  private saveDirtyAsPersonal(spaceId: string): string[] {
+    const personal = this.spaces.personal();
+    const ids = [...this.spaces.projectSpaces].filter(([, s]) => s === spaceId).map(([p]) => p);
+    return ids.map((pid) => this.copyProject(pid, `${this.project(pid).name} (my changes)`, personal?.spaceId ?? null, this.projects.length));
+  }
+
+  /** Mirrors core `plain_credentials`. */
+  private credentialRows(r: Request): CredentialRow[] {
+    const plain = (v: string | null | undefined) => {
+      const rest = (v ?? "").replace(/\{\{[^}]*\}\}/g, "").trim().replace(/^(Bearer|Basic|Token)\b/i, "").trim();
+      return rest.length > 0;
+    };
+    const row = (field: string, tab: CredentialRow["tab"]): CredentialRow => ({ requestId: r.id, requestName: r.name, field, tab });
+    const out: CredentialRow[] = [];
+    for (const h of r.headers) {
+      const k = h.key.trim().toLowerCase();
+      if (["authorization", "proxy-authorization", "cookie"].includes(k) && plain(h.value)) out.push(row(k === "cookie" ? "Cookie header" : k === "proxy-authorization" ? "Proxy-Authorization header" : "Authorization header", "headers"));
+    }
+    const a = r.auth;
+    if (a.type === "basic" && plain(a.password)) out.push(row("Basic auth password", "auth"));
+    if (a.type === "bearer" && plain(a.token)) out.push(row("Bearer token", "auth"));
+    if (a.type === "apikey" && plain(a.apiKey?.value)) out.push(row("API key", "auth"));
+    if (plain(r.ws?.socketIo?.auth)) out.push(row("Socket.IO auth", "ws"));
+    return out;
+  }
+
+  /** Mirrors core `collection_credentials`. */
+  private collectionCredentialRows(c: Collection): CredentialRow[] {
+    const plain = (v: string | null | undefined) => (v ?? "").replace(/\{\{[^}]*\}\}/g, "").trim().replace(/^(Bearer|Basic|Token)\b/i, "").trim().length > 0;
+    const row = (field: string): CredentialRow => ({ requestId: c.id, requestName: c.name, field: `Collection auth: ${field}`, tab: "collection" });
+    const a = c.auth;
+    if (a.type === "basic" && plain(a.password)) return [row("Basic auth password")];
+    if (a.type === "bearer" && plain(a.token)) return [row("Bearer token")];
+    if (a.type === "apikey" && plain(a.apiKey?.value)) return [row("API key")];
+    return [];
+  }
+
+  private filePaths(r: Request): number {
+    return (r.body.binaryPath?.trim() ? 1 : 0) + (r.body.form ?? []).filter((f) => f.kind === "file" && f.value.trim()).length;
+  }
+
+  /** Mirrors core `move_check` + `move_preview`. */
+  private movePreview(projectId: string, spaceId: string | null): TransferPreview {
+    const p = this.project(projectId);
+    if (!this.spaces.accountMode) fail("invalid", "Sign in to move projects between spaces.");
+    const from = this.spaces.projectSpaces.get(projectId) ?? null;
+    if (from === spaceId) fail("invalid", `“${p.name}” is already there.`);
+    if (from === LEGACY) fail("invalid", "This project syncs with a token. Merge it into your personal space first (Settings › Sync).");
+    const src = from ? this.spaces.binding(from) : undefined;
+    if (src?.kind === "team" && !["admin", "owner"].includes(src.role ?? "")) fail("read_only_role", `Only admins can move a project out of ${src.name}. Use Copy to project… instead.`);
+    this.spaces.spaceGuard(spaceId);
+    const target = spaceId ? this.spaces.binding(spaceId) : undefined;
+    const envs = this.environments.filter((e) => e.projectId === projectId);
+    const reqs = this.requestsOfProject(projectId);
+    return {
+      name: p.name,
+      targetName: target ? target.name : "This device only",
+      targetKind: target ? target.kind : "local",
+      memberCount: target?.memberCount ?? null,
+      items: 1 + this.collections.filter((c) => c.projectId === projectId).length + this.foldersOfProject(projectId).length + reqs.length + envs.length,
+      secretVariables: envs.flatMap((e) => e.variables).filter((v) => v.secret).length,
+      filePaths: reqs.reduce((n, r) => n + this.filePaths(r), 0),
+      credentials: [...this.collections.filter((c) => c.projectId === projectId).flatMap((c) => this.collectionCredentialRows(c)), ...reqs.flatMap((r) => this.credentialRows(r))],
+      unresolvedVariables: [],
+      sharesStay: !!spaceId,
+    };
+  }
+
+  /** Mirrors core `copy_preview`. */
+  private copyPreview(kind: "collection" | "folder" | "request", id: string, targetProjectId: string): TransferPreview {
+    const target = this.project(targetProjectId);
+    let name: string;
+    let reqs: Request[];
+    let items: number;
+    if (kind === "collection") {
+      const c = this.collection(id);
+      name = c.name;
+      reqs = this.requests.filter((r) => r.collectionId === id);
+      items = 1 + this.folders.filter((f) => f.collectionId === id).length + reqs.length;
+    } else if (kind === "folder") {
+      name = this.folder(id).name;
+      reqs = this.requestsUnderFolder(id);
+      items = 1 + this.descendantFolders(id).length + reqs.length;
+    } else {
+      const r = this.request(id);
+      name = r.name;
+      reqs = [r];
+      items = 1;
+    }
+    const defined = new Set(this.environments.filter((e) => e.projectId === targetProjectId).flatMap((e) => e.variables.map((v) => v.key.trim())));
+    const used = new Set<string>();
+    for (const r of reqs) {
+      const text = [r.url, ...r.headers.flatMap((h) => [h.key, h.value]), ...r.params.flatMap((h) => [h.key, h.value]), r.body.text ?? "", r.auth.token ?? "", r.auth.password ?? "", r.auth.username ?? ""].join("\n");
+      for (const m of text.matchAll(/\{\{\s*([^{}$\s][^{}]*?)\s*\}\}/g)) if (!defined.has(m[1])) used.add(m[1]);
+    }
+    const space = this.spaces.projectSpaces.get(targetProjectId);
+    const b = space ? this.spaces.binding(space) : undefined;
+    return {
+      name,
+      targetName: target.name,
+      targetKind: this.spaces.kindOf(targetProjectId),
+      memberCount: b?.memberCount ?? null,
+      items,
+      secretVariables: 0,
+      filePaths: reqs.reduce((n, r) => n + this.filePaths(r), 0),
+      credentials: reqs.flatMap((r) => this.credentialRows(r)),
+      unresolvedVariables: [...used].sort(),
+      sharesStay: false,
+    };
+  }
+
   // ───────────── command handlers ─────────────
   handlers: Handlers = {
     bootstrap: (): Bootstrap => {
@@ -1123,6 +1348,7 @@ export class MockServer {
     delete_project: ({ projectId }) => {
       this.project(projectId);
       if (this.projects.length <= 1) fail("invalid", "Cannot delete the last project");
+      this.spaces.deleteGuard(projectId);
       this.refuseReadOnlyContainers(this.collections.filter((c) => c.projectId === projectId), "delete", "a collection");
       this.refuseReadOnlyContainers(this.foldersOfProject(projectId), "delete", "a folder");
       this.refuseReadOnlyIn(this.requestsOfProject(projectId), "delete");
@@ -1281,6 +1507,7 @@ export class MockServer {
     },
 
     create_request: ({ collectionId, folderId, request }) => {
+      if (request) this.editedHere.add(request.id);
       this.collection(collectionId);
       if (folderId) {
         const f = this.folder(folderId);
@@ -1299,6 +1526,7 @@ export class MockServer {
       return clone(r);
     },
     save_request: ({ request }) => {
+      this.editedHere.add(request.id);
       const r = this.request(request.id);
       this.ensureEditable(r);
       this.ensureEditable(request);
@@ -1834,7 +2062,8 @@ export class MockServer {
       this.spaces.later(spaceIds, this.now());
       return clone(this.syncStatus());
     },
-    space_notice_resolve: ({ spaceId, keep }) => {
+    space_notice_resolve: ({ spaceId, keep, saveChanges }) => {
+      if (saveChanges) this.saveDirtyAsPersonal(spaceId);
       this.spaces.resolve(spaceId, keep);
       this.emitStatus();
       this.emit("sync://changed", { pushed: 0, pulled: 0, deleted: 0, conflicts: [], skipped: [], tooLarge: [], unsupported: [], restored: false, cursor: 0 });
@@ -1882,6 +2111,140 @@ export class MockServer {
     auth_sessions: () => this.accounts.listSessions(),
     auth_session_revoke: ({ sessionId }) => this.accounts.revoke(sessionId),
 
+    teams_list: () => this.teams.overview(),
+    team_create: async ({ name }) => {
+      await this.delay(150);
+      const t = this.teams.create(name);
+      this.emitStatus();
+      return t;
+    },
+    team_get: async ({ teamId }) => {
+      await this.delay(80);
+      return this.teams.get(teamId);
+    },
+    team_rename: ({ teamId, name }) => {
+      this.teams.rename(teamId, name);
+      this.emitStatus();
+      return null;
+    },
+    team_delete: async ({ teamId }) => {
+      const t = this.teams.list().find((x) => x.teamId === teamId);
+      this.teams.delete(teamId);
+      if (t?.spaceId) this.spaces.detach(t.spaceId, true);
+      await this.delay(100);
+      this.emitStatus();
+      this.emit("sync://changed", this.emptyReport());
+      return clone(this.syncStatus());
+    },
+    team_set_role: ({ teamId, userId, role }) => {
+      this.teams.setRole(teamId, userId, role);
+      this.emitStatus();
+      return null;
+    },
+    team_remove_member: ({ teamId, userId, revokeInvites }) => this.teams.removeMember(teamId, userId, revokeInvites),
+    team_leave: async ({ teamId, keepCopy }) => {
+      const t = this.teams.leave(teamId);
+      this.spaces.detach(t.spaceId, keepCopy);
+      await this.delay(100);
+      this.emitStatus();
+      this.emit("sync://changed", this.emptyReport());
+      return clone(this.syncStatus());
+    },
+    team_transfer: ({ teamId, userId }) => {
+      this.teams.transfer(teamId, userId);
+      this.emitStatus();
+      return null;
+    },
+    invite_create: async ({ teamId, role, maxUses, expiresInDays }) => {
+      await this.delay(100);
+      return this.teams.createInvite(teamId, role, maxUses, expiresInDays);
+    },
+    invite_list: ({ teamId }) => this.teams.listInvites(teamId),
+    invite_revoke: ({ teamId, inviteId }) => this.teams.revokeInvite(teamId, inviteId),
+    invite_preview: async ({ url, insecureConfirmed }) => {
+      this.inviteInsecureGate(url, !!insecureConfirmed);
+      await this.delay(150);
+      return this.teams.preview(url);
+    },
+    invite_accept: async ({ url }) => {
+      await this.delay(200);
+      const r = this.teams.accept(url);
+      this.spaces.synced(this.now());
+      this.emitStatus();
+      this.emit("sync://changed", this.emptyReport());
+      return r;
+    },
+    invite_ticket: async ({ url, insecureConfirmed }) => {
+      this.inviteInsecureGate(url, !!insecureConfirmed);
+      await this.delay(80);
+      return "tk_mock_ticket";
+    },
+    move_preview: ({ projectId, spaceId }) => this.movePreview(projectId, spaceId),
+    move_project_to_space: async ({ projectId, spaceId }) => {
+      this.movePreview(projectId, spaceId);
+      // A plan of this project to another place is undone first.
+      this.pendingMoves = this.pendingMoves.filter((m) => m.projectId !== projectId || m.to === spaceId);
+      const total = 1 + this.collections.filter((c) => c.projectId === projectId).length + this.foldersOfProject(projectId).length + this.requestsOfProject(projectId).length;
+      const steps = this.opts.move === "slow" ? 8 : 2;
+      for (let i = 1; i <= steps; i++) {
+        await this.delay(this.opts.move === "slow" ? 250 : 60);
+        this.emit("sync://move-progress", { projectId, done: Math.round((total * i) / steps), total });
+        if (i === 1 && (this.opts.move === "offline" || this.opts.move === "quota") && !this.moveRecovered.has(projectId)) {
+          if (!this.pendingMoves.some((m) => m.projectId === projectId)) {
+            this.pendingMoves.push({ moveId: ulid(this.now()), projectId, projectName: this.project(projectId).name, to: spaceId, targetName: this.spaces.binding(spaceId ?? "")?.name ?? "This device only", done: 1, total, copySaved: false });
+          }
+          this.moveRecovered.add(projectId);
+          this.emitStatus();
+          if (this.opts.move === "offline") fail("sync_offline", "You're offline. Nothing was moved.");
+          const name = this.spaces.binding(spaceId ?? "")?.name ?? "The team";
+          fail("sync_quota_exceeded", `${name}'s storage is full (250 MB). Ask an admin to clean up.`);
+        }
+      }
+      const src = this.project(projectId);
+      const copy = this.copyProject(projectId, src.name, spaceId, src.sortOrder);
+      this.pendingMoves = this.pendingMoves.filter((m) => m.projectId !== projectId);
+      if (this.settings.activeProjectId === projectId) this.settings.activeProjectId = copy;
+      this.forgetProject(projectId);
+      this.spaces.synced(this.now());
+      this.emitStatus();
+      return { moveId: ulid(this.now()), projectId: copy, items: total };
+    },
+    move_cancel: ({ projectId }) => {
+      this.pendingMoves = this.pendingMoves.filter((m) => m.projectId !== projectId);
+      this.emitStatus();
+      return null;
+    },
+    copy_preview: ({ kind, id, targetProjectId }) => this.copyPreview(kind, id, targetProjectId),
+    copy_to_project: ({ kind, id, targetProjectId, targetCollectionId, targetFolderId }) => {
+      this.project(targetProjectId);
+      this.spaces.guard(targetProjectId);
+      const copyId = this.copyNode(kind, id, targetProjectId, targetCollectionId ?? null, targetFolderId ?? null);
+      this.markChanged();
+      return { tree: this.tree(targetProjectId), copyId };
+    },
+    project_duplicate_to: ({ projectId, spaceId, name }) => {
+      this.spaces.spaceGuard(spaceId);
+      const src = this.project(projectId);
+      const id = this.copyProject(projectId, name?.trim() || `${src.name} copy`, spaceId, this.projects.length);
+      this.markChanged();
+      return this.tree(id);
+    },
+    request_edited_by: ({ requestId }) => {
+      const r = this.request(requestId);
+      const pid = this.collection(r.collectionId).projectId;
+      if (this.spaces.kindOf(pid) !== "team" || this.editedHere.has(requestId) || r.createdAt > this.bootAt) return null;
+      return { userId: "01JUSERSAM000000000000000", name: "Sam Lee", updatedAt: r.updatedAt };
+    },
+    role_change_resolve: async ({ spaceId, action }) => {
+      if (!this.spaces.binding(spaceId)) fail("not_found", `Space ${spaceId} not found`);
+      const copies = action === "savePersonal" ? this.saveDirtyAsPersonal(spaceId) : [];
+      this.spaces.unfreeze(spaceId);
+      await this.delay(100);
+      this.emitStatus();
+      this.emit("sync://changed", this.emptyReport());
+      return { status: clone(this.syncStatus()), copies };
+    },
+
     share_preview: ({ kind, entityId, includeCredentials, environmentId }) => this.snapshotFor(kind, entityId, includeCredentials, environmentId).preview,
     share_create: async ({ kind, entityId, includeCredentials, environmentId }) => {
       this.requireSync();
@@ -1890,7 +2253,9 @@ export class MockServer {
       await this.delay(120);
       const shareId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"[b % 62]).join("") + "x";
       const ts = this.now();
-      const info: ShareInfo = { shareId, url: `${base.url}/s/${shareId}`, kind, entityId, name: preview.name, createdAt: ts, updatedAt: ts, ...(base.spaceId ? { spaceId: base.spaceId } : {}) };
+      const me = this.accounts.status.account;
+      const team = base.spaceId && base.spaceId !== LEGACY ? { createdBy: me ? { userId: me.userId, name: me.name } : null, options: { includeCredentials, environmentId: environmentId ?? null } } : {};
+      const info: ShareInfo = { shareId, url: `${base.url}/s/${shareId}`, kind, entityId, name: preview.name, createdAt: ts, updatedAt: ts, ...(base.spaceId ? { spaceId: base.spaceId } : {}), ...team };
       this.shares.set(shareId, { info, snapshot, revoked: false });
       return clone(info);
     },
@@ -2027,9 +2392,16 @@ export function getMockServer(): MockServer {
       accountsEnabled: qs.get("mockAccounts") !== "off",
       legacy: qs.get("mockLegacy") === "1",
       mergeSyncFails: qs.get("mockMergeSyncFails") === "1",
+      move: (qs.get("mockMove") ?? undefined) as MockOptions["move"],
+      teams: {
+        enabled: qs.get("mockTeams") !== "off",
+        role: (qs.get("mockRole") ?? undefined) as TeamRole | undefined,
+        team: qs.get("mockTeam") === "1",
+      },
       spaces: {
         mode: (qs.get("mockSpace") ?? undefined) as MockSpaceMode | undefined,
         team: qs.get("mockTeam") === "1",
+        role: (qs.get("mockRole") ?? undefined) as TeamRole | undefined,
         foreign: qs.get("mockForeign") === "1",
       },
       accounts: {
@@ -2038,6 +2410,7 @@ export function getMockServer(): MockServer {
         auth: (qs.get("mockAuth") ?? undefined) as MockAccountOptions["auth"],
         authDelay: qs.get("mockAuthDelay") !== null ? Number(qs.get("mockAuthDelay")) : undefined,
         account: (qs.get("mockAccount") ?? undefined) as MockAccountOptions["account"],
+        teams: qs.get("mockTeams") !== "off",
       },
     });
     if (typeof window !== "undefined") (window as unknown as { __mock?: MockServer }).__mock = singleton;

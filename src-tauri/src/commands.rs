@@ -1241,12 +1241,14 @@ pub async fn auth_sign_in_start(
     server_url: String,
     method: Option<String>,
     insecure_confirmed: Option<bool>,
+    invite_ticket: Option<String>,
 ) -> CmdResult<AuthStatus> {
     auth_rt::sign_in_start(
         &app,
         &server_url,
         method.filter(|m| !m.is_empty()),
         insecure_confirmed.unwrap_or(false),
+        invite_ticket,
     )
     .await
 }
@@ -1341,11 +1343,22 @@ pub async fn first_sync_apply(app: AppHandle, project_ids: Vec<String>) -> CmdRe
 /// SpaceNoticeDialog: Keep (local-only copies) or Remove from this device,
 /// for a space paused for another account or removed (06 §9, 04 §6.7).
 #[tauri::command]
-pub fn space_notice_resolve(app: AppHandle, space_id: String, keep: bool) -> CmdResult<SyncStatus> {
+pub fn space_notice_resolve(
+    app: AppHandle,
+    space_id: String,
+    keep: bool,
+    save_changes: Option<bool>,
+) -> CmdResult<SyncStatus> {
     {
         let state = app.state::<AppState>();
-        state.store().space_notice_resolve(&space_id, keep)?;
+        let mut store = state.store();
+        // Edge case 3: unsynced edits are saved as a personal copy first.
+        if save_changes.unwrap_or(false) {
+            store.save_dirty_as_personal(&space_id)?;
+        }
+        store.space_notice_resolve(&space_id, keep)?;
     }
+    crate::sync_rt::schedule_push(&app);
     let status = crate::sync_rt::refresh_status(&app);
     let _ = tauri::Emitter::emit(&app, crate::sync_rt::EVENT_CHANGED, &SyncReport::default());
     Ok(status)

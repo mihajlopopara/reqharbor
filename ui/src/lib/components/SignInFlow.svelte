@@ -16,11 +16,14 @@
   let {
     presetServer = "",
     ongo,
+    inviteTicket = null,
   }: {
     /** Prefill (e.g. the account's server for "Sign in again"). */
     presetServer?: string;
     /** Navigate to another Settings section (Sync › Advanced). */
     ongo?: (section: "sync") => void;
+    /** Join team while signed out (06 §10 M2): lets the invitee sign up on an invite-only server. */
+    inviteTicket?: string | null;
   } = $props();
 
   // svelte-ignore state_referenced_locally
@@ -104,7 +107,7 @@
     if (!target.trim()) return;
     lastMethod = method;
     try {
-      app.auth = await call("auth_sign_in_start", { serverUrl: target, method, insecureConfirmed: insecureAck });
+      app.auth = await call("auth_sign_in_start", { serverUrl: target, method, insecureConfirmed: insecureAck, inviteTicket });
     } catch (e) {
       // The status event carries the error; keep a local copy in case it was missed.
       const err = toCommandError(e);

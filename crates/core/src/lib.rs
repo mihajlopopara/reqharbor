@@ -20,6 +20,8 @@ pub mod space_sync;
 pub mod spaces;
 pub mod storage;
 pub mod sync;
+pub mod teams;
+pub mod transfer;
 pub mod urlx;
 pub mod vars;
 pub mod ws;

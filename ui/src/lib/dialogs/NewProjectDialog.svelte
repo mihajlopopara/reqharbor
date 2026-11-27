@@ -5,23 +5,25 @@
   import { toasts } from "../stores/toasts.svelte";
 
   /**
-   * New project, signed in (UX §5.2): a name and a location. Personal is the default (D11);
-   * team locations arrive with teams, so bound teams are listed disabled.
+   * New project, signed in (UX §5.2): a name and a location. Personal is the default (D11); teams
+   * where I'm an editor or above are offered, a viewer's team is listed disabled.
    */
   const close = () => (ui.newProject = false);
   const personal = $derived(app.sync.spaces.find((s) => s.kind === "personal" && s.state === "active") ?? null);
-  const teams = $derived(app.sync.spaces.filter((s) => s.kind === "team"));
+  const teams = $derived(app.sync.spaces.filter((s) => s.kind === "team" && s.state === "active"));
+  const writable = (role: string | null) => role === "editor" || role === "admin" || role === "owner";
   let name = $state("New project");
   // svelte-ignore state_referenced_locally
   let location = $state<string>(personal?.spaceId ?? "local");
   let busy = $state(false);
 
-  const hint = $derived(location === "local" ? "Never leaves this device." : "Synced to your devices.");
+  const team = $derived(teams.find((t) => t.spaceId === location) ?? null);
+  const hint = $derived(location === "local" ? "Never leaves this device." : team ? `Everyone in ${team.name} can see it.` : "Synced to your devices.");
 
   async function create() {
     if (!name.trim() || busy) return;
     const target = location;
-    const issue = personal?.issue;
+    const issue = team ? team.issue : personal?.issue;
     busy = true;
     const ok = await app.createProject(name.trim(), target);
     busy = false;
@@ -49,7 +51,7 @@
       <select class="input" bind:value={location} data-testid="new-project-location">
         {#if personal}<option value={personal.spaceId}>Personal</option>{/if}
         {#each teams as t (t.spaceId)}
-          <option value={t.spaceId} disabled>{t.name} (team projects arrive with teams)</option>
+          <option value={t.spaceId} disabled={!app.teamsOn || !writable(t.role)}>{t.name}{writable(t.role) ? "" : " (viewer)"}</option>
         {/each}
         <option value="local">This device only</option>
       </select>

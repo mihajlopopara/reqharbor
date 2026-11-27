@@ -379,3 +379,145 @@ async fn live_personal_sync_round_trip_through_the_engine() {
     space_sync::run(&b, Some(session.clone()), RUN_BUDGET).await;
     assert!(b.with(|st| st.project(&pid).is_err()));
 }
+
+// ───────────────────────────── M2: teams (06 §10 M2 outline) ─────────────────────────────
+
+/// Whether the server advertises `features.teams`; the M2 live cases skip
+/// otherwise (teams are off by default, `REQHARBOR_TEAMS=false`).
+async fn teams_enabled() -> bool {
+    let origin = server_info::normalize_server_url(&server()).unwrap();
+    let d = server_info::discover_origin(&origin).await;
+    let on = d.info.as_ref().is_some_and(|i| i.features.teams);
+    if !on {
+        eprintln!("features.teams is off on {origin}; skipping");
+    }
+    on
+}
+
+/// Create, invite, join, preview, change roles, refuse a viewer push, remove,
+/// and see the removal in `/v1/me/spaces` `departed[]`.
+#[tokio::test]
+#[ignore]
+async fn live_team_invite_join_roles_and_removal() {
+    use reqharbor_core::teams;
+    if !teams_enabled().await {
+        return;
+    }
+    let owner = sign_in().await;
+    let team = teams::create(&owner.session, "Live Acme").await.unwrap();
+    assert_eq!(team.role, "owner");
+    let space = team.space_id.clone().expect("a team has a space");
+    let invite = teams::create_invite(&owner.session, &team.team_id, "editor", Some(1), 7)
+        .await
+        .unwrap();
+    let link = teams::parse_invite_link(&invite.url).unwrap();
+    let preview = teams::preview(&link).await.unwrap();
+    assert_eq!(preview.team_name, "Live Acme");
+    assert_eq!(preview.role, "editor");
+
+    let member = sign_in().await;
+    let joined = teams::accept(&member.session, &link.token).await.unwrap();
+    assert_eq!(joined.team_id, team.team_id);
+    assert!(!joined.already_member);
+    // A single-use link is spent.
+    assert!(matches!(
+        teams::preview(&link).await.unwrap_err(),
+        AuthError::Refused { code, .. } if code == "invite_invalid"
+    ));
+    let me = member.session.spaces().await.unwrap();
+    assert!(me.spaces.iter().any(|s| s.space_id == space && s.role.as_deref() == Some("editor")));
+
+    // A viewer's push is refused as a whole.
+    teams::set_role(&owner.session, &team.team_id, &member.account.user_id, "viewer")
+        .await
+        .unwrap();
+    let token = member.session.access_token().await.unwrap();
+    let push = serde_json::json!({"changes": [{"type": "project", "id": "01JLIVETEAMPROJ00000000000",
+        "updatedAt": reqharbor_core::model::now_ms(), "deleted": false,
+        "data": {"id": "01JLIVETEAMPROJ00000000000", "name": "Nope"}, "deviceId": "live"}]});
+    let resp = Browser::new()
+        .http
+        .post(format!("{}/v1/spaces/{space}/sync", member.client.base_url()))
+        .bearer_auth(&token)
+        // Team spaces require the version header (06 §10 "M2 as built").
+        .header(
+            reqharbor_core::sync::VERSION_HEADER,
+            reqharbor_core::model::CLIENT_VERSION,
+        )
+        .json(&push)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "forbidden_role");
+
+    // The billing owner can't be removed by anyone without a transfer.
+    let detail = teams::detail(&owner.session, &team.team_id, &owner.account.user_id)
+        .await
+        .unwrap();
+    assert_eq!(detail.members.len(), 2);
+    teams::remove_member(&owner.session, &team.team_id, &member.account.user_id, true)
+        .await
+        .unwrap();
+    let after = member.session.spaces().await.unwrap();
+    assert!(!after.spaces.iter().any(|s| s.space_id == space));
+    assert!(
+        after
+            .departed
+            .iter()
+            .any(|d| d.space_id == space && d.reason.as_deref() == Some("removed"))
+    );
+    teams::delete(&owner.session, &team.team_id).await.unwrap();
+}
+
+/// Move a personal project into a team through the engine (new ids), then
+/// see it in the team's pull.
+#[tokio::test]
+#[ignore]
+async fn live_team_move_project_through_the_engine() {
+    use reqharbor_core::space_sync::{self, RUN_BUDGET};
+    use reqharbor_core::spaces::AccountIdent;
+    use reqharbor_core::storage::Store;
+    use reqharbor_core::{teams, transfer};
+    if !teams_enabled().await {
+        return;
+    }
+    let s = sign_in().await;
+    let team = teams::create(&s.session, "Live Move").await.unwrap();
+    let space = team.space_id.clone().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Mutex::new(Store::open(dir.path()).unwrap());
+    let origin = s.client.base_url().to_string();
+    let who = AccountIdent {
+        server_url: origin.clone(),
+        server_instance_id: s.account.server_instance_id.clone(),
+        user_id: s.account.user_id.clone(),
+        email: s.account.email.clone(),
+    };
+    let secrets = MemorySecretStore::new();
+    store
+        .lock()
+        .unwrap()
+        .sign_in_migrate(who, &secrets)
+        .unwrap();
+    let session = Arc::new(s.session);
+    space_sync::run(&store, Some(session.clone()), RUN_BUDGET).await;
+    let pid = {
+        let mut st = store.lock().unwrap();
+        let p = st.create_project("Payments").unwrap().project.id;
+        st.create_collection(&p, "Orders").unwrap();
+        p
+    };
+    space_sync::run(&store, Some(session.clone()), RUN_BUDGET).await;
+    let moved = transfer::move_project(&store, Some(session.clone()), &pid, Some(&space), &|_, _| {})
+        .await
+        .unwrap();
+    assert_ne!(moved.project_id, pid);
+    space_sync::run(&store, Some(session.clone()), RUN_BUDGET).await;
+    let client = reqharbor_core::sync::SyncClient::for_space(&origin, &space, session.clone()).unwrap();
+    let pulled = client.pull_all(0).await.unwrap();
+    assert!(pulled.changes.iter().any(|c| c.id == moved.project_id && !c.deleted));
+    assert!(!pulled.changes.iter().any(|c| c.id == pid));
+    teams::delete(&session, &team.team_id).await.unwrap();
+}

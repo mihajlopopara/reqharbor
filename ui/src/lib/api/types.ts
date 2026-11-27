@@ -403,6 +403,28 @@ export type CommandErrorCode =
   /** 403 `not_a_member` / 404 `space_not_found` on a space call: temporarily unavailable, never a removal. */
   | "space_unavailable"
   | "forbidden_role"
+  // ── teams and invites (04 §5.7, 06-go-server §10 M2) ──
+  /** The server doesn't advertise `features.teams`. */
+  | "teams_disabled"
+  | "last_owner"
+  | "transfer_required"
+  | "limit_teams"
+  | "limit_members"
+  | "limit_invites"
+  /** Expired, revoked, used up or created before a removal: one generic message (AC-INV-5). */
+  | "invite_invalid"
+  /** The pasted text isn't an `/i#…` invite link. */
+  | "invite_not_a_link"
+  /** The invite is for another server than the signed-in one. */
+  | "invite_other_server"
+  | "not_a_member"
+  | "team_not_found"
+  | "member_not_found"
+  | "invite_not_found"
+  /** 400 from a team endpoint: the server's message says what's wrong. */
+  | "validation_failed"
+  | "quota_exceeded"
+  | "clock_skew"
   | "internal";
 
 export type PrepareErrorDetails =
@@ -657,6 +679,23 @@ export interface SyncStatus {
   legacy: LegacyStatus | null;
   /** The first-sync checklist is waiting for an answer (UX §10): open `FirstSyncDialog`. */
   firstSyncPending: boolean;
+  /** Moves that didn't finish (UX §9): offer Finish move / Cancel move. */
+  pendingMoves: PendingMove[];
+}
+
+/** An unfinished project move: nothing changed locally yet; resume or cancel it. */
+export interface PendingMove {
+  moveId: string;
+  projectId: string;
+  projectName: string;
+  /** Target space; null = this device only. */
+  to: string | null;
+  targetName: string;
+  /** Items the target already holds, of `total`. */
+  done: number;
+  total: number;
+  /** The copy is already saved here: offer Finish move only (Cancel and other targets are refused). */
+  copySaved: boolean;
 }
 
 // ───────────────────────────── Spaces (04 §6, 06-go-server §9) ─────────────────────────────
@@ -673,7 +712,12 @@ export type SpaceStateName = "active" | "paused" | "unavailable" | "removed" | "
 
 /** A per-space problem; `message` is the UX §6.7 copy. */
 export interface SpaceIssue {
-  code: "quota" | "serverFull" | "clockSkew" | "clockFixed" | "clientTooOld" | "unavailable" | "legacyDisabled" | "error" | (string & {});
+  /**
+   * `roleChanged`: unsynced changes are frozen after a role downgrade or a `forbidden_role` refusal
+   * (the role-changed banner, UX §6.8). `heldDelete`: a project, collection or folder deleted on the
+   * server is kept here because it holds newer unsynced edits (same banner).
+   */
+  code: "quota" | "serverFull" | "clockSkew" | "clockFixed" | "clientTooOld" | "unavailable" | "legacyDisabled" | "roleChanged" | "heldDelete" | "error" | (string & {});
   message: string;
   at: number;
 }
@@ -697,6 +741,13 @@ export interface SpaceStatus {
   unsupported: number;
   /** The account that bound the space ("These projects were synced by priya@acme.dev"). */
   accountEmail: string;
+  /** Team spaces: the team (for Team settings ›) and how many members can see it. */
+  teamId: string | null;
+  memberCount: number | null;
+  /** Changes waiting for the role-changed banner (UX §6.8): Save as personal copy or Discard. */
+  frozen: number;
+  /** `"type:id"` of containers deleted on the server but kept here for newer unsynced edits. */
+  held: string[];
 }
 
 export interface LegacyStatus {
@@ -825,6 +876,10 @@ export interface ShareInfo {
   updatedAt: number | null;
   /** Account mode: the space the share lives in ("legacy" for token sync). */
   spaceId?: string | null;
+  /** Space shares: who created it; `name` null = "Former member" (AC-TSHARE-2). */
+  createdBy?: UserRef | null;
+  /** Space shares: the options it was uploaded with (AC-TSHARE-3). */
+  options?: { includeCredentials: boolean; environmentId: string | null } | null;
 }
 
 export interface SharePreview {
@@ -970,6 +1025,165 @@ export interface KnownServer {
   keepTyped?: boolean;
 }
 
+// ───────────────────────────── Teams (04 §5.3, 06-go-server §10 M2) ─────────────────────────────
+
+export type TeamRole = "owner" | "admin" | "editor" | "viewer";
+
+/** `teams_list`: my teams, how many I own and the server's limits (`null` = no cap). */
+export interface TeamsOverview {
+  teams: TeamSummary[];
+  ownedCount: number | null;
+  limits: { ownedTeams: number | null; teamMembers: number | null; teamInvites: number | null };
+  /** What I'm billed for: personal space plus the teams I own. */
+  owner: { bytesUsed: number | null; quotaBytes: number | null } | null;
+}
+
+/** A user reference; `name` null = a former member. */
+export interface UserRef {
+  userId: string;
+  name: string | null;
+}
+
+/** `teams_list` row (personal teams are never listed). */
+export interface TeamSummary {
+  teamId: string;
+  name: string;
+  /** My role. */
+  role: TeamRole | (string & {});
+  spaceId: string | null;
+  memberCount: number | null;
+  bytesUsed: number | null;
+  quotaBytes: number | null;
+  /** The billing owner: can't be demoted or removed before a transfer (DEV-8). */
+  ownerUserId: string | null;
+  createdAt: number | null;
+}
+
+export interface TeamMember {
+  userId: string;
+  name: string;
+  email: string;
+  role: TeamRole | (string & {});
+  joinedAt: number | null;
+}
+
+/** An active invite link (the token is shown only once, at creation). */
+export interface InviteInfo {
+  inviteId: string;
+  role: TeamRole | (string & {});
+  /** null = unlimited. */
+  maxUses: number | null;
+  uses: number;
+  expiresAt: number | null;
+  createdAt: number | null;
+  createdBy: UserRef | null;
+}
+
+export interface CreatedInvite {
+  invite: InviteInfo;
+  /** `https://<server>/i#<token>`: copy it now, it can't be shown again. */
+  url: string;
+}
+
+/** `team_get`: invites are listed for admins and owners only (null otherwise). */
+export interface TeamDetail {
+  team: TeamSummary;
+  members: TeamMember[];
+  invites: InviteInfo[] | null;
+  /** My user id. */
+  me: string;
+}
+
+export interface InvitePreview {
+  teamId: string | null;
+  teamName: string;
+  inviterName: string | null;
+  role: TeamRole | (string & {});
+  expiresAt: number | null;
+}
+
+/** `invite_preview`: which server the link belongs to, and its team. */
+export interface InviteCheck {
+  serverUrl: string;
+  /** Signed in to another server: offer "Sign in to <host>". */
+  otherServer: boolean;
+  preview: InvitePreview;
+}
+
+export interface JoinResult {
+  teamId: string;
+  teamName: string;
+  role: TeamRole | (string & {});
+  spaceId: string | null;
+  /** Already a member: "Your role hasn't changed." */
+  alreadyMember: boolean;
+  /** Team projects on this device after the first sync ("syncing 2 projects"). */
+  projects: number;
+}
+
+/** One credential typed as plain text (the Move / Copy pre-flight, UX §9). */
+export interface CredentialRow {
+  requestId: string;
+  requestName: string;
+  /** "Authorization header", "Basic auth password", "Bearer token", "API key", "Cookie header", … */
+  field: string;
+  /** Where to fix it. */
+  /** "collection": the collection's auth (requestId/requestName are the collection's). "request": fields from a newer ReqHarbor. */
+  tab: "headers" | "auth" | "ws" | "collection" | "request";
+}
+
+/** The Move / Copy pre-flight (UX §9). */
+export interface TransferPreview {
+  name: string;
+  targetName: string;
+  targetKind: "personal" | "team" | "legacy" | "local";
+  memberCount: number | null;
+  items: number;
+  /** Secret variables: never uploaded, each member sets their own value. */
+  secretVariables: number;
+  /** Binary bodies and form files whose paths stay on this device. */
+  filePaths: number;
+  credentials: CredentialRow[];
+  /** Copy mode: variables the target project's environments don't define. */
+  unresolvedVariables: string[];
+  /** "Existing share links stay with your personal space and keep working." */
+  sharesStay: boolean;
+}
+
+export interface MoveResult {
+  moveId: string;
+  /** The moved copy's (new) project id. */
+  projectId: string;
+  items: number;
+}
+
+/** Payload of `sync://move-progress`: "Moving… 42 of 120 items". */
+export interface MoveProgress {
+  projectId: string;
+  done: number;
+  total: number;
+}
+
+export interface CopyResult {
+  /** The target project's tree. */
+  tree: ProjectTree;
+  copyId: string;
+}
+
+/** "Edited by Sam · 3h" (UX §6.5). */
+export interface EditedBy {
+  userId: string;
+  /** "Former member" when the account no longer exists. */
+  name: string;
+  updatedAt: number;
+}
+
+export interface RoleChangeResult {
+  status: SyncStatus;
+  /** Personal copies made by "savePersonal". */
+  copies: string[];
+}
+
 // ───────────────────────────── WebSocket (AC-WS-*) ─────────────────────────────
 
 /**
@@ -1048,6 +1262,8 @@ export interface Events {
   "sync://changed": SyncReport;
   /** Sign-in progress, sign-out, session ended (AC-AUTH-9). */
   "auth://status": AuthStatus;
+  /** A project move pushing its copy (UX §9 progress). */
+  "sync://move-progress": MoveProgress;
 }
 
 // ───────────────────────────── Command map ─────────────────────────────
@@ -1179,8 +1395,9 @@ export interface Commands {
   server_discover: { args: { serverUrl: string }; result: ServerDiscovery };
   auth_status: { args: {}; result: AuthStatus };
   /** Resolves once the browser is open (signIn.state "waiting"); the rest arrives on `auth://status`. */
+  /** `inviteTicket` (from invite_ticket) lets an invitee without an account sign up on an invite-only server. */
   auth_sign_in_start: {
-    args: { serverUrl: string; method?: string | null; insecureConfirmed?: boolean | null };
+    args: { serverUrl: string; method?: string | null; insecureConfirmed?: boolean | null; inviteTicket?: string | null };
     result: AuthStatus;
   };
   auth_sign_in_reopen: { args: {}; result: null };
@@ -1193,19 +1410,72 @@ export interface Commands {
 
   /** Where every project syncs (account mode; pure-legacy: "legacy" when token sync is on, else "local"). */
   project_locations: { args: {}; result: ProjectLocation[] };
-  /** Sync location… (B1): a space id, or null for this device only. Team moves arrive with teams. */
+  /** Sync location… (B1): a space id, or null for this device only. Team moves: move_project_to_space. */
   project_set_location: { args: { projectId: string; spaceId: string | null }; result: ProjectLocation[] };
   first_sync_candidates: { args: {}; result: FirstSyncCandidate[] };
   /** The checked projects sync to Personal; the rest stay on this device (also "Keep all": `[]`). */
   first_sync_apply: { args: { projectIds: string[] }; result: SyncStatus };
-  /** SpaceNoticeDialog: keep its projects as local-only copies, or remove them from this device. */
-  space_notice_resolve: { args: { spaceId: string; keep: boolean }; result: SyncStatus };
+  /**
+   * SpaceNoticeDialog: keep its projects as local-only copies, or remove them from this device.
+   * `saveChanges`: first copy projects with unsynced edits to Personal ("X (my changes)", edge case 3).
+   */
+  space_notice_resolve: { args: { spaceId: string; keep: boolean; saveChanges?: boolean | null }; result: SyncStatus };
   /** × on the space notice ("decide later", UX §6.9): Keep applies by itself after 7 days. */
   space_notice_later: { args: { spaceIds: string[] }; result: SyncStatus };
   /** Merge the token-synced workspace into Personal (same ids), then sync. Safe to repeat. */
   legacy_merge: { args: {}; result: LegacyMergeResult };
   /** Forget the legacy token; its share links keep working on the server. */
   legacy_disconnect: { args: {}; result: SyncStatus };
+
+  // ── teams (only when the server advertises features.teams; else "teams_disabled") ──
+  teams_list: { args: {}; result: TeamsOverview };
+  /** 1–80 characters; 409 "limit_teams". Syncs so the team's space binds. */
+  team_create: { args: { name: string }; result: TeamSummary };
+  team_get: { args: { teamId: string }; result: TeamDetail };
+  /** Admin. */
+  team_rename: { args: { teamId: string; name: string }; result: null };
+  /** Billing owner. This device keeps local copies of the team's projects (D5). */
+  team_delete: { args: { teamId: string }; result: SyncStatus };
+  /** Rejects with "forbidden_role", "last_owner" or "transfer_required". */
+  team_set_role: { args: { teamId: string; userId: string; role: TeamRole }; result: null };
+  team_remove_member: { args: { teamId: string; userId: string; revokeInvites: boolean }; result: null };
+  /** `keepCopy`: its projects stay here as "X (from Acme)"; else they're removed from this device. */
+  team_leave: { args: { teamId: string; keepCopy: boolean }; result: SyncStatus };
+  /** Billing owner; 413 "quota_exceeded" when the receiver has no room, 409 "limit_teams". */
+  team_transfer: { args: { teamId: string; userId: string }; result: null };
+  /** `maxUses` null = unlimited; admin links only by an owner and single-use; `expiresInDays` 1, 7 or 30. */
+  invite_create: { args: { teamId: string; role: TeamRole; maxUses: number | null; expiresInDays: number }; result: CreatedInvite };
+  invite_list: { args: { teamId: string }; result: InviteInfo[] };
+  invite_revoke: { args: { teamId: string; inviteId: string }; result: null };
+  /**
+   * No sign-in needed. Rejects with "invite_not_a_link", "invite_invalid", or "insecure_unconfirmed"
+   * for a plain-http server until `insecureConfirmed` (or a remembered "Continue anyway").
+   */
+  invite_preview: { args: { url: string; insecureConfirmed?: boolean | null }; result: InviteCheck };
+  /** Joins, then syncs so the team's projects arrive. */
+  invite_accept: { args: { url: string }; result: JoinResult };
+  /** A 10-minute signup ticket for `auth_sign_in_start` (signed-out invitees). */
+  invite_ticket: { args: { url: string; insecureConfirmed?: boolean | null }; result: string };
+
+  // ── moves and copies (new ids, 04 §6.5) ──
+  /** `spaceId` null = this device only. */
+  move_preview: { args: { projectId: string; spaceId: string | null }; result: TransferPreview };
+  /** Online and resumable: on failure nothing moved; calling it again resumes with the same ids. */
+  move_project_to_space: { args: { projectId: string; spaceId: string | null }; result: MoveResult };
+  /** Undo what an interrupted move already pushed, and forget it (finishes it instead when its copy is already saved). */
+  move_cancel: { args: { projectId: string }; result: null };
+  copy_preview: { args: { kind: NodeKind; id: string; targetProjectId: string }; result: TransferPreview };
+  /** Without `targetCollectionId` a request or folder lands in a new collection named after its own. */
+  copy_to_project: {
+    args: { kind: NodeKind; id: string; targetProjectId: string; targetCollectionId?: string | null; targetFolderId?: string | null };
+    result: CopyResult;
+  };
+  /** Duplicate to personal… for a whole project (`spaceId` null = this device only). */
+  project_duplicate_to: { args: { projectId: string; spaceId: string | null; name?: string | null }; result: ProjectTree };
+  /** Who last changed a team project's request; null in personal/local projects or when it was me. */
+  request_edited_by: { args: { requestId: string }; result: EditedBy | null };
+  /** The role-changed banner (UX §6.8). */
+  role_change_resolve: { args: { spaceId: string; action: "savePersonal" | "discard" }; result: RoleChangeResult };
 }
 
 export type CommandName = keyof Commands;

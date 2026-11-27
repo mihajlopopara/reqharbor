@@ -178,6 +178,9 @@ pub struct SpaceBinding {
     /// §6.9): after [`DECIDE_LATER_MS`] Keep is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decide_later_at: Option<i64>,
+    /// Team spaces: how many members can see it (`/v1/me/spaces`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u64>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -351,9 +354,24 @@ pub struct SpaceSync {
     pub state: SyncState,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attribution: BTreeMap<String, Attribution>,
-    /// Keys frozen after a role downgrade (M2).
+    /// `"type:id"` keys whose local version (or tombstone) waits for the
+    /// role-changed banner (04 §6.8, 06 §10 M2): unsynced edits when the role
+    /// dropped to viewer, changes the server refused with `forbidden_role`,
+    /// and dirty descendants of a project deleted on the server. They are
+    /// never pushed, and pulled versions of them are skipped, until the user
+    /// picks Save as personal copy or Discard.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frozen: Vec<String>,
+    /// `"type:id"` of projects, collections and folders whose pulled
+    /// tombstone is held because they still have unsynced descendants that
+    /// are newer than the delete (06 §10 M2). Nothing under them is pushed
+    /// (no orphans on the server) until the banner is resolved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<String>,
+    /// `"type:id"` of this space's pulled tombstones held back by B7 this
+    /// run: nothing at or under them is pushed until they apply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_deletes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<SpaceIssue>,
     /// Pulled entities ignored because they belong elsewhere (B2/B3).
@@ -661,6 +679,58 @@ impl Store {
             .map_err(|e| StoreError::Io(e.to_string()))?;
         atomic_write(&self.dir().join(SPACES_FILE), &bytes)?;
         atomic_write(&self.dir().join(SPACES_BACKUP), &bytes)
+    }
+
+    /// This account's role in the space `scope` syncs with (`None` for
+    /// legacy, personal without a role, or an unknown space).
+    pub fn scope_role(&self, scope: &Scope) -> Option<Role> {
+        match scope {
+            Scope::Legacy => None,
+            Scope::Space(id) => self.binding(id).and_then(|b| b.role),
+        }
+    }
+
+    /// The space only lets this account read (04 §6.8).
+    pub fn read_only_scope(&self, scope: &Scope) -> bool {
+        self.account_mode() && self.scope_role(scope).is_some_and(|r| !r.can_write())
+    }
+
+    /// Deleting a team project needs admin (AC-ROLE-2): editors may delete
+    /// its content but not the project container.
+    pub fn delete_guard(&self, project_id: &str) -> Result<()> {
+        self.write_guard(project_id)?;
+        let Some(Scope::Space(id)) = self.scope_of_project(project_id) else {
+            return Ok(());
+        };
+        match self.binding(&id) {
+            Some(b)
+                if matches!(b.kind, SpaceKind::Team | SpaceKind::Unknown)
+                    && !matches!(b.role, Some(Role::Admin | Role::Owner)) =>
+            {
+                Err(StoreError::ReadOnlyRole(
+                    "Only admins can delete team projects.".into(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A project may be created in (or copied into) `space` (`None`: this
+    /// device only): the space must be bound and writable for this account.
+    pub fn space_write_guard(&self, space: Option<&str>) -> Result<()> {
+        let Some(sp) = space.filter(|s| *s != LEGACY_SPACE) else {
+            return Ok(());
+        };
+        if !self.account_mode() {
+            return Ok(());
+        }
+        match self.binding(sp) {
+            None => Err(StoreError::NotFound(format!("Space {sp}"))),
+            Some(b) if b.role.is_some_and(|r| !r.can_write()) => Err(StoreError::ReadOnlyRole(
+                format!("Viewers can't add projects to {}.", b.name()),
+            )),
+            Some(_) => Ok(()),
+        }
     }
 
     /// The viewer guard (04 §6.8): every project-tree mutator calls it.
@@ -1015,7 +1085,7 @@ impl Store {
             let from_kind = self.binding(from).map(|b| b.kind);
             if matches!(from_kind, Some(SpaceKind::Team | SpaceKind::Unknown)) {
                 return Err(StoreError::Invalid(
-                    "Moving a project out of a team arrives with teams. Use Copy to project… instead."
+                    "A project leaves a team with Move… (new ids), or use Copy to project…"
                         .into(),
                 ));
             }
@@ -1034,7 +1104,7 @@ impl Store {
                 Some(b) if b.kind == SpaceKind::Personal => {}
                 Some(_) => {
                     return Err(StoreError::Invalid(
-                        "Moving a project to a team arrives with teams.".into(),
+                        "Use Move to team… to move a project into a team (new ids).".into(),
                     ));
                 }
                 None => return Err(StoreError::NotFound(format!("Space {to}"))),
@@ -1222,6 +1292,14 @@ impl Store {
     /// renamed "X (from Team)"); remove drops them from this device. No
     /// tombstone is sent either way. Returns the affected project ids.
     pub fn space_notice_resolve(&mut self, space_id: &str, keep: bool) -> Result<Vec<String>> {
+        self.detach_space(space_id, keep)
+    }
+
+    /// Stop syncing a space on this device (04 §6.7): `keep` turns its
+    /// projects into local-only copies named "X (from Team)"; otherwise they
+    /// are forgotten here. The binding and its bookkeeping go; nothing is
+    /// sent to the server. Returns the affected project ids.
+    pub fn detach_space(&mut self, space_id: &str, keep: bool) -> Result<Vec<String>> {
         let binding = self
             .binding(space_id)
             .cloned()
@@ -1317,6 +1395,19 @@ impl Store {
             return false;
         }
         let mut changed = false;
+        // A role that drops below editor freezes the space's unsynced
+        // changes (04 §6.8): they are gathered before the role changes.
+        for s in &list.spaces {
+            let new = s.role.as_deref().map(Role::parse);
+            let Some(b) = self.binding(&s.space_id).filter(|b| b.belongs_to(&who)) else {
+                continue;
+            };
+            if b.role.is_some_and(|r| r.can_write()) && new.is_some_and(|r| !r.can_write()) {
+                let name = b.name();
+                let new = new.unwrap_or(Role::Viewer);
+                self.freeze_dirty(&Scope::Space(s.space_id.clone()), &name, new);
+            }
+        }
         let listed: BTreeSet<&str> = list.spaces.iter().map(|s| s.space_id.as_str()).collect();
         for s in &list.spaces {
             let kind = match s.kind.as_str() {
@@ -1332,6 +1423,7 @@ impl Store {
                     b.team_name = s.team_name.clone().or(b.team_name.take());
                     b.bytes_used = s.bytes_used;
                     b.quota_bytes = s.quota_bytes;
+                    b.member_count = s.member_count.or(b.member_count);
                     if matches!(
                         b.state,
                         BindingState::Unavailable { .. } | BindingState::Removed { .. }
@@ -1362,6 +1454,7 @@ impl Store {
                         bytes_used: s.bytes_used,
                         quota_bytes: s.quota_bytes,
                         decide_later_at: None,
+                        member_count: s.member_count,
                         extra: Extra::new(),
                     });
                     changed = true;
@@ -1543,6 +1636,110 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Freeze the unsynced changes of `scope` after the role dropped to
+    /// `role` (04 §6.8) or the server refused a push with `forbidden_role`,
+    /// and set the role-changed issue. Returns how many keys are frozen.
+    pub fn freeze_dirty(&mut self, scope: &Scope, name: &str, role: Role) -> usize {
+        let keys = crate::sync::dirty_keys_in(self, scope);
+        let ss = self.space_sync_mut(scope);
+        for k in keys {
+            if !ss.frozen.contains(&k) {
+                ss.frozen.push(k);
+            }
+        }
+        let n = ss.frozen.len();
+        let role = match role {
+            Role::Viewer => "Viewer",
+            Role::Editor => "Editor",
+            Role::Admin => "Admin",
+            Role::Owner => "Owner",
+            Role::Unknown => "a read-only role",
+        };
+        ss.issue = Some(SpaceIssue::new(
+            "roleChanged",
+            role_changed_message(name, role, n),
+        ));
+        n
+    }
+}
+
+impl Store {
+    /// The server refused a whole push with `forbidden_role` (04 §6.2): the
+    /// role is read-only now. Freeze the unsynced changes for the banner.
+    pub fn role_refused(&mut self, scope: &Scope) {
+        let Scope::Space(id) = scope else { return };
+        let Some(b) = self.binding_mut(id) else { return };
+        if b.role.is_some_and(|r| r.can_write()) || b.role.is_none() {
+            b.role = Some(Role::Viewer);
+        }
+        let name = b.name();
+        let role = b.role.unwrap_or(Role::Viewer);
+        // The role is already read-only here, so gather unsynced changes
+        // directly (collect_push_in sends nothing for a viewer).
+        self.freeze_dirty(scope, &name, role);
+        let _ = self.save_bindings();
+        let _ = self.save_spaces_state();
+    }
+}
+
+/// "Edited by Sam · 3h" (UX §6.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditedBy {
+    pub user_id: String,
+    /// "Former member" when the account no longer exists.
+    pub name: String,
+    pub updated_at: i64,
+}
+
+impl Store {
+    /// Who last changed a request of a team project (UX §6.5): `None` in
+    /// personal, legacy and local projects, and when the last edit was mine.
+    pub fn edited_by(&self, request_id: &str) -> Option<EditedBy> {
+        let r = self.request(request_id)?;
+        let pid = self
+            .project_of(crate::storage::NodeKind::Request, request_id)
+            .ok()?;
+        let Some(Scope::Space(id)) = self.scope_of_project(&pid) else {
+            return None;
+        };
+        let b = self.binding(&id)?;
+        if !matches!(b.kind, SpaceKind::Team | SpaceKind::Unknown) {
+            return None;
+        }
+        let key = sync_key(EntityType::Request, request_id);
+        let scope = Scope::Space(id.clone());
+        // Only the version the attribution describes: a newer local edit is mine.
+        if self.space_state(&scope).synced.get(&key) != Some(&r.updated_at) {
+            return None;
+        }
+        let a = self.space_sync(&scope).attribution.get(&key)?;
+        if a.user_id.is_empty() || Some(a.user_id.as_str()) == self.account.as_ref().map(|w| w.user_id.as_str()) {
+            return None;
+        }
+        Some(EditedBy {
+            user_id: a.user_id.clone(),
+            name: if a.name.trim().is_empty() {
+                "Former member".into()
+            } else {
+                a.name.clone()
+            },
+            updated_at: r.updated_at,
+        })
+    }
+}
+
+/// "Your role in Acme changed to Viewer. You have 3 unsynced changes." (UX §6.8)
+pub fn role_changed_message(team: &str, role: &str, frozen: usize) -> String {
+    let base = format!("Your role in {team} changed to {role}.");
+    match frozen {
+        0 => base,
+        1 => format!("{base} You have 1 unsynced change."),
+        n => format!("{base} You have {n} unsynced changes."),
+    }
+}
+
 /// A binding that waits for a SpaceNoticeDialog answer.
 fn needs_notice(b: &SpaceBinding) -> bool {
     matches!(b.state, BindingState::Removed { .. }) || b.paused_foreign()
@@ -1661,6 +1858,7 @@ mod tests {
             bytes_used: None,
             quota_bytes: None,
             decide_later_at: None,
+            member_count: None,
             extra: Extra::new(),
         };
         assert!(b.belongs_to(&who));

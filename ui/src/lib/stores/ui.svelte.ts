@@ -1,5 +1,5 @@
 /** Transient UI state: sidebar tab, menus, dialogs. */
-import type { ShareKind } from "../api/types";
+import type { NodeKind, ShareKind } from "../api/types";
 
 export type SidebarTab = "activity" | "collections" | "env";
 
@@ -44,7 +44,23 @@ export interface ConfirmState {
   body: string;
   confirmLabel: string;
   danger: boolean;
-  resolve: (ok: boolean) => void;
+  /** Type-to-confirm (UX §4.4 pattern): the confirm button stays disabled until this is typed. */
+  typeToConfirm?: string;
+  /** Bullet lines under the body ("2 projects and everything in them"). */
+  details?: string[];
+  /** One checkbox ("Also revoke all active invite links (3)"); its value is returned. */
+  checkbox?: { label: string; checked: boolean; testid?: string };
+  resolve: (r: { ok: boolean; checked?: boolean }) => void;
+}
+
+export interface ConfirmOptions {
+  title: string;
+  body: string;
+  confirmLabel?: string;
+  danger?: boolean;
+  typeToConfirm?: string;
+  details?: string[];
+  checkbox?: { label: string; checked: boolean; testid?: string };
 }
 
 export type PickerMode =
@@ -53,7 +69,7 @@ export type PickerMode =
   | { kind: "moveRequest"; requestId: string }
   | { kind: "moveFolder"; folderId: string };
 
-export type SettingsSection = "account" | "general" | "sync" | "shares" | "shortcuts" | "about";
+export type SettingsSection = "account" | "general" | "sync" | "teams" | "shares" | "shortcuts" | "about";
 
 export type ImportTab = "curl" | "openapi" | "link";
 
@@ -64,7 +80,7 @@ class UiStore {
   confirmState = $state<ConfirmState | null>(null);
   importDialog = $state<{ tab: ImportTab; text?: string; path?: string } | null>(null);
   shareDialog = $state<{ kind: ShareKind; entityId: string; name: string } | null>(null);
-  settingsDialog = $state<{ section: SettingsSection } | null>(null);
+  settingsDialog = $state<{ section: SettingsSection; teamId?: string } | null>(null);
   picker = $state<PickerMode | null>(null);
   envPicker = $state(false);
   exportCurl = $state<{ anchor: HTMLElement | null } | null>(null);
@@ -74,6 +90,13 @@ class UiStore {
   firstSync = $state(false);
   mergeLegacy = $state(false);
   spaceNotice = $state<{ mode: "foreign" | "removed"; spaceIds: string[] } | null>(null);
+  /** Teams (UX §7–§9). */
+  joinTeam = $state<{ url?: string } | null>(null);
+  createTeam = $state(false);
+  invite = $state<{ teamId: string; teamName: string; role: string } | null>(null);
+  transferOwnership = $state<{ teamId: string } | null>(null);
+  moveToTeam = $state<{ projectId: string; spaceId?: string | null } | null>(null);
+  copyToProject = $state<{ kind: NodeKind; id: string; name: string; mode: "copy" | "duplicate"; targetProjectId?: string } | null>(null);
   /** Open Settings › Sync with Advanced expanded (token sync). */
   syncAdvanced = $state(false);
   /** Tree node or env being renamed inline. */
@@ -101,7 +124,13 @@ class UiStore {
       this.syncLocation ||
       this.firstSync ||
       this.mergeLegacy ||
-      this.spaceNotice
+      this.spaceNotice ||
+      this.joinTeam ||
+      this.createTeam ||
+      this.invite ||
+      this.transferOwnership ||
+      this.moveToTeam ||
+      this.copyToProject
     );
   }
 
@@ -132,12 +161,20 @@ class UiStore {
   }
 
   confirm(opts: { title: string; body: string; confirmLabel?: string; danger?: boolean }): Promise<boolean> {
+    return this.confirmEx(opts).then((r) => r.ok);
+  }
+
+  /** `confirm` with type-to-confirm, detail lines and a checkbox (UX §7.2, §7.3). */
+  confirmEx(opts: ConfirmOptions): Promise<{ ok: boolean; checked?: boolean }> {
     return new Promise((resolve) => {
       this.confirmState = {
         title: opts.title,
         body: opts.body,
         confirmLabel: opts.confirmLabel ?? "Delete",
         danger: opts.danger ?? true,
+        typeToConfirm: opts.typeToConfirm,
+        details: opts.details,
+        checkbox: opts.checkbox ? { ...opts.checkbox } : undefined,
         resolve,
       };
     });

@@ -746,7 +746,7 @@ impl Store {
     /// by the caller **before** the entity is removed, 04 §6.1). Only
     /// entities that space knows about need a tombstone; a local-only
     /// project records none.
-    fn tombstone(
+    pub(crate) fn tombstone(
         &mut self,
         scope: Option<&crate::spaces::Scope>,
         entity_type: EntityType,
@@ -779,13 +779,7 @@ impl Store {
 
     /// Create a project bound to `space` (`None`: this device only).
     pub fn create_project_at(&mut self, name: &str, space: Option<String>) -> Result<ProjectTree> {
-        if let Some(sp) = &space
-            && sp != crate::spaces::LEGACY_SPACE
-            && self.account_mode()
-            && self.binding(sp).is_none()
-        {
-            return Err(StoreError::NotFound(format!("Space {sp}")));
-        }
+        self.space_write_guard(space.as_deref())?;
         let name = non_empty(name)?;
         let now = now_ms();
         let sort_order = self
@@ -849,8 +843,21 @@ impl Store {
         }
         ensure_entity_editable(t.project.is_editable(), &t.project.name, "This project")?;
         t.project.active_environment_id = env_id.map(str::to_string);
-        t.project.updated_at = touch(t.project.updated_at);
         let p = t.project.clone();
+        // A viewer may pick an environment, but only for this device: the
+        // project isn't marked changed, so nothing is frozen or pushed and a
+        // pulled version takes over again (04 §6.8).
+        let read_only = self
+            .scope_of_project(project_id)
+            .is_some_and(|sc| self.read_only_scope(&sc));
+        let t = self.project_mut(project_id)?;
+        if !read_only {
+            t.project.updated_at = touch(t.project.updated_at);
+        }
+        let p = Project {
+            updated_at: t.project.updated_at,
+            ..p
+        };
         self.save_project(project_id)?;
         Ok(p)
     }
@@ -946,7 +953,7 @@ impl Store {
             ));
         }
         first_read_only(self.project(id)?, |_| true, |_| true, |_| true, "delete")?;
-        self.write_guard(id)?;
+        self.delete_guard(id)?;
         if let Some(e) = self
             .environments
             .iter()
@@ -957,6 +964,13 @@ impl Store {
                 "delete",
             ));
         }
+        self.remove_project_tombstoned(id).map(|_| ())
+    }
+
+    /// Remove a project, its tree and its environments, recording
+    /// tombstones in the space it syncs with (no permission checks: callers
+    /// check first). Returns the removed tree.
+    pub(crate) fn remove_project_tombstoned(&mut self, id: &str) -> Result<ProjectTree> {
         let scope = self.scope_of_project(id);
         let sc = scope.as_ref();
         let tree = self
@@ -982,6 +996,28 @@ impl Store {
         for eid in &env_ids {
             self.tombstone(sc, EntityType::Environment, eid);
         }
+        // Remember which project each child went with: if the server refuses
+        // the project's own tombstone (04 §6.8), the children's wait too.
+        if let Some(scope) = sc {
+            let children: BTreeSet<&str> = tree
+                .collections
+                .iter()
+                .map(|c| c.id.as_str())
+                .chain(tree.folders.iter().map(|f| f.id.as_str()))
+                .chain(tree.requests.iter().map(|r| r.id.as_str()))
+                .chain(env_ids.iter().map(String::as_str))
+                .collect();
+            let pid = serde_json::Value::String(id.to_string());
+            for t in self
+                .space_state_mut(scope)
+                .tombstones
+                .iter_mut()
+                .filter(|t| t.entity_type != EntityType::Project && children.contains(t.id.as_str()))
+            {
+                t.extra
+                    .insert(crate::sync::TOMBSTONE_PROJECT.to_string(), pid.clone());
+            }
+        }
         self.environments
             .retain(|e| e.project_id.as_deref() != Some(id));
         let _ = std::fs::remove_file(self.project_path(id));
@@ -989,7 +1025,8 @@ impl Store {
         if self.bindings.project_spaces.remove(id).is_some() {
             self.save_bindings()?;
         }
-        self.persist_tombstones()
+        self.persist_tombstones()?;
+        Ok(tree)
     }
 
     /// Move a project to `index` in the project list.
@@ -1974,6 +2011,18 @@ impl ReadOnlyEntities {
         }
         Ok(())
     }
+}
+
+/// `ReadOnlyNewer` when anything in `t` (the project too) came from a newer
+/// ReqHarbor: it can't be copied or moved by this build.
+pub fn ensure_tree_editable(t: &ProjectTree, verb: &str) -> Result<()> {
+    if !t.project.is_editable() {
+        return Err(read_only_newer_named(
+            &quoted(&t.project.name, "a project"),
+            verb,
+        ));
+    }
+    first_read_only(t, |_| true, |_| true, |_| true, verb)
 }
 
 /// The first read-only entity among the given folders and requests of a

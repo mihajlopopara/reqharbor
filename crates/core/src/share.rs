@@ -170,6 +170,17 @@ fn strip_request_extra(r: &mut Request, replace: bool) -> usize {
     n
 }
 
+/// Credential fields of an auth block (the share scanner's count, 04 §8).
+pub fn auth_credential_fields(a: &Auth) -> usize {
+    sanitize_auth(&mut a.clone(), false)
+}
+
+/// Blocks of fields from a newer ReqHarbor in a request: each may hold a
+/// credential (the share scanner's count, 04 §8).
+pub fn unknown_field_blocks(r: &Request) -> usize {
+    strip_request_extra(&mut r.clone(), false)
+}
+
 /// `ReadOnlyNewer` for a share without credentials that holds an entity
 /// from a newer ReqHarbor: its fields can't be sorted into secret and not.
 fn share_needs_credentials(name: &str) -> StoreError {

@@ -13,6 +13,8 @@
   import Avatar from "./Avatar.svelte";
   import { serverHost } from "../util/account";
   import { bindingIcon, chipTooltip, groupProjects, locationTooltip, spacesWithIssues } from "../util/spaces";
+  import { projectPermissions, writableTeam } from "../util/teams";
+  import SpaceBanner from "./SpaceBanner.svelte";
   import type { MenuItem } from "../stores/ui.svelte";
 
   let { collapsed, onexpand }: { collapsed: boolean; onexpand: () => void } = $props();
@@ -107,20 +109,34 @@
         ])
       : app.projects.map((x) => option(x));
     const canLocate = !!p && grouped && (app.signedIn || !!activeLoc?.spaceId);
+    const perms = projectPermissions(activeLoc);
+    const teams = app.sync.spaces.filter((s) => s.kind === "team" && s.state === "active");
+    // Move to team…: a Personal or This device only project, and editor+ in at least one team (UX §5.1).
+    const pending = p ? app.sync.pendingMoves?.find((m) => m.projectId === p.id) : undefined;
+    const canMove = !!p && app.teamsOn && activeLoc?.kind !== "team" && activeLoc?.kind !== "legacy" && teams.some((t) => writableTeam(t.role));
     ui.openMenu(
       [
         ...list,
         { separator: true },
         { label: "New project…", action: newProject, testid: "project-new" },
+        ...(app.teamsOn ? [{ label: "Join team…", action: () => (ui.joinTeam = {}), testid: "project-join-team" }] : []),
         { separator: true },
-        { label: "Rename", shortcut: "F2", disabled: !p, action: () => p && (ui.renaming = { kind: "project", id: p.id }), testid: "project-rename" },
+        { label: "Rename", shortcut: "F2", disabled: !p || !!perms.edit, reason: perms.edit ?? undefined, action: () => p && (ui.renaming = { kind: "project", id: p.id }), testid: "project-rename" },
         { label: "Duplicate", disabled: !p, action: () => p && void app.duplicateProject(p.id), testid: "project-duplicate" },
         ...(canLocate ? [{ label: "Sync location…", disabled: !app.signedIn, reason: app.signedIn ? undefined : "Sign in to change where projects sync", action: () => {
               if (p) ui.syncLocation = { projectId: p.id };
             },
             testid: "project-sync-location",
           }] : []),
-        { label: "Delete…", danger: true, disabled: !p || app.projects.length <= 1, action: () => p && void app.deleteProject(p.id), testid: "project-delete" },
+        ...(pending
+          ? [
+              { label: `Finish move to ${pending.targetName}…`, action: () => p && (ui.moveToTeam = { projectId: p.id, spaceId: pending.to ?? "local" }), testid: "project-finish-move" },
+              ...(pending.copySaved ? [] : [{ label: "Cancel move", action: () => p && void app.cancelMove(p.id), testid: "project-cancel-move" }]),
+            ]
+          : canMove
+            ? [{ label: "Move to team…", action: () => p && (ui.moveToTeam = { projectId: p.id }), testid: "project-move-team" }]
+            : []),
+        { label: "Delete…", danger: true, disabled: !p || app.projects.length <= 1 || !!perms.delete, reason: perms.delete ?? undefined, action: () => p && void app.deleteProject(p.id), testid: "project-delete" },
       ],
       projectBtn,
     );
@@ -257,6 +273,7 @@
         <button class="project" type="button" aria-haspopup="menu" title={projectTitle} bind:this={projectBtn} onclick={projectMenu} data-testid="project-switcher">
           <span class="faint" data-testid="project-binding-icon" data-icon={bindingIcon(activeLoc, grouped)}><Icon name={bindingIcon(activeLoc, grouped)} small /></span><span class="pname">{app.project?.name ?? "Project"}</span><span class="faint"><Icon name="chev-d" small /></span>
         </button>
+        {#if app.viewerHere}<span class="chip-role" data-testid="view-only-chip">View only</span>{/if}
       {/if}
       <span class="grow"></span>
       <button class="icon-btn" type="button" aria-label="Import" title="Import (cURL, OpenAPI, link)  {shortcutText('Mod+U', app.platform)}" onclick={() => (ui.importDialog = { tab: "curl" })} data-testid="import-button"
@@ -314,6 +331,7 @@
       {#if ui.sidebarTab === "activity"}
         <ActivityList />
       {:else if ui.sidebarTab === "collections"}
+        <SpaceBanner />
         <CollectionsTree />
       {:else}
         <EnvList />
@@ -507,5 +525,15 @@
   }
   .sync.danger {
     color: var(--danger);
+  }
+  .chip-role {
+    flex: none;
+    height: 16px;
+    line-height: 16px;
+    padding: 0 6px;
+    border-radius: 3px;
+    background: var(--bg-active);
+    color: var(--text-2);
+    font-size: 10.5px;
   }
 </style>

@@ -151,7 +151,7 @@ describe("app store", () => {
     const p = app.deleteNode("collection", c!.id);
     await until(() => !!ui.confirmState);
     expect(ui.confirmState?.title).toBe("Delete “Temp 2”?");
-    ui.confirmState!.resolve(true);
+    ui.confirmState!.resolve({ ok: true });
     ui.confirmState = null;
     await p;
     expect(app.index?.collectionById.has(c!.id)).toBe(false);

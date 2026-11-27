@@ -83,6 +83,7 @@
 {#if menu}
   <div
     class="menu pop host"
+    class:over-dialog={ui.anyModalOpen}
     role="menu"
     tabindex="-1"
     bind:this={el}
@@ -137,6 +138,10 @@
     outline: none;
     max-height: calc(100vh - 16px);
     overflow-y: auto;
+  }
+  /* A menu opened from inside a dialog (a team member's ⋯) sits above it, below toasts. */
+  .host.over-dialog {
+    z-index: calc(var(--z-dialog) + 10);
   }
   .chk {
     width: 14px;

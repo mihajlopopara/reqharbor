@@ -104,6 +104,10 @@ impl From<SyncError> for CommandError {
 
 impl From<AuthError> for CommandError {
     fn from(e: AuthError) -> Self {
+        if let AuthError::Refused { code, message } = &e {
+            let text = reqharbor_core::teams::refusal_message(code, "").unwrap_or(message.clone());
+            return CommandError::new(code, text);
+        }
         let code = match e {
             AuthError::Offline(_) => "server_unreachable",
             AuthError::Cancelled => "sign_in_cancelled",
@@ -120,8 +124,28 @@ impl From<AuthError> for CommandError {
             AuthError::Keychain(_) => "keychain_unavailable",
             AuthError::NotSignedIn => "not_signed_in",
             AuthError::Store(_) => "io",
+            AuthError::Refused { .. } => "auth_rejected",
         };
         CommandError::new(code, e.to_string())
+    }
+}
+
+impl From<reqharbor_core::transfer::TransferError> for CommandError {
+    fn from(e: reqharbor_core::transfer::TransferError) -> Self {
+        use reqharbor_core::transfer::TransferError;
+        match e {
+            TransferError::Store(e) => e.into(),
+            TransferError::Sync(e) => e.into(),
+            TransferError::Rejected { reason, message } => {
+                let code = match reason.as_str() {
+                    "forbidden_role" => "forbidden_role",
+                    "entity_too_large" => "sync_too_large",
+                    "clock_skew" => "clock_skew",
+                    _ => "sync_rejected",
+                };
+                CommandError::new(code, message)
+            }
+        }
     }
 }
 

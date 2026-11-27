@@ -528,6 +528,7 @@ pub async fn sign_in_start(
     server_url: &str,
     method: Option<String>,
     insecure_confirmed: bool,
+    invite_ticket: Option<String>,
 ) -> CmdResult<AuthStatus> {
     let generation = {
         let auth = app.state::<AuthState>();
@@ -550,7 +551,9 @@ pub async fn sign_in_start(
         i.generation
     };
     emit(app);
-    let result = prepare(app, server_url, method.clone(), insecure_confirmed).await;
+    let result = prepare(app, server_url, method.clone(), insecure_confirmed)
+        .await
+        .map(|(p, d)| (p.with_ticket(invite_ticket.as_deref()), d));
     let (pending, discovery) = match result {
         Ok(v) => v,
         Err(e) => {
