@@ -12,6 +12,8 @@
   import Icon from "./Icon.svelte";
   import Avatar from "./Avatar.svelte";
   import { serverHost } from "../util/account";
+  import { bindingIcon, chipTooltip, groupProjects, locationTooltip, spacesWithIssues } from "../util/spaces";
+  import type { MenuItem } from "../stores/ui.svelte";
 
   let { collapsed, onexpand }: { collapsed: boolean; onexpand: () => void } = $props();
 
@@ -69,16 +71,55 @@
     void tick().then(() => document.querySelector<HTMLElement>(`[data-testid="sidebar-tab-${n}"]`)?.focus());
   }
 
+  /** Account mode: the grouped switcher (UX §5.1). Signed out with no bindings: today's flat list. */
+  const grouped = $derived(app.sync.accountMode);
+  const activeLoc = $derived(app.activeProjectId ? app.locationById.get(app.activeProjectId) : undefined);
+  const activeSpace = $derived(activeLoc?.spaceId ? app.sync.spaces.find((s) => s.spaceId === activeLoc.spaceId) : undefined);
+  const projectTitle = $derived(grouped && app.project ? locationTooltip(app.project.name, activeLoc, activeSpace) : "Switch project");
+
+  function newProject() {
+    if (app.signedIn && app.sync.accountMode) {
+      ui.newProject = true;
+      return;
+    }
+    void app.createProject("New project").then(() => (ui.renaming = { kind: "project", id: app.activeProjectId ?? "" }));
+  }
+
   function projectMenu() {
     if (!projectBtn) return;
     const p = app.project;
+    const option = (x: { id: string; name: string }, group?: string): MenuItem => {
+      const l = app.locationById.get(x.id);
+      return {
+        label: x.name,
+        checked: x.id === app.activeProjectId,
+        icon: grouped ? bindingIcon(l, true) : undefined,
+        ariaLabel: group ? `${x.name}, ${group}` : undefined,
+        action: () => void app.switchProject(x.id),
+        testid: "project-option",
+      };
+    };
+    const list: MenuItem[] = grouped
+      ? groupProjects(app.projects, app.locations, app.sync.spaces, app.signedIn).flatMap((g) => [
+          { heading: true, group: true, label: g.heading, trailing: g.trailing, testid: `project-group-${g.key}` },
+          ...(g.emptyRow ? [{ label: "No projects yet", disabled: true, testid: "project-group-empty" }] : []),
+          ...g.projects.map((x) => option(x, g.heading)),
+        ])
+      : app.projects.map((x) => option(x));
+    const canLocate = !!p && grouped && (app.signedIn || !!activeLoc?.spaceId);
     ui.openMenu(
       [
-        ...app.projects.map((x) => ({ label: x.name, checked: x.id === app.activeProjectId, action: () => void app.switchProject(x.id), testid: "project-option" })),
+        ...list,
         { separator: true },
-        { label: "New project…", action: () => void app.createProject("New project").then(() => (ui.renaming = { kind: "project", id: app.activeProjectId ?? "" })), testid: "project-new" },
+        { label: "New project…", action: newProject, testid: "project-new" },
+        { separator: true },
         { label: "Rename", shortcut: "F2", disabled: !p, action: () => p && (ui.renaming = { kind: "project", id: p.id }), testid: "project-rename" },
         { label: "Duplicate", disabled: !p, action: () => p && void app.duplicateProject(p.id), testid: "project-duplicate" },
+        ...(canLocate ? [{ label: "Sync location…", disabled: !app.signedIn, reason: app.signedIn ? undefined : "Sign in to change where projects sync", action: () => {
+              if (p) ui.syncLocation = { projectId: p.id };
+            },
+            testid: "project-sync-location",
+          }] : []),
         { label: "Delete…", danger: true, disabled: !p || app.projects.length <= 1, action: () => p && void app.deleteProject(p.id), testid: "project-delete" },
       ],
       projectBtn,
@@ -161,8 +202,17 @@
   }
 
   const sync = $derived(app.sync);
-  const syncVisible = $derived(sync.connected || sync.state === "unauthorized");
+  /** Hidden when nothing is connected, signed-out account mode included (UX §6.6). */
+  const syncVisible = $derived(sync.connected || sync.state === "unauthorized" || sync.state === "signInRequired");
   const retryIn = $derived(sync.nextRetryAt ? Math.max(0, Math.round((sync.nextRetryAt - app.now) / 1000)) : null);
+  const chipTitle = $derived(chipTooltip(sync, app.now, retryIn));
+  const issues = $derived(spacesWithIssues(sync));
+  const warningText = $derived([sync.warning, ...issues.map((s) => `${s.name}: ${s.issue?.message}`)].filter(Boolean).join("\n"));
+
+  /** "Sync off": account mode → Settings › Account (banner); token sync → Settings › Sync (UX §6.6). */
+  function syncOff() {
+    ui.settingsDialog = { section: sync.state === "signInRequired" && app.auth.enabled ? "account" : "sync" };
+  }
 </script>
 
 {#if collapsed}
@@ -204,8 +254,8 @@
           onblur={commitProjectRename}
         />
       {:else}
-        <button class="project" type="button" aria-haspopup="menu" title="Switch project" bind:this={projectBtn} onclick={projectMenu} data-testid="project-switcher">
-          <span class="faint"><Icon name="layers" small /></span><span class="pname">{app.project?.name ?? "Project"}</span><span class="faint"><Icon name="chev-d" small /></span>
+        <button class="project" type="button" aria-haspopup="menu" title={projectTitle} bind:this={projectBtn} onclick={projectMenu} data-testid="project-switcher">
+          <span class="faint" data-testid="project-binding-icon" data-icon={bindingIcon(activeLoc, grouped)}><Icon name={bindingIcon(activeLoc, grouped)} small /></span><span class="pname">{app.project?.name ?? "Project"}</span><span class="faint"><Icon name="chev-d" small /></span>
         </button>
       {/if}
       <span class="grow"></span>
@@ -276,16 +326,20 @@
         <Icon name="chev-d" small />
       </button>
       <span class="grow"></span>
-      {#if sync.warning && sync.connected}
-        <span class="sync warn" title={sync.warning} data-testid="sync-warning"><Icon name="alert" small /></span>
+      {#if warningText && sync.connected}
+        {#if sync.accountMode}
+          <button class="sync warn" type="button" title={warningText} aria-label="Sync warnings: {warningText}" onclick={() => (ui.settingsDialog = { section: "sync" })} data-testid="sync-warning"><Icon name="alert" small /></button>
+        {:else}
+          <span class="sync warn" title={warningText} data-testid="sync-warning"><Icon name="alert" small /></span>
+        {/if}
       {/if}
       {#if syncVisible}
-        {#if sync.state === "unauthorized" || sync.state === "error"}
-          <button class="sync danger" type="button" title={sync.lastError ?? "Sync is off"} onclick={() => (ui.settingsDialog = { section: "sync" })} data-testid="sync-indicator"
+        {#if sync.state === "unauthorized" || sync.state === "error" || sync.state === "signInRequired"}
+          <button class="sync danger" type="button" title={chipTitle} aria-label={chipTitle} onclick={syncOff} data-testid="sync-indicator"
             ><Icon name="cloud-off" small />Sync off</button
           >
         {:else if sync.state === "offline"}
-          <button class="sync warn" type="button" title={retryIn !== null ? `Retrying in ${retryIn} s — click to sync now` : "Offline — click to sync now"} onclick={syncNow} data-testid="sync-indicator"
+          <button class="sync warn" type="button" title={chipTitle} aria-label={chipTitle} onclick={syncNow} data-testid="sync-indicator"
             ><Icon name="cloud-off" small />Offline</button
           >
         {:else}
@@ -293,7 +347,8 @@
             class="sync"
             class:syncing={sync.state === "syncing"}
             type="button"
-            title={sync.lastSyncAt ? `Synced ${relativeTime(sync.lastSyncAt, app.now)} — click to sync now` : "Click to sync now"}
+            title={chipTitle}
+            aria-label={chipTitle}
             onclick={syncNow}
             data-testid="sync-indicator"><Icon name="cloud" small />{sync.state === "syncing" ? "Syncing" : "Synced"}</button
           >

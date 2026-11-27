@@ -90,6 +90,9 @@ interface Hooks {
   delay: (ms: number) => Promise<void>;
   now: () => number;
   settings: () => Settings;
+  /** A browser sign-in finished (the store's migration runs here). */
+  onSignedIn?: (account: Account) => void;
+  onSignedOut?: () => void;
 }
 
 export class MockAccounts {
@@ -272,16 +275,21 @@ export class MockAccounts {
     this.signedIn(p.origin, p.method ?? "github", p.discovery);
     this.status.signIn = { ...this.status.signIn, state: "success", error: null, message: null, authorizeUrl: null };
     this.emit();
+    if (this.status.account) this.hooks.onSignedIn?.(this.status.account);
   }
 
+  /** Who the next browser sign-in signs in as (tests: `__mock.accounts.identity = {…}`); default Priya. */
+  identity: { userId: string; email: string; name: string } | null = null;
+
   private signedIn(origin: string, method: string, d: ServerDiscovery) {
+    const who = this.identity ?? { userId: "01JUSERPRIYA0000000000000", email: "priya@acme.dev", name: "Priya Shah" };
     const account: Account = {
       serverUrl: origin,
       serverInstanceId: d.info?.instanceId ?? "",
       serverName: d.info?.name || displayHost(origin),
-      userId: "01JUSERPRIYA0000000000000",
-      email: "priya@acme.dev",
-      name: "Priya Shah",
+      userId: who.userId,
+      email: who.email,
+      name: who.name,
       method,
       sessionId: "01JSESSIONTHISDEVICE00000",
     };
@@ -322,6 +330,7 @@ export class MockAccounts {
     await this.hooks.delay(100);
     this.status = { ...this.status, account: null, server: null, signInRequired: false, keychainUnreadable: false, offline: false, signIn: idle() };
     this.sessions = [];
+    this.hooks.onSignedOut?.();
     return this.emit();
   }
 

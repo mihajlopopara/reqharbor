@@ -7,6 +7,8 @@ export async function copyText(text: string): Promise<void> {
     await writeText(text);
     return;
   }
+  // Test hook, set first so a test can read it right after the click.
+  (window as unknown as { __lastCopied?: string }).__lastCopied = text;
   try {
     await navigator.clipboard.writeText(text);
   } catch {
@@ -19,7 +21,6 @@ export async function copyText(text: string): Promise<void> {
     document.execCommand("copy");
     ta.remove();
   }
-  (window as unknown as { __lastCopied?: string }).__lastCopied = text;
 }
 
 export interface PickedFile {

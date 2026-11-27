@@ -16,6 +16,8 @@ pub mod secrets;
 pub mod send;
 pub mod server_info;
 pub mod share;
+pub mod space_sync;
+pub mod spaces;
 pub mod storage;
 pub mod sync;
 pub mod urlx;

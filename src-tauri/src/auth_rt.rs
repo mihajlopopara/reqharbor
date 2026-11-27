@@ -2,8 +2,9 @@
 //!
 //! Owns the signed-in [`Session`], the pending browser sign-in and the
 //! cached discovery of the account's server, and reports every change as
-//! one [`AuthStatus`] on `auth://status`. The account is inert for sync in
-//! this milestone: nothing here touches `workspace.json` or token sync.
+//! one [`AuthStatus`] on `auth://status`. A finished sign-in runs the
+//! store's one-time migration (04 §7) and starts a sync; signing out pauses
+//! the account's spaces (their bindings stay).
 
 use crate::error::{CmdResult, CommandError};
 use crate::secret_store::AppSecrets;
@@ -255,21 +256,116 @@ impl AuthState {
         self.lock().account.as_ref().map(|a| a.server_url.clone())
     }
 
+    /// The signed-in account (none while the keychain is unreadable).
+    pub fn account(&self) -> Option<Account> {
+        let i = self.lock();
+        if i.keychain_unreadable {
+            None
+        } else {
+            i.account.clone()
+        }
+    }
+
+    /// The secret store (keychain or 0600 file), probed on first use.
+    pub fn secrets(&self) -> Arc<dyn SecretStore> {
+        self.secrets.clone()
+    }
+
     fn persist_flags(&self) {
         let (required, server) = {
             let i = self.lock();
             (i.sign_in_required, i.server.clone())
         };
-        if let Ok(Some(mut file)) = AccountFile::load(&self.dir)
-            && file.account.is_some()
-        {
-            file.sign_in_required = required;
-            if server.is_some() {
-                file.server = server;
+        let _ = AccountFile::update(&self.dir, |file| {
+            if file.account.is_some() {
+                file.sign_in_required = required;
+                if server.is_some() {
+                    file.server = server;
+                }
             }
-            let _ = file.save(&self.dir);
-        }
+        });
     }
+}
+
+/// After a sign-in: run the store's migration (or pause foreign bindings),
+/// refresh the sync status and start a sync (04 §7, 06 §9).
+pub fn on_signed_in(app: &AppHandle) {
+    let auth = app.state::<AuthState>();
+    let Some(account) = auth.account() else {
+        return;
+    };
+    let secrets = auth.secrets();
+    let state = app.state::<crate::state::AppState>();
+    let migrated = {
+        let mut store = state.store();
+        let r = store.sign_in_migrate((&account).into(), secrets.as_ref());
+        let fresh = crate::state::SyncStatus::from_store(&mut store);
+        state.update_sync(|s| *s = fresh);
+        r
+    };
+    let fresh = match migrated {
+        Ok(r) => r.fresh_device,
+        Err(e) => {
+            // Token sync stays exactly as it was; the account is still signed in.
+            let _ = app.emit(
+                crate::sync_rt::EVENT_STATUS,
+                &state.update_sync(|s| s.last_error = Some(e.to_string())),
+            );
+            return;
+        }
+    };
+    crate::sync_rt::refresh_status(app);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = crate::sync_rt::run_sync(&app).await;
+        if fresh {
+            // UX §10 "Fresh device": no checklist, just say what syncs.
+            let message = app
+                .state::<crate::state::AppState>()
+                .store()
+                .fresh_device_notice();
+            let _ = app.emit(
+                crate::sync_rt::EVENT_NOTICE,
+                &crate::sync_rt::SyncNotice {
+                    kind: "success",
+                    message,
+                },
+            );
+        }
+    });
+}
+
+/// App start: line the store up with `account.json` and the secret store:
+/// the signed-in account, the legacy token in account mode, and the
+/// migration for an account signed in by a build without bindings.
+pub fn attach_store(app: &AppHandle) {
+    let auth = app.state::<AuthState>();
+    let account = if auth.enabled { auth.account() } else { None };
+    let secrets = auth.secrets();
+    let state = app.state::<crate::state::AppState>();
+    let mut store = state.store();
+    if let Some(a) = &account
+        && !store.account_mode()
+    {
+        let _ = store.sign_in_migrate(a.into(), secrets.as_ref());
+    }
+    if !store.account_mode() {
+        return;
+    }
+    store.set_account(account.as_ref().map(Into::into));
+    // Token sync reconnected by an older build: keep its token safe in the
+    // secret store before it leaves workspace.json (stays there on failure).
+    let _ = store.secure_stray_sync(secrets.as_ref());
+    if store.legacy_token.is_none()
+        && let Some(l) = store.bindings.legacy.clone()
+    {
+        store.legacy_token = secrets
+            .get(&reqharbor_core::spaces::legacy_key(&l.remote_workspace_id))
+            .ok()
+            .flatten();
+    }
+    let fresh = crate::state::SyncStatus::from_store(&mut store);
+    state.update_sync(|s| *s = fresh);
 }
 
 fn emit(app: &AppHandle) -> AuthStatus {
@@ -322,7 +418,15 @@ pub async fn discover(app: &AppHandle, server_url: &str) -> CmdResult<Discovery>
     let cached = auth.lock().server.clone();
     let d = Discovery::or_cached(fresh, cached.as_ref(), now_ms());
     if !d.cached {
-        note_account_discovery(&auth, &d);
+        if let Some(filled) = note_account_discovery(&auth, &d) {
+            // The account's instance is known now: its bindings can sync.
+            let state = app.state::<crate::state::AppState>();
+            let mut store = state.store();
+            if store.account_mode() {
+                store.set_account(Some((&filled).into()));
+                let _ = store.save_bindings();
+            }
+        }
         emit(app);
     }
     Ok(d)
@@ -330,10 +434,11 @@ pub async fn discover(app: &AppHandle, server_url: &str) -> CmdResult<Discovery>
 
 /// Record a fresh discovery of the account's server: a changed `instanceId`
 /// for the same origin is a different server (06 §9), whose sessions this
-/// one's tokens can't use.
-fn note_account_discovery(auth: &AuthState, d: &Discovery) {
-    let Some(info) = d.info.as_ref() else { return };
-    {
+/// one's tokens can't use. An account signed in without a known instance
+/// adopts the discovered one; it is returned then.
+fn note_account_discovery(auth: &AuthState, d: &Discovery) -> Option<Account> {
+    let info = d.info.as_ref()?;
+    let filled = {
         let mut i = auth.lock();
         let changed = i.account.as_ref().is_some_and(|a| {
             !a.server_instance_id.is_empty()
@@ -344,8 +449,27 @@ fn note_account_discovery(auth: &AuthState, d: &Discovery) {
             i.sign_in_required = true;
         }
         i.server = Some(d.clone());
-    }
+        match i.account.as_mut() {
+            Some(a) if a.server_instance_id.is_empty() && !info.instance_id.is_empty() => {
+                a.server_instance_id = info.instance_id.clone();
+                Some(a.clone())
+            }
+            _ => None,
+        }
+    };
     auth.persist_flags();
+    if let Some(a) = &filled {
+        let a = a.clone();
+        let _ = AccountFile::update(&auth.dir, move |file| {
+            if let Some(acc) = file.account.as_mut()
+                && acc.server_url == a.server_url
+                && acc.user_id == a.user_id
+            {
+                acc.server_instance_id = a.server_instance_id.clone();
+            }
+        });
+    }
+    filled
 }
 
 /// App start: rediscover the account's server (06 §9 "Rediscovery").
@@ -538,6 +662,7 @@ async fn finish(
     {
         Ok(true) => {
             emit(app);
+            on_signed_in(app);
         }
         // Superseded (signed out while exchanging): nothing was kept.
         Ok(false) => {}
@@ -643,16 +768,14 @@ impl AuthState {
             let i = self.lock();
             (i.account.clone(), i.server.clone(), i.sign_in_required)
         };
-        let Ok(Some(mut file)) = AccountFile::load(&self.dir) else {
-            return;
-        };
-        if file.account.as_ref() != Some(written) {
-            return;
-        }
-        file.server = if account.is_some() { server } else { None };
-        file.sign_in_required = account.is_some() && required;
-        file.account = account;
-        let _ = file.save_or_remove(&self.dir);
+        let _ = AccountFile::update(&self.dir, |file| {
+            if file.account.as_ref() != Some(written) {
+                return;
+            }
+            file.server = if account.is_some() { server } else { None };
+            file.sign_in_required = account.is_some() && required;
+            file.account = account;
+        });
     }
 }
 
@@ -718,13 +841,12 @@ pub async fn sign_out(app: &AppHandle) -> CmdResult<AuthStatus> {
             .await
             .map_err(|e| CommandError::from(AuthError::from(e)))?;
     }
-    let mut file = AccountFile::load(&auth.dir)
-        .map_err(CommandError::from)?
-        .unwrap_or_default();
-    file.account = None;
-    file.server = None;
-    file.sign_in_required = false;
-    file.save_or_remove(&auth.dir).map_err(CommandError::from)?;
+    AccountFile::update(&auth.dir, |file| {
+        file.account = None;
+        file.server = None;
+        file.sign_in_required = false;
+    })
+    .map_err(CommandError::from)?;
     {
         let mut i = auth.lock();
         i.account = None;
@@ -735,11 +857,16 @@ pub async fn sign_out(app: &AppHandle) -> CmdResult<AuthStatus> {
         i.offline = false;
         i.sign_in = SignInStatus::idle();
     }
+    // The account's spaces pause; their bindings and data stay (UX §4.3).
+    if let Some(state) = app.try_state::<crate::state::AppState>() {
+        state.store().set_account(None);
+        crate::sync_rt::refresh_status(app);
+    }
     Ok(emit(app))
 }
 
 /// Mark the session as needing a new sign-in (AC-AUTH-9) and tell the UI.
-fn signed_out_by_server(app: &AppHandle) {
+pub(crate) fn signed_out_by_server(app: &AppHandle) {
     let auth = app.state::<AuthState>();
     auth.lock().sign_in_required = true;
     auth.persist_flags();
@@ -799,12 +926,11 @@ pub async fn refresh_profile(app: &AppHandle) -> CmdResult<AuthStatus> {
         }
     }
     let account = auth.lock().account.clone();
-    if let Ok(Some(mut file)) = AccountFile::load(&auth.dir)
-        && file.account.is_some()
-    {
-        file.account = account;
-        let _ = file.save(&auth.dir);
-    }
+    let _ = AccountFile::update(&auth.dir, |file| {
+        if file.account.is_some() {
+            file.account = account;
+        }
+    });
     Ok(emit(app))
 }
 
@@ -1160,10 +1286,39 @@ mod tests {
             "https://rh.acme.dev",
             Some((200, body.to_string().as_bytes())),
         );
-        note_account_discovery(&state, &d);
+        assert!(note_account_discovery(&state, &d).is_none());
         assert!(state.status().sign_in_required);
         let saved = AccountFile::load(dir.path()).unwrap().unwrap();
         assert!(saved.sign_in_required);
         assert_eq!(saved.server.unwrap().info.unwrap().instance_id, "I2");
+    }
+
+    #[test]
+    fn an_account_without_an_instance_adopts_the_discovered_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = account();
+        a.server_instance_id = String::new();
+        AccountFile {
+            account: Some(a),
+            ..Default::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let state = AuthState::load(dir.path(), chosen(Arc::new(MemorySecretStore::new())), true);
+        state.lock().sign_in_required = false;
+        let body = json!({
+            "software": "reqharbor-server", "apiVersion": 1, "instanceId": "I9",
+            "auth": {"methods": [{"id": "password", "label": "Email"}]},
+            "features": {"accounts": true}
+        });
+        let d = server_info::classify(
+            "https://rh.acme.dev",
+            Some((200, body.to_string().as_bytes())),
+        );
+        let filled = note_account_discovery(&state, &d).expect("instance adopted");
+        assert_eq!(filled.server_instance_id, "I9");
+        assert!(!state.status().sign_in_required, "not a different server");
+        let saved = AccountFile::load(dir.path()).unwrap().unwrap();
+        assert_eq!(saved.account.unwrap().server_instance_id, "I9");
     }
 }

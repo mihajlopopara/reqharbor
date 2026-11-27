@@ -1,6 +1,7 @@
 //! Pure sync-status state machine (AC-SYNC-2/6/7, contracts C2/C4), kept
 //! free of Tauri types so it is unit-tested. `sync_rt` applies the actions.
 
+use reqharbor_core::space_sync::{self, LegacyStatus, SpaceStatus};
 use reqharbor_core::storage::Store;
 use reqharbor_core::sync::{self, SkippedEntity, SyncError};
 use serde::Serialize;
@@ -22,6 +23,12 @@ pub enum SyncState {
     Unauthorized,
     /// Other failure (validation, protocol); not retried automatically.
     Error,
+    /// Account mode: the session ended (AC-AUTH-9). Account spaces wait for
+    /// a new sign-in; token sync keeps going.
+    SignInRequired,
+    /// Account mode with nothing syncing right now (signed out, or every
+    /// space paused); bindings are kept.
+    Paused,
 }
 
 /// Payload of `get_sync_status` and the `sync://status` event.
@@ -48,10 +55,21 @@ pub struct SyncStatus {
     pub unsupported_entities: Vec<SkippedEntity>,
     /// Non-fatal warning for the sync indicator tooltip, e.g. skipped items.
     pub warning: Option<String>,
+    /// `account.json` holds bindings (04 §6.1): projects sync per space.
+    pub account_mode: bool,
+    /// One entry per bound space, personal first, then teams, then legacy.
+    pub spaces: Vec<SpaceStatus>,
+    /// The token-synced workspace in account mode.
+    pub legacy: Option<LegacyStatus>,
+    /// The first-sync checklist is waiting for an answer (UX §10).
+    pub first_sync_pending: bool,
 }
 
 impl SyncStatus {
     pub fn from_store(store: &mut Store) -> Self {
+        if store.account_mode() {
+            return Self::from_account_store(store);
+        }
         let cfg = store.workspace.sync.clone();
         let skipped = if cfg.is_some() {
             sync::skipped_entities(store)
@@ -85,7 +103,66 @@ impl SyncStatus {
             warning: sync_warning(&skipped, &unsupported),
             skipped_entities: skipped,
             unsupported_entities: unsupported,
+            account_mode: false,
+            spaces: Vec::new(),
+            legacy: None,
+            first_sync_pending: false,
         }
+    }
+
+    /// Account mode: per-space lines, `connected` while anything can sync.
+    fn from_account_store(store: &mut Store) -> Self {
+        let skipped = space_sync::skipped_total(store);
+        let unsupported = space_sync::unsupported_total(store);
+        let connected = store.sync_active();
+        let legacy = space_sync::legacy_status(store);
+        let mut s = SyncStatus {
+            state: SyncState::Idle,
+            connected,
+            worker_url: legacy.as_ref().map(|l| l.worker_url.clone()),
+            remote_workspace_id: legacy.as_ref().map(|l| l.remote_workspace_id.clone()),
+            last_sync_at: None,
+            last_pull_at: None,
+            last_error: None,
+            next_retry_at: None,
+            retry_attempt: 0,
+            pending_changes: space_sync::pending_total(store),
+            warning: sync_warning(&skipped, &unsupported),
+            skipped_entities: skipped,
+            unsupported_entities: unsupported,
+            account_mode: true,
+            spaces: Vec::new(),
+            legacy,
+            first_sync_pending: false,
+        };
+        refresh_spaces(&mut s, store);
+        s.last_sync_at = s.spaces.iter().filter_map(|x| x.last_sync_at).max();
+        s
+    }
+}
+
+/// Re-read the per-space part of the status from the store.
+pub fn refresh_spaces(s: &mut SyncStatus, store: &Store) {
+    if !store.account_mode() {
+        return;
+    }
+    s.account_mode = true;
+    s.spaces = space_sync::space_statuses(store);
+    s.legacy = space_sync::legacy_status(store);
+    s.first_sync_pending =
+        store.bindings.first_sync_pending && !store.first_sync_candidates().is_empty();
+    s.connected = store.sync_active();
+    s.worker_url = s.legacy.as_ref().map(|l| l.worker_url.clone());
+    s.remote_workspace_id = s.legacy.as_ref().map(|l| l.remote_workspace_id.clone());
+    let syncing = !store.sync_scopes().is_empty();
+    if !syncing && matches!(s.state, SyncState::Idle | SyncState::Disconnected) {
+        s.state = if s.spaces.is_empty() && s.legacy.is_none() {
+            SyncState::Disconnected
+        } else {
+            SyncState::Paused
+        };
+    } else if syncing && s.state == SyncState::Paused {
+        s.state = SyncState::Idle;
     }
 }
 
@@ -161,6 +238,7 @@ pub fn sync_warning(skipped: &[SkippedEntity], unsupported: &[SkippedEntity]) ->
 pub fn should_pull_on_focus(s: &SyncStatus, now: i64) -> bool {
     s.connected
         && s.state != SyncState::Syncing
+        && s.state != SyncState::SignInRequired
         && !s
             .last_pull_at
             .is_some_and(|t| now - t < FOCUS_PULL_INTERVAL_MS)
@@ -207,6 +285,10 @@ pub const UNAUTHORIZED_MESSAGE: &str = "Token rejected — sync disconnected. En
 /// Update the status for a failure. `token_rotated` is true when the token
 /// in the store changed while this sync ran (a 401 for the old token must not
 /// disconnect, contract C4).
+///
+/// Only a legacy token's 401 disconnects ([`SyncError::Unauthorized`] comes
+/// only from token clients; session clients refresh and end in
+/// [`SyncError::SignInRequired`], which never touches bindings or data).
 pub fn on_failure(
     s: &mut SyncStatus,
     err: &SyncError,
@@ -214,6 +296,13 @@ pub fn on_failure(
     token_rotated: bool,
 ) -> FailureAction {
     match err {
+        SyncError::SignInRequired => {
+            s.state = SyncState::SignInRequired;
+            s.last_error = Some(err.to_string());
+            s.next_retry_at = None;
+            s.retry_attempt = 0;
+            FailureAction::Stop
+        }
         SyncError::Unauthorized if token_rotated => {
             s.state = SyncState::Idle;
             s.next_retry_at = Some(now);
@@ -244,6 +333,44 @@ pub fn on_failure(
     }
 }
 
+/// Fold an account-mode run into the status (04 §6.6 step 5). The worst
+/// state wins: a session that ended, then a retryable failure (offline),
+/// then any other error; a legacy 401 only disconnects token sync.
+pub fn on_account_run(
+    s: &mut SyncStatus,
+    run: &space_sync::AccountRun,
+    now: i64,
+    token_rotated: bool,
+) -> FailureAction {
+    s.connected = true;
+    s.last_pull_at = Some(now);
+    if run.sign_in_required {
+        s.state = SyncState::SignInRequired;
+        s.last_error = Some(SyncError::SignInRequired.to_string());
+        s.next_retry_at = None;
+        // Token sync may still have failed and need its own handling.
+        if let Some(e @ SyncError::Unauthorized) = run.error() {
+            let mut scratch = s.clone();
+            let a = on_failure(&mut scratch, e, now, token_rotated);
+            if a == FailureAction::Disconnect {
+                return a;
+            }
+        }
+        return FailureAction::Stop;
+    }
+    match run.error() {
+        None => {
+            s.state = SyncState::Idle;
+            s.last_sync_at = Some(now);
+            s.last_error = None;
+            s.next_retry_at = None;
+            s.retry_attempt = 0;
+            FailureAction::Stop
+        }
+        Some(e) => on_failure(s, e, now, token_rotated),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +391,108 @@ mod tests {
             skipped_entities: vec![],
             unsupported_entities: vec![],
             warning: None,
+            account_mode: false,
+            spaces: vec![],
+            legacy: None,
+            first_sync_pending: false,
         }
+    }
+
+    #[test]
+    fn only_a_legacy_401_disconnects() {
+        let mut s = connected();
+        assert_eq!(
+            on_failure(&mut s, &SyncError::SignInRequired, 0, false),
+            FailureAction::Stop
+        );
+        assert_eq!(s.state, SyncState::SignInRequired);
+        assert!(s.connected, "bindings and data stay; nothing disconnects");
+        for e in [
+            SyncError::SpaceGone("space_not_found".into()),
+            SyncError::Forbidden("forbidden_role".into()),
+            SyncError::ClientTooOld("client_too_old".into()),
+        ] {
+            let mut s = connected();
+            assert_ne!(on_failure(&mut s, &e, 0, false), FailureAction::Disconnect);
+            assert!(s.connected);
+        }
+        let mut s = connected();
+        assert_eq!(
+            on_failure(&mut s, &SyncError::Unauthorized, 0, false),
+            FailureAction::Disconnect
+        );
+        // 507 and 429 back off like other transient failures (06 §9).
+        for e in [
+            SyncError::ServerFull("server_full".into()),
+            SyncError::RateLimited("rate_limited".into()),
+        ] {
+            let mut s = connected();
+            assert!(matches!(
+                on_failure(&mut s, &e, 0, false),
+                FailureAction::Retry(_)
+            ));
+            assert_eq!(s.state, SyncState::Offline);
+        }
+    }
+
+    #[test]
+    fn an_account_run_folds_into_the_worst_state() {
+        use reqharbor_core::space_sync::{AccountRun, ScopeRun};
+        let ok = AccountRun::default();
+        let mut s = connected();
+        assert_eq!(on_account_run(&mut s, &ok, 5, false), FailureAction::Stop);
+        assert_eq!(s.state, SyncState::Idle);
+        assert_eq!(s.last_sync_at, Some(5));
+
+        let offline = AccountRun {
+            scopes: vec![
+                ScopeRun {
+                    space_id: "p".into(),
+                    error: Some(SyncError::QuotaExceeded("q".into())),
+                    ..Default::default()
+                },
+                ScopeRun {
+                    space_id: "t".into(),
+                    error: Some(SyncError::Offline("down".into())),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut s = connected();
+        assert!(matches!(
+            on_account_run(&mut s, &offline, 5, false),
+            FailureAction::Retry(_)
+        ));
+        assert_eq!(s.state, SyncState::Offline);
+
+        let ended = AccountRun {
+            sign_in_required: true,
+            ..Default::default()
+        };
+        let mut s = connected();
+        assert_eq!(
+            on_account_run(&mut s, &ended, 5, false),
+            FailureAction::Stop
+        );
+        assert_eq!(s.state, SyncState::SignInRequired);
+
+        // The session ended and the legacy token was rejected: token sync
+        // still disconnects (AC-SYNC-7).
+        let both = AccountRun {
+            sign_in_required: true,
+            scopes: vec![ScopeRun {
+                space_id: "legacy".into(),
+                error: Some(SyncError::Unauthorized),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut s = connected();
+        assert_eq!(
+            on_account_run(&mut s, &both, 5, false),
+            FailureAction::Disconnect
+        );
     }
 
     #[test]

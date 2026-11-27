@@ -38,6 +38,7 @@ impl From<StoreError> for CommandError {
             StoreError::Invalid(_) => "invalid",
             StoreError::Io(_) => "io",
             StoreError::ReadOnlyNewer(_) => "read_only_newer",
+            StoreError::ReadOnlyRole(_) => "read_only_role",
         };
         CommandError::new(code, e.to_string())
     }
@@ -90,6 +91,12 @@ impl From<SyncError> for CommandError {
             SyncError::Rejected(_) => "sync_rejected",
             SyncError::Protocol(_) => "sync_protocol",
             SyncError::Store(_) => "io",
+            SyncError::SignInRequired => "sign_in_required",
+            SyncError::SpaceGone(_) => "space_unavailable",
+            SyncError::Forbidden(_) => "forbidden_role",
+            SyncError::RateLimited(_) => "rate_limited",
+            SyncError::ClientTooOld(_) => "client_too_old",
+            SyncError::ServerFull(_) => "server_full",
         };
         CommandError::new(code, e.to_string())
     }
@@ -163,6 +170,28 @@ mod tests {
         assert_eq!(
             CommandError::from(AuthError::Timeout).message,
             "Sign-in timed out. Try again."
+        );
+    }
+
+    #[test]
+    fn sync_errors_of_account_spaces_have_codes() {
+        for (e, code) in [
+            (SyncError::SignInRequired, "sign_in_required"),
+            (SyncError::SpaceGone("x".into()), "space_unavailable"),
+            (SyncError::ClientTooOld("x".into()), "client_too_old"),
+            (SyncError::ServerFull("x".into()), "server_full"),
+            (SyncError::RateLimited("x".into()), "rate_limited"),
+            (SyncError::Unauthorized, "sync_unauthorized"),
+        ] {
+            assert_eq!(CommandError::from(e).code, code);
+        }
+        assert_eq!(
+            CommandError::from(StoreError::ReadOnlyRole("v".into())).code,
+            "read_only_role"
+        );
+        assert_eq!(
+            CommandError::from(SyncError::ServerFull("x".into())).message,
+            "The sync server is out of space. Your changes are saved on this device."
         );
     }
 

@@ -96,8 +96,8 @@
       {#if it.separator}
         <div class="sep" role="separator"></div>
       {:else if it.heading}
-        <div class="mh" role="presentation" data-testid={it.testid}>
-          <span class="lbl">{it.label}</span>
+        <div class="mh" class:group={it.group} role="presentation" data-testid={it.testid}>
+          <span class="mh-row"><span class="lbl">{it.label}</span>{#if it.trailing}<span class="trail">{it.trailing}</span>{/if}</span>
           {#if it.sublabel}<span class="sub">{it.sublabel}</span>{/if}
         </div>
       {:else}
@@ -108,16 +108,21 @@
           role={it.checked !== undefined ? "menuitemcheckbox" : "menuitem"}
           aria-checked={it.checked !== undefined ? it.checked : undefined}
           aria-disabled={it.disabled ? "true" : undefined}
+          aria-label={it.ariaLabel}
+          {...it.disabled && it.reason ? { "aria-description": it.reason } : {}}
+          title={it.reason ?? it.title}
           tabindex="-1"
           data-testid={it.testid}
           onmouseenter={() => (hl = actionable(it) ? i : -1)}
           onclick={() => activate(it)}
           onkeydown={() => {}}
         >
-          {#if it.checked !== undefined}
+          {#if it.icon}<span class="mi-icon"><Icon name={it.icon} small /></span>{/if}
+          {#if it.checked !== undefined && !it.icon}
             <span class="chk">{#if it.checked}<Icon name="check" small />{/if}</span>
           {/if}
           <span class="lbl">{it.label}</span>
+          {#if it.icon && it.checked}<span class="chk end"><Icon name="check" small /></span>{/if}
           {#if it.shortcut}<span class="sc">{it.shortcut}</span>{/if}
         </div>
       {/if}
@@ -152,5 +157,31 @@
     font-weight: var(--fw-regular);
     font-size: var(--fs-sm);
     color: var(--text-3);
+  }
+  .mh-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-4);
+  }
+  .mh.group {
+    padding: var(--sp-4) var(--sp-5) var(--sp-2);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+  }
+  .trail {
+    margin-left: auto;
+    text-transform: none;
+    letter-spacing: normal;
+    font-weight: var(--fw-regular);
+  }
+  .mi-icon {
+    display: inline-flex;
+    color: var(--text-3);
+  }
+  .chk.end {
+    margin-left: auto;
+    justify-content: flex-end;
   }
 </style>

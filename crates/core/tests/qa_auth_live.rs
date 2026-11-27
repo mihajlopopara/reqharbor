@@ -114,6 +114,7 @@ struct SignedIn {
     session: Session,
     client: AuthClient,
     secrets: Arc<MemorySecretStore>,
+    account: auth::Account,
     _dir: tempfile::TempDir,
 }
 
@@ -195,6 +196,7 @@ async fn sign_in() -> SignedIn {
         session,
         client,
         secrets,
+        account,
         _dir: dir,
     }
 }
@@ -285,4 +287,95 @@ async fn live_personal_space_push_and_pull() {
             .any(|c| c["id"] == "01JLIVEPROJECT000000000000"),
         "{pulled}"
     );
+}
+
+/// The C2 round trip through the real engine: device A signs in (the
+/// migration binds its fresh Default to Personal), creates a project and
+/// syncs; device B with the same account pulls it; B's edit reaches A.
+#[tokio::test]
+#[ignore]
+async fn live_personal_sync_round_trip_through_the_engine() {
+    use reqharbor_core::model::Request;
+    use reqharbor_core::space_sync::{self, RUN_BUDGET, StoreAccess};
+    use reqharbor_core::spaces::{AccountIdent, Scope};
+    use reqharbor_core::storage::Store;
+    use std::sync::Mutex;
+
+    let s = sign_in().await;
+    match s.session.spaces().await {
+        Ok(list) => assert!(
+            list.spaces.iter().any(|x| x.kind == "personal"),
+            "a personal space is created at signup: {list:?}"
+        ),
+        Err(AuthError::Rejected(m)) => {
+            eprintln!("personal spaces are not served yet (S6): {m}; skipping");
+            return;
+        }
+        Err(e) => panic!("{e:?}"),
+    }
+    let who = AccountIdent::from(&s.account);
+    let session = Arc::new(s.session);
+    let device = || {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        (dir, Mutex::new(store))
+    };
+    let (_da, a) = device();
+    let (_db, b) = device();
+    for d in [&a, &b] {
+        d.with(|st| st.sign_in_migrate(who.clone(), s.secrets.as_ref()).unwrap());
+    }
+
+    let run = space_sync::run(&a, Some(session.clone()), RUN_BUDGET).await;
+    assert!(run.error().is_none(), "{:?}", run.error());
+    let personal = a.with(|st| st.personal_space().unwrap().space_id.clone());
+    let (pid, rid) = a.with(|st| {
+        let p = st.create_project("Live sync").unwrap().project.id;
+        let c = st.create_collection(&p, "API").unwrap();
+        let r = st
+            .create_request(
+                &c.id,
+                None,
+                Request {
+                    method: "GET".into(),
+                    url: "https://example.test/live".into(),
+                    ..Request::default()
+                },
+            )
+            .unwrap();
+        (p, r.id)
+    });
+    let run = space_sync::run(&a, Some(session.clone()), RUN_BUDGET).await;
+    assert!(run.error().is_none(), "{:?}", run.error());
+    assert!(run.report.pushed >= 3, "{:?}", run.report);
+    let scope = Scope::Space(personal.clone());
+    assert_eq!(
+        a.with(|st| reqharbor_core::sync::pending_count_in(st, &scope)),
+        0
+    );
+
+    let run = space_sync::run(&b, Some(session.clone()), RUN_BUDGET).await;
+    assert!(run.error().is_none(), "{:?}", run.error());
+    b.with(|st| {
+        assert_eq!(st.project(&pid).unwrap().project.name, "Live sync");
+        assert!(st.request(&rid).is_some());
+        assert_eq!(st.bindings.project_spaces[&pid], personal);
+    });
+
+    // B edits; A pulls the edit, with attribution kept out of the entity.
+    b.with(|st| st.rename_request(&rid, "Renamed on B").unwrap());
+    let run = space_sync::run(&b, Some(session.clone()), RUN_BUDGET).await;
+    assert!(run.error().is_none(), "{:?}", run.error());
+    let run = space_sync::run(&a, Some(session.clone()), RUN_BUDGET).await;
+    assert!(run.error().is_none(), "{:?}", run.error());
+    a.with(|st| {
+        assert_eq!(st.request(&rid).unwrap().name, "Renamed on B");
+        assert!(st.request(&rid).unwrap().extra.get("updatedBy").is_none());
+    });
+
+    // Deleting on A removes it from B.
+    a.with(|st| st.delete_project(&pid).unwrap());
+    space_sync::run(&a, Some(session.clone()), RUN_BUDGET).await;
+    space_sync::run(&b, Some(session.clone()), RUN_BUDGET).await;
+    assert!(b.with(|st| st.project(&pid).is_err()));
 }

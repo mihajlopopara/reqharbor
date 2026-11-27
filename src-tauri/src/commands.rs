@@ -14,7 +14,8 @@ use reqharbor_core::prepare::PrepareError;
 use reqharbor_core::send::{ResponseMeta, send_request as core_send};
 use reqharbor_core::server_info::Discovery;
 use reqharbor_core::share::{self, ShareOptions, SharePreview};
-use reqharbor_core::storage::{ChildCounts, CorruptFile, NodeKind};
+use reqharbor_core::spaces::{FirstSyncCandidate, LegacyLink, LegacyMode, ProjectLocation, Scope};
+use reqharbor_core::storage::{ChildCounts, CorruptFile, NodeKind, Store};
 use reqharbor_core::sync::{
     self, CreatedWorkspace, RemoteWorkspace, ShareInfo, ShareKind, SyncClient, SyncReport,
 };
@@ -125,9 +126,21 @@ fn mutate<T>(
     Ok(out)
 }
 
+/// `location`: omitted or null for the default (Personal when signed in),
+/// `"local"` for this device only, or a space id (UX §5.2).
 #[tauri::command]
-pub fn create_project(app: AppHandle, name: String) -> CmdResult<ProjectTree> {
-    mutate(&app, |s| Ok(s.create_project(&name)?))
+pub fn create_project(
+    app: AppHandle,
+    name: String,
+    location: Option<String>,
+) -> CmdResult<ProjectTree> {
+    mutate(&app, |s| {
+        Ok(match location.as_deref() {
+            None | Some("") => s.create_project(&name)?,
+            Some("local") => s.create_project_at(&name, None)?,
+            Some(space) => s.create_project_at(&name, Some(space.to_string()))?,
+        })
+    })
 }
 
 #[tauri::command]
@@ -682,6 +695,34 @@ async fn connect(app: &AppHandle, worker_url: &str, token: &str) -> CmdResult<Sy
     let client = SyncClient::new(worker_url, Some(token))?;
     let remote = client.workspace().await?;
     let state = app.state::<AppState>();
+    if state.store().account_mode() {
+        // Signed in (or once was): token sync becomes the legacy space. Its
+        // token goes to the secret store; nothing local is bound to it
+        // until projects arrive from it.
+        let secrets = app.state::<AuthState>().secrets();
+        let key = reqharbor_core::spaces::legacy_key(&remote.workspace_id);
+        secrets
+            .set(&key, token)
+            .map_err(|e| CommandError::from(reqharbor_core::auth::AuthError::from(e)))?;
+        {
+            let mut store = state.store();
+            store.bindings.legacy = Some(LegacyLink {
+                worker_url: client.base_url().to_string(),
+                remote_workspace_id: remote.workspace_id,
+                mode: LegacyMode::Sync,
+            });
+            store.legacy_token = Some(token.to_string());
+            store
+                .spaces_state
+                .spaces
+                .remove(reqharbor_core::spaces::LEGACY_SPACE);
+            store.save_bindings()?;
+            store.save_spaces_state()?;
+        }
+        reset_status(&state);
+        let _ = run_sync(app).await;
+        return Ok(state.sync_status());
+    }
     {
         let mut store = state.store();
         store.workspace.sync = Some(SyncConfig {
@@ -700,7 +741,12 @@ async fn connect(app: &AppHandle, worker_url: &str, token: &str) -> CmdResult<Sy
 }
 
 #[tauri::command]
-pub fn sync_disconnect(state: S<'_>) -> CmdResult<SyncStatus> {
+pub fn sync_disconnect(app: AppHandle, state: S<'_>) -> CmdResult<SyncStatus> {
+    if state.store().account_mode() {
+        let secrets = app.state::<AuthState>().secrets();
+        state.store().legacy_disconnect(secrets.as_ref())?;
+        return Ok(reset_status(&state));
+    }
     sync::disconnect(&mut state.store())?;
     state.retry.cancel();
     state.push_debounce.cancel();
@@ -717,10 +763,22 @@ pub struct RotatedToken {
 /// sync can use the old token after the Worker invalidated it, and the new
 /// token is stored before the lock is released.
 #[tauri::command]
-pub async fn sync_rotate_token(state: S<'_>) -> CmdResult<RotatedToken> {
+pub async fn sync_rotate_token(app: AppHandle, state: S<'_>) -> CmdResult<RotatedToken> {
     let _serial = state.sync_lock.lock().await;
     let client = sync::client_for(&state.store())?;
     let token = client.rotate_token().await?;
+    let legacy = state.store().bindings.legacy.clone();
+    if let Some(l) = legacy {
+        state.store().legacy_token = Some(token.clone());
+        let secrets = app.state::<AuthState>().secrets();
+        let key = reqharbor_core::spaces::legacy_key(&l.remote_workspace_id);
+        if let Err(e) = secrets.set(&key, &token) {
+            let mut err = CommandError::from(reqharbor_core::auth::AuthError::from(e));
+            err.details = Some(serde_json::json!({ "token": token }));
+            return Err(err);
+        }
+        return Ok(RotatedToken { token });
+    }
     let mut store = state.store();
     if let Some(cfg) = store.workspace.sync.as_mut() {
         cfg.token = token.clone();
@@ -749,7 +807,82 @@ pub async fn sync_now(app: AppHandle) -> CmdResult<SyncReport> {
 
 // --------------------------------------------------------------------- shares
 
+/// Shown when sharing a project that syncs nowhere (UX §12.3).
+const SHARE_NEEDS_SYNC: &str =
+    "Sharing needs this project to sync. Change its sync location to Personal first.";
+
+/// Shown when sharing from a project whose space is paused or gone.
+const SHARE_PAUSED: &str =
+    "This project's sync is paused, so it can't be shared. Resolve it in Settings › Sync first.";
+
+/// The client of a scope: token sync, or an account space with the session.
+/// A space client exists only for an active binding of the signed-in
+/// account on the session's server (06 §9): a project paused for another
+/// account never sends this session's tokens to its server.
+fn scope_client(app: &AppHandle, store: &Store, scope: &Scope) -> CmdResult<SyncClient> {
+    match scope {
+        Scope::Legacy => Ok(sync::client_for(store)?),
+        Scope::Space(id) => {
+            if store.binding(id).is_none() {
+                return Err(CommandError::new("sync_not_connected", SHARE_NEEDS_SYNC));
+            }
+            let session = app.state::<AuthState>().session().ok_or_else(|| {
+                CommandError::from(reqharbor_core::auth::AuthError::SignInRequired)
+            })?;
+            reqharbor_core::space_sync::space_client(store, id, &session)
+                .map_err(|_| CommandError::new("sync_not_connected", SHARE_PAUSED))
+        }
+    }
+}
+
+/// The client for sharing `entity_id`: its project's space (04 §10:
+/// `share_*` keep their signatures; the space comes from the binding).
+fn share_client(
+    app: &AppHandle,
+    store: &Store,
+    kind: ShareKind,
+    entity_id: &str,
+) -> CmdResult<SyncClient> {
+    if !store.account_mode() {
+        return Ok(sync::client_for(store)?);
+    }
+    let node = match kind {
+        ShareKind::Collection => NodeKind::Collection,
+        ShareKind::Request => NodeKind::Request,
+    };
+    let pid = store.project_of(node, entity_id)?;
+    let scope = store
+        .scope_of_project(&pid)
+        .ok_or_else(|| CommandError::new("sync_not_connected", SHARE_NEEDS_SYNC))?;
+    scope_client(app, store, &scope)
+}
+
+/// Clients of every scope that can hold shares: token sync (also in
+/// shares-only mode) and each signed-in account space.
+fn share_clients(app: &AppHandle, store: &Store) -> CmdResult<Vec<SyncClient>> {
+    if !store.account_mode() {
+        return Ok(vec![sync::client_for(store)?]);
+    }
+    let mut out = Vec::new();
+    for b in &store.bindings.spaces {
+        let scope = Scope::Space(b.space_id.clone());
+        if store.scope_syncable(&scope)
+            && let Ok(c) = scope_client(app, store, &scope)
+        {
+            out.push(c);
+        }
+    }
+    if let Ok(c) = sync::client_for(store) {
+        out.push(c);
+    }
+    if out.is_empty() {
+        return Err(CommandError::from(sync::SyncError::NotConnected));
+    }
+    Ok(out)
+}
+
 fn share_snapshot(
+    app: &AppHandle,
     state: &AppState,
     kind: ShareKind,
     entity_id: &str,
@@ -757,7 +890,7 @@ fn share_snapshot(
     environment_id: Option<String>,
 ) -> CmdResult<(serde_json::Value, SharePreview, SyncClient)> {
     let store = state.store();
-    let client = sync::client_for(&store)?;
+    let client = share_client(app, &store, kind, entity_id)?;
     let opts = ShareOptions {
         include_credentials,
         environment_id,
@@ -786,6 +919,7 @@ pub fn share_preview(
 /// AC-SHARE-1: upload a sanitized snapshot, returns the share URL.
 #[tauri::command]
 pub async fn share_create(
+    app: AppHandle,
     state: S<'_>,
     kind: ShareKind,
     entity_id: String,
@@ -793,19 +927,23 @@ pub async fn share_create(
     environment_id: Option<String>,
 ) -> CmdResult<ShareInfo> {
     let (snap, _, client) = share_snapshot(
+        &app,
         &state,
         kind,
         &entity_id,
         include_credentials,
         environment_id,
     )?;
-    Ok(client.create_share(kind, &entity_id, &snap).await?)
+    let mut info = client.create_share(kind, &entity_id, &snap).await?;
+    info.space_id = Some(client.scope().id().to_string());
+    Ok(info)
 }
 
 /// AC-SHARE-4 "Update share": same URL, new snapshot built with the given
 /// options. The returned info always carries `kind`, `entityId` and `name`.
 #[tauri::command]
 pub async fn share_update(
+    app: AppHandle,
     state: S<'_>,
     share_id: String,
     kind: ShareKind,
@@ -814,6 +952,7 @@ pub async fn share_update(
     environment_id: Option<String>,
 ) -> CmdResult<ShareInfo> {
     let (snap, _, client) = share_snapshot(
+        &app,
         &state,
         kind,
         &entity_id,
@@ -823,21 +962,62 @@ pub async fn share_update(
     let mut info = client.update_share(&share_id, &snap).await?;
     info.kind.get_or_insert(kind);
     info.entity_id.get_or_insert(entity_id);
+    info.space_id = Some(client.scope().id().to_string());
     Ok(info)
 }
 
-/// AC-SHARE-4 "Revoke": the URL then returns 410.
+/// AC-SHARE-4 "Revoke": the URL then returns 410. In account mode the
+/// share is looked for in each space (`spaceId` from `share_list` first).
 #[tauri::command]
-pub async fn share_revoke(state: S<'_>, share_id: String) -> CmdResult<()> {
-    let client = sync::client_for(&state.store())?;
-    Ok(client.revoke_share(&share_id).await?)
+pub async fn share_revoke(
+    app: AppHandle,
+    state: S<'_>,
+    share_id: String,
+    space_id: Option<String>,
+) -> CmdResult<()> {
+    let mut clients = share_clients(&app, &state.store())?;
+    if let Some(sp) = space_id {
+        clients.sort_by_key(|c| c.scope().id() != sp);
+    }
+    let mut last = None;
+    for c in clients {
+        match c.revoke_share(&share_id).await {
+            Ok(()) => return Ok(()),
+            Err(e @ sync::SyncError::NotFound(_)) => last = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last.unwrap_or(sync::SyncError::NotConnected).into())
 }
 
-/// AC-SHARE-6: active shares of this workspace.
+/// AC-SHARE-6: active shares of this workspace (account mode: of every
+/// space, each tagged with its `spaceId`).
 #[tauri::command]
-pub async fn share_list(state: S<'_>) -> CmdResult<Vec<ShareInfo>> {
-    let client = sync::client_for(&state.store())?;
-    Ok(client.list_shares().await?)
+pub async fn share_list(app: AppHandle, state: S<'_>) -> CmdResult<Vec<ShareInfo>> {
+    let clients = share_clients(&app, &state.store())?;
+    let mut out = Vec::new();
+    let mut first_err = None;
+    let mut any_ok = false;
+    for c in &clients {
+        match c.list_shares().await {
+            Ok(list) => {
+                any_ok = true;
+                out.extend(list.into_iter().map(|mut s| {
+                    s.space_id = Some(c.scope().id().to_string());
+                    s
+                }));
+            }
+            // A space route the server doesn't serve yet lists nothing.
+            Err(sync::SyncError::NotFound(_)) if clients.len() > 1 => any_ok = true,
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match (any_ok, first_err) {
+        (false, Some(e)) => Err(e.into()),
+        _ => Ok(out),
+    }
 }
 
 #[derive(Serialize)]
@@ -958,4 +1138,129 @@ pub async fn auth_sessions(app: AppHandle) -> CmdResult<Vec<SessionInfo>> {
 #[tauri::command]
 pub async fn auth_session_revoke(app: AppHandle, session_id: String) -> CmdResult<()> {
     auth_rt::revoke_session(&app, &session_id).await
+}
+
+// ------------------------------------------------------------------- spaces
+
+/// Where every project syncs (UX §5.1 grouped switcher).
+#[tauri::command]
+pub fn project_locations(state: S<'_>) -> Vec<ProjectLocation> {
+    state.store().project_locations()
+}
+
+/// Sync location… (AC-PROJ-3): a space id, or null for this device only.
+#[tauri::command]
+pub fn project_set_location(
+    app: AppHandle,
+    project_id: String,
+    space_id: Option<String>,
+) -> CmdResult<Vec<ProjectLocation>> {
+    let out = mutate(&app, |s| {
+        s.set_project_location(&project_id, space_id.as_deref())?;
+        Ok(s.project_locations())
+    })?;
+    crate::sync_rt::refresh_status(&app);
+    Ok(out)
+}
+
+/// The first-sync checklist (UX §10): projects not bound to any space.
+#[tauri::command]
+pub fn first_sync_candidates(state: S<'_>) -> Vec<FirstSyncCandidate> {
+    state.store().first_sync_candidates()
+}
+
+/// Run a sync first when the personal space isn't bound yet (the first
+/// `/v1/me/spaces` of a sign-in).
+async fn ensure_personal(app: &AppHandle) {
+    let missing = app.state::<AppState>().store().personal_space().is_none();
+    if missing {
+        let _ = run_sync(app).await;
+    }
+}
+
+/// Answer the first-sync checklist: the checked projects sync to Personal,
+/// the rest stay on this device (AC-ONB-5). Nothing uploads before this.
+#[tauri::command]
+pub async fn first_sync_apply(app: AppHandle, project_ids: Vec<String>) -> CmdResult<SyncStatus> {
+    ensure_personal(&app).await;
+    {
+        let state = app.state::<AppState>();
+        let mut store = state.store();
+        store.first_sync_apply(&project_ids)?;
+    }
+    crate::sync_rt::refresh_status(&app);
+    let _ = run_sync(&app).await;
+    Ok(app.state::<AppState>().sync_status())
+}
+
+/// SpaceNoticeDialog: Keep (local-only copies) or Remove from this device,
+/// for a space paused for another account or removed (06 §9, 04 §6.7).
+#[tauri::command]
+pub fn space_notice_resolve(app: AppHandle, space_id: String, keep: bool) -> CmdResult<SyncStatus> {
+    {
+        let state = app.state::<AppState>();
+        state.store().space_notice_resolve(&space_id, keep)?;
+    }
+    let status = crate::sync_rt::refresh_status(&app);
+    let _ = tauri::Emitter::emit(&app, crate::sync_rt::EVENT_CHANGED, &SyncReport::default());
+    Ok(status)
+}
+
+/// × on SpaceNoticeDialog: decide later; Keep applies after 7 days (UX §6.9).
+#[tauri::command]
+pub fn space_notice_later(app: AppHandle, space_ids: Vec<String>) -> CmdResult<SyncStatus> {
+    {
+        let state = app.state::<AppState>();
+        state.store().space_notice_later(&space_ids, now_ms())?;
+    }
+    Ok(crate::sync_rt::refresh_status(&app))
+}
+
+/// What `legacy_merge` did: the merge is local and done once this returns;
+/// the follow-up sync is reported on its own (a failed sync is not a
+/// failed merge).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyMergeResult {
+    /// Projects moved from the legacy workspace to Personal.
+    pub merged: usize,
+    /// The follow-up sync, when it ran without error.
+    pub report: Option<SyncReport>,
+    /// Why the follow-up sync failed; the merge stands and syncs later.
+    pub sync_error: Option<CommandError>,
+}
+
+/// Merge the token-synced workspace into Personal (AC-ONB-3), then sync.
+#[tauri::command]
+pub async fn legacy_merge(app: AppHandle) -> CmdResult<LegacyMergeResult> {
+    ensure_personal(&app).await;
+    let merged = {
+        let state = app.state::<AppState>();
+        let mut store = state.store();
+        store.legacy_merge()?
+    };
+    crate::sync_rt::refresh_status(&app);
+    Ok(match run_sync(&app).await {
+        Ok(report) => LegacyMergeResult {
+            merged,
+            report: Some(report),
+            sync_error: None,
+        },
+        Err(e) => LegacyMergeResult {
+            merged,
+            report: None,
+            sync_error: Some(e),
+        },
+    })
+}
+
+/// Forget the legacy token (its share links keep working on the server).
+#[tauri::command]
+pub fn legacy_disconnect(app: AppHandle) -> CmdResult<SyncStatus> {
+    {
+        let state = app.state::<AppState>();
+        let secrets = app.state::<AuthState>().secrets();
+        state.store().legacy_disconnect(secrets.as_ref())?;
+    }
+    Ok(crate::sync_rt::refresh_status(&app))
 }

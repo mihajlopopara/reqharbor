@@ -1,6 +1,12 @@
 //! Sync client for the ReqHarbor Worker (PRODUCT §8, AC-SYNC-1..7, AC-ENV-7).
 //!
-//! * [`SyncClient`] is a thin typed wrapper over the Worker HTTP API.
+//! * [`SyncClient`] is a thin typed wrapper over the sync API: token sync
+//!   (`/v1/sync` with an `rh_` token, [`Scope::Legacy`]) or an account space
+//!   (`/v1/spaces/{id}/sync` with a session, [`Scope::Space`]).
+//! * Every engine step takes the [`Scope`] it works on (`*_in`); the
+//!   functions without the suffix are the token-sync (legacy) scope. In
+//!   account mode a scope sees only the projects bound to it, and pulled data
+//!   never rebinds anything (04 §6.3 rules B1–B7).
 //! * The engine is split into pure store steps ([`collect_push`],
 //!   [`apply_push_results`], [`apply_pull`]) and network steps, so callers can
 //!   hold their store lock only for the short local parts. [`sync_now`] runs a
@@ -12,10 +18,14 @@
 //! cascade to children. Secret variable values are never sent (AC-ENV-7) and
 //! local secret values are kept when environments are pulled.
 
+use crate::auth::{AuthError, Session};
 use crate::model::*;
-use crate::storage::{Store, StoreError, descendant_folders, sync_key};
+pub use crate::spaces::Scope;
+use crate::spaces::{Attribution, MAX_DEFERRED_RUNS, SpaceIssue};
+use crate::storage::{Store, StoreError, SyncState, descendant_folders, sync_key};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Header carrying this build's version on every sync call, so a server can
@@ -82,19 +92,62 @@ pub enum SyncError {
     /// 413 `quota_exceeded`: the workspace is full (50 MB). Not retried.
     #[error("Workspace storage quota exceeded: {0}")]
     QuotaExceeded(String),
-    /// Other 4xx (validation, rate limit...).
+    /// Other 4xx (validation...).
     #[error("Request rejected: {0}")]
     Rejected(String),
     #[error("Unexpected response: {0}")]
     Protocol(String),
     #[error("Local storage error: {0}")]
     Store(String),
+    /// An account space's session ended (AC-AUTH-9): sign in again. Local
+    /// data, bindings and unpushed edits are untouched.
+    #[error("Your session ended. Sign in again to keep syncing.")]
+    SignInRequired,
+    /// 403 `not_a_member` / 404 `space_not_found` on a space call: the space
+    /// is temporarily unavailable (04 §6.7); never a removal by itself.
+    #[error("This space is temporarily unavailable: {0}")]
+    SpaceGone(String),
+    /// 403 with another code (e.g. `forbidden_role`).
+    #[error("Not allowed: {0}")]
+    Forbidden(String),
+    /// 429: retried with backoff.
+    #[error("Too many requests: {0}")]
+    RateLimited(String),
+    /// 426 `client_too_old`.
+    #[error("This server needs a newer version of ReqHarbor.")]
+    ClientTooOld(String),
+    /// 507 `server_full`: retried with backoff (06 §9).
+    #[error("The sync server is out of space. Your changes are saved on this device.")]
+    ServerFull(String),
 }
 
 impl SyncError {
     /// Whether the caller should retry with backoff (AC-SYNC-6).
     pub fn is_retryable(&self) -> bool {
-        matches!(self, SyncError::Offline(_) | SyncError::Server(_))
+        matches!(
+            self,
+            SyncError::Offline(_)
+                | SyncError::Server(_)
+                | SyncError::ServerFull(_)
+                | SyncError::RateLimited(_)
+        )
+    }
+}
+
+impl From<AuthError> for SyncError {
+    fn from(e: AuthError) -> Self {
+        match e {
+            AuthError::SignInRequired | AuthError::InvalidGrant | AuthError::Unauthorized(_) => {
+                SyncError::SignInRequired
+            }
+            AuthError::Offline(m) => SyncError::Offline(m),
+            AuthError::Server(m) => SyncError::Server(m),
+            AuthError::ServerFull => SyncError::ServerFull("server_full".into()),
+            AuthError::RateLimited => SyncError::RateLimited("rate_limited".into()),
+            AuthError::ClientTooOld => SyncError::ClientTooOld("client_too_old".into()),
+            AuthError::NotSignedIn => SyncError::NotConnected,
+            other => SyncError::Rejected(other.to_string()),
+        }
     }
 }
 
@@ -125,6 +178,35 @@ pub struct Change {
     /// Device that produced this version (contract C3 tie-breaker).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    /// Who made this version (pulled from account spaces; never pushed).
+    /// Kept in the space's `attribution`, not in the entity JSON.
+    #[serde(default, skip_serializing, deserialize_with = "lenient_updated_by")]
+    pub updated_by: Option<Attribution>,
+}
+
+/// `updatedBy` as a user id string or `{id|userId, name}`; anything else
+/// is ignored.
+fn lenient_updated_by<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Attribution>, D::Error> {
+    let v = Value::deserialize(d)?;
+    let s = |o: &serde_json::Map<String, Value>, k: &str| {
+        o.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+    };
+    Ok(match v {
+        Value::String(id) if !id.is_empty() => Some(Attribution {
+            user_id: id,
+            name: String::new(),
+        }),
+        Value::Object(o) => {
+            let id = Some(s(&o, "userId"))
+                .filter(|x| !x.is_empty())
+                .unwrap_or_else(|| s(&o, "id"));
+            let name = s(&o, "name");
+            (!id.is_empty() || !name.is_empty()).then_some(Attribution { user_id: id, name })
+        }
+        _ => None,
+    })
 }
 
 /// One `GET /v1/sync` page. Changes whose `type` this build does not know
@@ -260,6 +342,9 @@ pub struct PushResponse {
     pub results: Vec<PushResult>,
     #[serde(default)]
     pub cursor: u64,
+    /// The server's clock (Unix ms), on account spaces (04 §6.9).
+    #[serde(default)]
+    pub server_time: Option<i64>,
 }
 
 fn lenient_results<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<PushResult>, D::Error> {
@@ -318,6 +403,10 @@ pub struct ShareInfo {
     pub created_at: Option<i64>,
     #[serde(default)]
     pub updated_at: Option<i64>,
+    /// The space the share lives in (account mode; `legacy` for token
+    /// sync). Set by the client, not the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
 }
 
 impl ShareInfo {
@@ -362,16 +451,52 @@ struct ErrorDetail {
     message: String,
 }
 
-/// Typed client for the Worker API.
+/// How a [`SyncClient`] authenticates.
+#[derive(Clone)]
+pub enum ClientAuth {
+    None,
+    /// A legacy workspace token (`rh_…`).
+    Token(String),
+    /// An account session: a 401 refreshes once and retries once.
+    Session(Arc<Session>),
+}
+
+/// Typed client for the sync API of one scope.
 #[derive(Clone)]
 pub struct SyncClient {
     http: reqwest::Client,
     base: String,
-    token: Option<String>,
+    auth: ClientAuth,
+    scope: Scope,
 }
 
 impl SyncClient {
+    /// A token-sync (legacy) client.
     pub fn new(base_url: &str, token: Option<&str>) -> Result<Self, SyncError> {
+        Self::build(
+            base_url,
+            match token {
+                Some(t) => ClientAuth::Token(t.to_string()),
+                None => ClientAuth::None,
+            },
+            Scope::Legacy,
+        )
+    }
+
+    /// A client for the account space `space_id` on `base_url`.
+    pub fn for_space(
+        base_url: &str,
+        space_id: &str,
+        session: Arc<Session>,
+    ) -> Result<Self, SyncError> {
+        Self::build(
+            base_url,
+            ClientAuth::Session(session),
+            Scope::Space(space_id.to_string()),
+        )
+    }
+
+    fn build(base_url: &str, auth: ClientAuth, scope: Scope) -> Result<Self, SyncError> {
         let base = base_url.trim().trim_end_matches('/').to_string();
         if !(base.starts_with("https://") || base.starts_with("http://")) {
             return Err(SyncError::Rejected(
@@ -393,7 +518,8 @@ impl SyncClient {
         Ok(SyncClient {
             http,
             base,
-            token: token.map(str::to_string),
+            auth,
+            scope,
         })
     }
 
@@ -401,9 +527,42 @@ impl SyncClient {
         &self.base
     }
 
-    fn auth(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, SyncError> {
-        let token = self.token.as_deref().ok_or(SyncError::NotConnected)?;
-        Ok(rb.bearer_auth(token))
+    pub fn scope(&self) -> &Scope {
+        &self.scope
+    }
+
+    /// Send an authenticated request built by `build`. With a session, a
+    /// 401 refreshes (single-flight) and retries once; a second 401 means
+    /// the session is gone ([`SyncError::SignInRequired`]).
+    async fn authed<T: serde::de::DeserializeOwned>(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+    ) -> Result<T, SyncError> {
+        match &self.auth {
+            ClientAuth::None => Err(SyncError::NotConnected),
+            ClientAuth::Token(t) => self.send(build().bearer_auth(t)).await,
+            ClientAuth::Session(s) => {
+                let token = s.access_token().await?;
+                match self.send(build().bearer_auth(&token)).await {
+                    Err(SyncError::Unauthorized) => {
+                        let retry = s.refresh_if_current(&token).await?;
+                        match self.send(build().bearer_auth(&retry)).await {
+                            Err(SyncError::Unauthorized) => {
+                                s.mark_sign_in_required();
+                                Err(SyncError::SignInRequired)
+                            }
+                            other => other,
+                        }
+                    }
+                    other => other,
+                }
+            }
+        }
+    }
+
+    /// `/v1/sync` or `/v1/spaces/{id}/sync` (and the same for shares).
+    fn scoped(&self, rest: &str) -> String {
+        format!("{}{}{rest}", self.base, self.scope.prefix())
     }
 
     async fn send<T: serde::de::DeserializeOwned>(
@@ -430,13 +589,21 @@ impl SyncClient {
         let message = parsed
             .map(|b| format!("{}: {}", b.error.code, b.error.message))
             .unwrap_or_else(|| format!("HTTP {status}"));
-        Err(match status {
-            401 => SyncError::Unauthorized,
-            404 => SyncError::NotFound(message),
-            410 => SyncError::Gone(message),
-            413 if code == "quota_exceeded" => SyncError::QuotaExceeded(message),
-            413 => SyncError::TooLarge(message),
-            500..=599 => SyncError::Server(message),
+        Err(match (status, code.as_str()) {
+            (401, _) => SyncError::Unauthorized,
+            (403, "legacy_disabled") => {
+                SyncError::Rejected(crate::spaces::LEGACY_DISABLED_MESSAGE.into())
+            }
+            (403, "not_a_member") | (404, "space_not_found") => SyncError::SpaceGone(message),
+            (403, _) if !code.is_empty() => SyncError::Forbidden(message),
+            (404, _) => SyncError::NotFound(message),
+            (410, _) => SyncError::Gone(message),
+            (413, "quota_exceeded") => SyncError::QuotaExceeded(message),
+            (413, _) => SyncError::TooLarge(message),
+            (426, _) | (_, "client_too_old") => SyncError::ClientTooOld(message),
+            (429, _) => SyncError::RateLimited(message),
+            (507, _) | (_, "server_full") => SyncError::ServerFull(message),
+            (500..=599, _) => SyncError::Server(message),
             _ => SyncError::Rejected(message),
         })
     }
@@ -457,7 +624,7 @@ impl SyncClient {
 
     /// `GET /v1/workspace` (AC-SYNC-1 "Connect" validation).
     pub async fn workspace(&self) -> Result<RemoteWorkspace, SyncError> {
-        self.send(self.auth(self.http.get(self.url("/v1/workspace")))?)
+        self.authed(|| self.http.get(self.url("/v1/workspace")))
             .await
     }
 
@@ -468,15 +635,15 @@ impl SyncClient {
             token: String,
         }
         let t: T = self
-            .send(self.auth(self.http.post(self.url("/v1/workspace/token/rotate")))?)
+            .authed(|| self.http.post(self.url("/v1/workspace/token/rotate")))
             .await?;
         Ok(t.token)
     }
 
-    /// `GET /v1/sync?since=&limit=`.
+    /// `GET /v1/sync?since=&limit=` (or the space's sync route).
     pub async fn pull_page(&self, since: u64) -> Result<PullPage, SyncError> {
-        let url = format!("{}/v1/sync?since={since}&limit={BATCH}", self.base);
-        self.send(self.auth(self.http.get(url))?).await
+        let url = self.scoped(&format!("/sync?since={since}&limit={BATCH}"));
+        self.authed(|| self.http.get(&url)).await
     }
 
     /// Pull every page after `since`: all changes (known and unknown types)
@@ -555,13 +722,12 @@ impl SyncClient {
         }
     }
 
-    /// `POST /v1/sync` for at most [`BATCH`] changes.
+    /// `POST /v1/sync` (or the space's sync route) for at most [`BATCH`]
+    /// changes.
     pub async fn push(&self, changes: &[Change]) -> Result<PushResponse, SyncError> {
-        self.send(
-            self.auth(self.http.post(self.url("/v1/sync")))?
-                .json(&serde_json::json!({ "changes": changes })),
-        )
-        .await
+        let url = self.scoped("/sync");
+        let body = serde_json::json!({ "changes": changes });
+        self.authed(|| self.http.post(&url).json(&body)).await
     }
 
     /// `POST /v1/shares` (AC-SHARE-1).
@@ -571,13 +737,11 @@ impl SyncClient {
         entity_id: &str,
         snapshot: &Value,
     ) -> Result<ShareInfo, SyncError> {
-        let mut info: ShareInfo =
-            self.send(self.auth(self.http.post(self.url("/v1/shares")))?.json(
-                &serde_json::json!({
-                    "kind": kind, "entityId": entity_id, "snapshot": snapshot
-                }),
-            ))
-            .await?;
+        let url = self.scoped("/shares");
+        let body = serde_json::json!({
+            "kind": kind, "entityId": entity_id, "snapshot": snapshot
+        });
+        let mut info: ShareInfo = self.authed(|| self.http.post(&url).json(&body)).await?;
         info.kind.get_or_insert(kind);
         info.entity_id.get_or_insert_with(|| entity_id.to_string());
         info.fill_from_snapshot(snapshot);
@@ -586,9 +750,8 @@ impl SyncClient {
 
     /// `GET /v1/shares` (AC-SHARE-6). Accepts `{shares: [...]}` or `[...]`.
     pub async fn list_shares(&self) -> Result<Vec<ShareInfo>, SyncError> {
-        let v: Value = self
-            .send(self.auth(self.http.get(self.url("/v1/shares")))?)
-            .await?;
+        let url = self.scoped("/shares");
+        let v: Value = self.authed(|| self.http.get(&url)).await?;
         let list = match v {
             Value::Object(mut o) => o.remove("shares").unwrap_or(Value::Array(vec![])),
             other => other,
@@ -602,26 +765,17 @@ impl SyncClient {
         share_id: &str,
         snapshot: &Value,
     ) -> Result<ShareInfo, SyncError> {
-        let mut info: ShareInfo = self
-            .send(
-                self.auth(self.http.put(self.url(&format!("/v1/shares/{share_id}"))))?
-                    .json(&serde_json::json!({ "snapshot": snapshot })),
-            )
-            .await?;
+        let url = self.scoped(&format!("/shares/{share_id}"));
+        let body = serde_json::json!({ "snapshot": snapshot });
+        let mut info: ShareInfo = self.authed(|| self.http.put(&url).json(&body)).await?;
         info.fill_from_snapshot(snapshot);
         Ok(info)
     }
 
     /// `DELETE /v1/shares/:id` (AC-SHARE-4 "Revoke").
     pub async fn revoke_share(&self, share_id: &str) -> Result<(), SyncError> {
-        let _: Value = self
-            .send(
-                self.auth(
-                    self.http
-                        .delete(self.url(&format!("/v1/shares/{share_id}"))),
-                )?,
-            )
-            .await?;
+        let url = self.scoped(&format!("/shares/{share_id}"));
+        let _: Value = self.authed(|| self.http.delete(&url)).await?;
         Ok(())
     }
 
@@ -670,10 +824,25 @@ fn to_value<T: Serialize>(v: &T) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
-/// All local entities as `(type, id, updatedAt, data)`.
-fn local_entities(store: &Store) -> Vec<(EntityType, String, i64, Value)> {
+const LEGACY: &Scope = &Scope::Legacy;
+
+fn st<'a>(store: &'a Store, scope: &Scope) -> &'a SyncState {
+    store.space_state(scope)
+}
+
+fn st_mut<'a>(store: &'a mut Store, scope: &Scope) -> &'a mut SyncState {
+    store.space_state_mut(scope)
+}
+
+/// The local entities `scope` syncs, as `(type, id, updatedAt, data)`: the
+/// projects bound to it with their trees and environments, and the Global
+/// environment when `scope` holds it (B4).
+fn local_entities(store: &Store, scope: &Scope) -> Vec<(EntityType, String, i64, Value)> {
     let mut out = Vec::new();
     for t in store.projects.values() {
+        if !store.in_scope(scope, &t.project.id) {
+            continue;
+        }
         out.push((
             EntityType::Project,
             t.project.id.clone(),
@@ -696,6 +865,9 @@ fn local_entities(store: &Store) -> Vec<(EntityType, String, i64, Value)> {
         }
     }
     for e in &store.environments {
+        if store.scope_of_env(e).as_ref() != Some(scope) {
+            continue;
+        }
         out.push((
             EntityType::Environment,
             e.id.clone(),
@@ -708,8 +880,8 @@ fn local_entities(store: &Store) -> Vec<(EntityType, String, i64, Value)> {
 
 /// An entity from a newer ReqHarbor (AC-FWD-3/4) that is already on the
 /// server: a local version of it is never pushed, only its deletion.
-fn frozen_on_server(store: &Store, t: EntityType, id: &str) -> bool {
-    read_only_entity(store, t, id) && store.sync_state.synced.contains_key(&sync_key(t, id))
+fn frozen_on_server(store: &Store, scope: &Scope, t: EntityType, id: &str) -> bool {
+    read_only_entity(store, t, id) && st(store, scope).synced.contains_key(&sync_key(t, id))
 }
 
 /// A local entity this build cannot edit (a request it can't handle, or any
@@ -732,13 +904,18 @@ pub fn read_only_entity(store: &Store, t: EntityType, id: &str) -> bool {
 }
 
 /// The entity is unchanged since a server restore and only needs re-sending.
-fn is_resend(store: &Store, key: &str, updated_at: i64) -> bool {
-    store.sync_state.resend.get(key) == Some(&updated_at)
+fn is_resend(store: &Store, scope: &Scope, key: &str, updated_at: i64) -> bool {
+    st(store, scope).resend.get(key) == Some(&updated_at)
 }
 
-/// Sync types the server accepts (its `sync.types`, else the base five).
+/// Sync types the token-sync server accepts (its `sync.types`, else the
+/// base five).
 pub fn server_types(store: &Store) -> Vec<String> {
-    match &store.sync_state.server_types {
+    server_types_in(store, LEGACY)
+}
+
+pub fn server_types_in(store: &Store, scope: &Scope) -> Vec<String> {
+    match &st(store, scope).server_types {
         Some(t) => t.clone(),
         None => BASE_SYNC_TYPES.iter().map(|s| s.to_string()).collect(),
     }
@@ -751,19 +928,30 @@ fn type_accepted(types: &[String], t: EntityType) -> bool {
 /// Record a `GET /v1/server` result: `None` (no discovery endpoint) means
 /// the base types.
 pub fn record_server_info(store: &mut Store, info: Option<&ServerInfo>) {
-    store.sync_state.server_types = info
+    record_server_info_in(store, LEGACY, info)
+}
+
+pub fn record_server_info_in(store: &mut Store, scope: &Scope, info: Option<&ServerInfo>) {
+    let state = st_mut(store, scope);
+    state.server_types = info
         .and_then(|i| i.sync.as_ref())
         .and_then(|s| s.types.clone());
-    store.sync_state.server_checked_at = Some(now_ms());
+    state.server_checked_at = Some(now_ms());
 }
 
 /// Whether `GET /v1/server` should be asked (again) before this sync:
 /// never asked, older than [`SERVER_INFO_TTL_MS`], or items are held back
 /// (so the notice clears as soon as the server is updated).
 pub fn server_info_due(store: &Store, now: i64) -> bool {
-    match store.sync_state.server_checked_at {
+    server_info_due_in(store, LEGACY, now)
+}
+
+pub fn server_info_due_in(store: &Store, scope: &Scope, now: i64) -> bool {
+    match st(store, scope).server_checked_at {
         None => true,
-        Some(at) => now - at >= SERVER_INFO_TTL_MS || !unsupported_entities(store).is_empty(),
+        Some(at) => {
+            now - at >= SERVER_INFO_TTL_MS || !unsupported_entities_in(store, scope).is_empty()
+        }
     }
 }
 
@@ -787,11 +975,15 @@ pub async fn refresh_server_info(client: &SyncClient, due: bool) -> Option<Optio
 /// Dirty local entities (and tombstones) of a type the server does not
 /// accept: they stay local-only (06-go-server §9).
 pub fn unsupported_entities(store: &Store) -> Vec<SkippedEntity> {
-    let types = server_types(store);
+    unsupported_entities_in(store, LEGACY)
+}
+
+pub fn unsupported_entities_in(store: &Store, scope: &Scope) -> Vec<SkippedEntity> {
+    let types = server_types_in(store, scope);
     if BASE_SYNC_TYPES.iter().all(|b| types.iter().any(|t| t == b)) {
         return Vec::new();
     }
-    collect_push(store)
+    collect_push_in(store, scope)
         .into_iter()
         .filter(|c| !type_accepted(&types, c.entity_type))
         .map(|c| SkippedEntity {
@@ -819,45 +1011,55 @@ pub fn unsupported_notice(n: usize) -> Option<String> {
 /// [`unsupported_entities`] and stay local-only until the server is
 /// updated).
 pub fn pending_count(store: &Store) -> usize {
-    let types = server_types(store);
-    collect_push(store)
+    pending_count_in(store, LEGACY)
+}
+
+pub fn pending_count_in(store: &Store, scope: &Scope) -> usize {
+    let types = server_types_in(store, scope);
+    collect_push_in(store, scope)
         .iter()
         .filter(|c| type_accepted(&types, c.entity_type))
         .count()
 }
 
-fn is_skipped(store: &Store, key: &str, updated_at: i64) -> bool {
-    store
-        .sync_state
+fn is_skipped(store: &Store, scope: &Scope, key: &str, updated_at: i64) -> bool {
+    st(store, scope)
         .sync_skipped
         .get(key)
         .is_some_and(|m| m.updated_at == updated_at)
 }
 
-/// Local changes not yet on the server: dirty entities + tombstones, each
-/// stamped with this device's id. Entities marked too large are left out
-/// until they change again.
+/// Local changes not yet on the token-sync server.
 pub fn collect_push(store: &Store) -> Vec<Change> {
-    let device = store.sync_state.device_id.clone();
-    let mut changes: Vec<Change> = local_entities(store)
+    collect_push_in(store, LEGACY)
+}
+
+/// Local changes not yet in `scope`: dirty entities + tombstones, each
+/// stamped with this device's id. Entities marked too large are left out
+/// until they change again. In account mode only the projects (and Global)
+/// bound to `scope` are considered, and a scope that may not sync (a paused
+/// binding of another server or account, a shares-only legacy workspace)
+/// sends nothing.
+pub fn collect_push_in(store: &Store, scope: &Scope) -> Vec<Change> {
+    if store.account_mode() && !store.scope_syncable(scope) {
+        return Vec::new();
+    }
+    let device = store.device_id().to_string();
+    let state = st(store, scope);
+    let mut changes: Vec<Change> = local_entities(store, scope)
         .into_iter()
         .filter(|(t, id, updated, _)| {
             let key = sync_key(*t, id);
-            store.sync_state.synced.get(&key) != Some(updated)
-                && !is_skipped(store, &key, *updated)
-                && !frozen_on_server(store, *t, id)
+            state.synced.get(&key) != Some(updated)
+                && !is_skipped(store, scope, &key, *updated)
+                && !frozen_on_server(store, scope, *t, id)
         })
         .map(|(t, id, updated_at, data)| {
             // An entity re-sent after a server restore keeps the device id of
             // the version it is, so the push is idempotent (contract C3).
             let key = sync_key(t, &id);
-            let device_id = if is_resend(store, &key, updated_at) {
-                store
-                    .sync_state
-                    .origins
-                    .get(&key)
-                    .unwrap_or(&device)
-                    .clone()
+            let device_id = if is_resend(store, scope, &key, updated_at) {
+                state.origins.get(&key).unwrap_or(&device).clone()
             } else {
                 device.clone()
             };
@@ -869,12 +1071,13 @@ pub fn collect_push(store: &Store) -> Vec<Change> {
                 data: Some(data),
                 rev: None,
                 device_id: Some(device_id),
+                updated_by: None,
             }
         })
         .collect();
     // Parents first so a partial push never strands children.
     changes.sort_by_key(|c| c.entity_type.depth());
-    for t in &store.sync_state.tombstones {
+    for t in &state.tombstones {
         changes.push(Change {
             entity_type: t.entity_type,
             id: t.id.clone(),
@@ -883,6 +1086,7 @@ pub fn collect_push(store: &Store) -> Vec<Change> {
             data: None,
             rev: None,
             device_id: Some(device.clone()),
+            updated_by: None,
         });
     }
     changes
@@ -902,8 +1106,15 @@ pub struct SkippedEntity {
     pub reason: String,
 }
 
-fn mark_skipped(store: &mut Store, t: EntityType, id: &str, updated_at: i64, reason: &str) {
-    store.sync_state.sync_skipped.insert(
+fn mark_skipped(
+    store: &mut Store,
+    scope: &Scope,
+    t: EntityType,
+    id: &str,
+    updated_at: i64,
+    reason: &str,
+) {
+    st_mut(store, scope).sync_skipped.insert(
         sync_key(t, id),
         crate::storage::SyncSkipped {
             updated_at,
@@ -912,11 +1123,14 @@ fn mark_skipped(store: &mut Store, t: EntityType, id: &str, updated_at: i64, rea
     );
 }
 
-/// Entities currently excluded from sync (their skipped version is still
-/// the local one). Stale marks are pruned.
+/// Entities currently excluded from token sync (their skipped version is
+/// still the local one). Stale marks are pruned.
 pub fn skipped_entities(store: &mut Store) -> Vec<SkippedEntity> {
-    let marks: Vec<(String, crate::storage::SyncSkipped)> = store
-        .sync_state
+    skipped_entities_in(store, LEGACY)
+}
+
+pub fn skipped_entities_in(store: &mut Store, scope: &Scope) -> Vec<SkippedEntity> {
+    let marks: Vec<(String, crate::storage::SyncSkipped)> = st(store, scope)
         .sync_skipped
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -924,7 +1138,7 @@ pub fn skipped_entities(store: &mut Store) -> Vec<SkippedEntity> {
     let mut out = Vec::new();
     for (key, mark) in marks {
         let Some((t, id)) = parse_sync_key(&key) else {
-            store.sync_state.sync_skipped.remove(&key);
+            st_mut(store, scope).sync_skipped.remove(&key);
             continue;
         };
         match local_meta(store, t, id) {
@@ -935,7 +1149,7 @@ pub fn skipped_entities(store: &mut Store) -> Vec<SkippedEntity> {
                 reason: mark.reason.clone(),
             }),
             _ => {
-                store.sync_state.sync_skipped.remove(&key);
+                st_mut(store, scope).sync_skipped.remove(&key);
             }
         }
     }
@@ -963,14 +1177,18 @@ fn change_size(c: &Change) -> usize {
 /// skipped (never sent), and split the rest into batches of at most
 /// [`BATCH`] changes and [`MAX_PUSH_BYTES`] bytes (contracts C1, C2).
 pub fn plan_push(store: &mut Store) -> Vec<Vec<Change>> {
+    plan_push_in(store, LEGACY)
+}
+
+pub fn plan_push_in(store: &mut Store, scope: &Scope) -> Vec<Vec<Change>> {
     let mut sendable = Vec::new();
-    let types = server_types(store);
-    for c in collect_push(store) {
+    let types = server_types_in(store, scope);
+    for c in collect_push_in(store, scope) {
         if !type_accepted(&types, c.entity_type) {
             continue; // local-only until the server accepts the type
         }
         if !c.deleted && data_size(&c) > MAX_ENTITY_BYTES {
-            mark_skipped(store, c.entity_type, &c.id, c.updated_at, TOO_LARGE);
+            mark_skipped(store, scope, c.entity_type, &c.id, c.updated_at, TOO_LARGE);
         } else {
             sendable.push(c);
         }
@@ -999,6 +1217,15 @@ pub fn batch_changes(changes: Vec<Change>, max_count: usize, max_bytes: usize) -
     batches
 }
 
+/// One pushed (sub-)batch with the server's answer.
+#[derive(Debug, Clone)]
+pub struct Pushed {
+    pub sent: Vec<Change>,
+    pub results: Vec<PushResult>,
+    /// `serverTime` of the response (account spaces).
+    pub server_time: Option<i64>,
+}
+
 /// Push one batch; on a whole-body 413 split it in halves and retry. A
 /// single change that is still too large is reported as rejected
 /// (`entity_too_large`) instead of failing the sync (contract C2).
@@ -1006,6 +1233,18 @@ pub async fn push_batch(
     client: &SyncClient,
     batch: Vec<Change>,
 ) -> Result<Vec<(Vec<Change>, Vec<PushResult>)>, SyncError> {
+    Ok(push_batch_timed(client, batch)
+        .await?
+        .into_iter()
+        .map(|p| (p.sent, p.results))
+        .collect())
+}
+
+/// [`push_batch`], keeping each response's `serverTime`.
+pub async fn push_batch_timed(
+    client: &SyncClient,
+    batch: Vec<Change>,
+) -> Result<Vec<Pushed>, SyncError> {
     let mut out = Vec::new();
     let mut queue = vec![batch];
     while let Some(b) = queue.pop() {
@@ -1013,7 +1252,11 @@ pub async fn push_batch(
             continue;
         }
         match client.push(&b).await {
-            Ok(resp) => out.push((b, resp.results)),
+            Ok(resp) => out.push(Pushed {
+                sent: b,
+                results: resp.results,
+                server_time: resp.server_time,
+            }),
             Err(SyncError::TooLarge(_)) if b.len() > 1 => {
                 let mut first = b;
                 let second = first.split_off(first.len() / 2);
@@ -1031,7 +1274,11 @@ pub async fn push_batch(
                         reason: Some("entity_too_large".into()),
                     })
                     .collect();
-                out.push((b, results));
+                out.push(Pushed {
+                    sent: b,
+                    results,
+                    server_time: None,
+                });
             }
             Err(e) => return Err(e),
         }
@@ -1048,7 +1295,8 @@ pub struct PushApplied {
     pub rejected: usize,
     /// Changes rejected with `unsupported_type`: they stay dirty and local.
     pub unsupported: usize,
-    /// Changes rejected with `clock_skew`: they stay dirty (M1 restamps).
+    /// Changes rejected with `clock_skew`: they stay dirty (and are
+    /// restamped once the clock is fixed, 04 §6.9).
     pub clock_skew: usize,
     /// Results with a status this build doesn't know: left dirty.
     pub unknown: usize,
@@ -1084,7 +1332,21 @@ pub fn apply_push_results_detailed(
     pushed: &[Change],
     results: &[PushResult],
 ) -> PushApplied {
+    apply_push_results_in(store, LEGACY, pushed, results, None)
+}
+
+/// [`apply_push_results`] for `scope`, with the response's `serverTime`
+/// (account spaces record it for the clock-skew restamp, 04 §6.9).
+pub fn apply_push_results_in(
+    store: &mut Store,
+    scope: &Scope,
+    pushed: &[Change],
+    results: &[PushResult],
+    server_time: Option<i64>,
+) -> PushApplied {
     let mut out = PushApplied::default();
+    let now = now_ms();
+    store.record_server_time(scope, server_time, now);
     for r in results {
         let Some(change) = pushed
             .iter()
@@ -1096,43 +1358,59 @@ pub fn apply_push_results_detailed(
         if r.status == PushStatus::Rejected && r.reason.as_deref() == Some(UNSUPPORTED_TYPE) {
             // The server changed since discovery: keep it local, stop sending
             // the type and ask `GET /v1/server` again on the next run.
-            let mut types = server_types(store);
+            let mut types = server_types_in(store, scope);
             types.retain(|t| t != change.entity_type.as_str());
-            store.sync_state.server_types = Some(types);
-            store.sync_state.server_checked_at = None;
+            let state = st_mut(store, scope);
+            state.server_types = Some(types);
+            state.server_checked_at = None;
             out.unsupported += 1;
             continue;
         }
         match (change.deleted, r.status) {
             (true, PushStatus::Applied | PushStatus::Stale) => {
-                store
-                    .sync_state
+                let state = st_mut(store, scope);
+                state
                     .tombstones
                     .retain(|t| !(t.id == change.id && t.entity_type == change.entity_type));
-                store.sync_state.synced.remove(&key);
-                store.sync_state.origins.remove(&key);
+                state.synced.remove(&key);
+                state.origins.remove(&key);
             }
             // Kept: the server still has the entity, so the delete is
             // pending until the server accepts it.
             (true, PushStatus::Rejected | PushStatus::Unknown) => {}
             (false, PushStatus::Applied) => {
-                store
-                    .sync_state
-                    .synced
-                    .insert(key.clone(), change.updated_at);
-                if !is_resend(store, &key, change.updated_at) {
-                    store.sync_state.origins.remove(&key);
+                let resend = is_resend(store, scope, &key, change.updated_at);
+                let state = st_mut(store, scope);
+                state.synced.insert(key.clone(), change.updated_at);
+                if !resend {
+                    state.origins.remove(&key);
                 }
-                store.sync_state.resend.remove(&key);
-                store.sync_state.sync_skipped.remove(&key);
+                state.resend.remove(&key);
+                state.sync_skipped.remove(&key);
+                if store.account_mode() {
+                    store.space_sync_mut(scope).skewed.remove(&key);
+                }
             }
             (false, PushStatus::Rejected) if r.reason.as_deref() == Some(CLOCK_SKEW) => {
-                // Left dirty for the M1 restamp (04 §6.9), never skipped.
+                // Left dirty and remembered for the restamp (04 §6.9).
                 out.clock_skew += 1;
+                if store.account_mode() {
+                    let ss = store.space_sync_mut(scope);
+                    ss.skewed.insert(key.clone(), change.updated_at);
+                    // How far this device's clock (or the stamp) is ahead.
+                    let ahead = server_time
+                        .map(|t| (now - t).max(change.updated_at - t))
+                        .unwrap_or(0);
+                    ss.issue = Some(SpaceIssue::new(
+                        "clockSkew",
+                        crate::spaces::clock_skew_message(ahead),
+                    ));
+                }
             }
             (false, PushStatus::Rejected) => {
                 mark_skipped(
                     store,
+                    scope,
                     change.entity_type,
                     &change.id,
                     change.updated_at,
@@ -1172,6 +1450,11 @@ pub struct PullReport {
     pub unknown: usize,
     /// The server was restored from a backup; everything is being re-sent.
     pub restored: bool,
+    /// Pulled changes ignored because the entity (or its parent) belongs to
+    /// another space or to this device only (B2/B3/B5).
+    pub foreign: usize,
+    /// Deletes held back because another space's pull failed (B7).
+    pub deferred: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -1214,6 +1497,72 @@ fn local_meta(store: &Store, t: EntityType, id: &str) -> Option<(i64, String)> {
     }
 }
 
+/// The scope a local entity currently syncs with (`None`: missing, or this
+/// device only).
+fn scope_of_local(store: &Store, t: EntityType, id: &str) -> Option<Scope> {
+    use crate::storage::NodeKind;
+    match t {
+        EntityType::Project => store
+            .projects
+            .contains_key(id)
+            .then(|| store.scope_of_project(id))
+            .flatten(),
+        EntityType::Collection => store
+            .project_of(NodeKind::Collection, id)
+            .ok()
+            .and_then(|p| store.scope_of_project(&p)),
+        EntityType::Folder => store
+            .project_of(NodeKind::Folder, id)
+            .ok()
+            .and_then(|p| store.scope_of_project(&p)),
+        EntityType::Request => store
+            .project_of(NodeKind::Request, id)
+            .ok()
+            .and_then(|p| store.scope_of_project(&p)),
+        EntityType::Environment => store.environment(id).and_then(|e| store.scope_of_env(e)),
+    }
+}
+
+/// Whether `change` (an upsert pulled from `scope`) may be applied (B2–B4):
+/// the parent named in the incoming data is bound to `scope`, and an entity
+/// that already exists here is bound to `scope` too. A project unknown here
+/// is accepted (it is new to this device and binds to `scope`), unless this
+/// device bound that id elsewhere.
+fn accepts_upsert(store: &Store, scope: &Scope, change: &Change) -> bool {
+    use crate::storage::NodeKind;
+    if !store.account_mode() {
+        return true;
+    }
+    let data = change.data.as_ref();
+    let field = |k: &str| data.and_then(|d| d.get(k)).and_then(Value::as_str);
+    let parent_ok = |pid: Option<String>| pid.is_some_and(|p| store.in_scope(scope, &p));
+    let existing_ok = || match local_meta(store, change.entity_type, &change.id) {
+        None => true,
+        Some(_) => scope_of_local(store, change.entity_type, &change.id).as_ref() == Some(scope),
+    };
+    match change.entity_type {
+        EntityType::Project => match store.bindings.project_spaces.get(&change.id) {
+            Some(s) => Scope::from_id(s) == *scope,
+            None => !store.projects.contains_key(&change.id),
+        },
+        EntityType::Collection => {
+            parent_ok(field("projectId").map(str::to_string)) && existing_ok()
+        }
+        EntityType::Folder | EntityType::Request => {
+            let pid =
+                field("collectionId").and_then(|c| store.project_of(NodeKind::Collection, c).ok());
+            parent_ok(pid) && existing_ok()
+        }
+        EntityType::Environment => {
+            let parent = match field("projectId") {
+                Some(p) => store.in_scope(scope, p),
+                None => store.global_in_scope(scope),
+            };
+            parent && existing_ok()
+        }
+    }
+}
+
 /// Keep the losing local version as "<name> (conflict)" (AC-SYNC-4).
 fn conflict_copy(store: &mut Store, t: EntityType, id: &str) -> Option<String> {
     if read_only_entity(store, t, id) {
@@ -1233,6 +1582,10 @@ fn conflict_copy(store: &mut Store, t: EntityType, id: &str) -> Option<String> {
                 ..src
             };
             store.projects.insert(copy_id.clone(), ProjectTree::new(p));
+            // The copy syncs where the original does.
+            if let Some(space) = store.bindings.project_spaces.get(id).cloned() {
+                store.bindings.project_spaces.insert(copy_id.clone(), space);
+            }
         }
         EntityType::Collection => {
             let pid = store
@@ -1299,6 +1652,7 @@ fn remove_local(store: &mut Store, t: EntityType, id: &str) -> Vec<(EntityType, 
     match t {
         EntityType::Project => {
             if let Some(tree) = store.forget_project(id) {
+                store.bindings.project_spaces.remove(id);
                 removed.push((EntityType::Project, id.to_string()));
                 removed.extend(
                     tree.collections
@@ -1389,21 +1743,39 @@ fn remove_local(store: &mut Store, t: EntityType, id: &str) -> Vec<(EntityType, 
     removed
 }
 
-/// Insert or replace an entity from remote data. Returns false when the
-/// parent is missing (orphan) or the data is malformed.
-fn upsert_remote(store: &mut Store, change: &Change) -> Result<(), String> {
+/// Insert or replace an entity from remote data, within `scope`'s projects
+/// only (the entity is never relocated out of another space's project, 04
+/// §1.3). Returns an error when the parent is missing (orphan) or the data
+/// is malformed.
+fn upsert_remote(store: &mut Store, scope: &Scope, change: &Change) -> Result<(), String> {
     let data = change.data.clone().ok_or("missing data")?;
     let ws_id = store.workspace.id.clone();
     let err = |e: serde_json::Error| format!("malformed {}: {e}", change.entity_type.as_str());
+    // Project ids of `scope` (every project in pure-legacy mode).
+    let in_scope: std::collections::BTreeSet<String> = store
+        .projects
+        .keys()
+        .filter(|p| store.in_scope(scope, p))
+        .cloned()
+        .collect();
     match change.entity_type {
         EntityType::Project => {
             let mut p: Project = serde_json::from_value(data).map_err(err)?;
             p.workspace_id = ws_id;
             p.updated_at = change.updated_at;
+            let id = p.id.clone();
             match store.projects.get_mut(&p.id) {
                 Some(t) => t.project = p,
                 None => {
                     store.projects.insert(p.id.clone(), ProjectTree::new(p));
+                    store.removed_projects.remove(&id);
+                    // B1: a project new to this device binds to its space.
+                    if store.account_mode() {
+                        store
+                            .bindings
+                            .project_spaces
+                            .insert(id, scope.id().to_string());
+                    }
                 }
             }
         }
@@ -1413,8 +1785,10 @@ fn upsert_remote(store: &mut Store, change: &Change) -> Result<(), String> {
             if !store.projects.contains_key(&c.project_id) {
                 return Err(format!("collection {} has no project", c.id));
             }
-            for t in store.projects.values_mut() {
-                t.collections.retain(|x| x.id != c.id);
+            for (pid, t) in store.projects.iter_mut() {
+                if in_scope.contains(pid) {
+                    t.collections.retain(|x| x.id != c.id);
+                }
             }
             if let Some(t) = store.projects.get_mut(&c.project_id) {
                 t.collections.push(c);
@@ -1426,8 +1800,10 @@ fn upsert_remote(store: &mut Store, change: &Change) -> Result<(), String> {
             let pid = store
                 .project_of(crate::storage::NodeKind::Collection, &f.collection_id)
                 .map_err(|_| format!("folder {} has no collection", f.id))?;
-            for t in store.projects.values_mut() {
-                t.folders.retain(|x| x.id != f.id);
+            for (p, t) in store.projects.iter_mut() {
+                if in_scope.contains(p) {
+                    t.folders.retain(|x| x.id != f.id);
+                }
             }
             if let Some(t) = store.projects.get_mut(&pid) {
                 t.folders.push(f);
@@ -1439,8 +1815,10 @@ fn upsert_remote(store: &mut Store, change: &Change) -> Result<(), String> {
             let pid = store
                 .project_of(crate::storage::NodeKind::Collection, &r.collection_id)
                 .map_err(|_| format!("request {} has no collection", r.id))?;
-            for t in store.projects.values_mut() {
-                t.requests.retain(|x| x.id != r.id);
+            for (p, t) in store.projects.iter_mut() {
+                if in_scope.contains(p) {
+                    t.requests.retain(|x| x.id != r.id);
+                }
             }
             if let Some(t) = store.projects.get_mut(&pid) {
                 t.requests.push(r);
@@ -1483,8 +1861,7 @@ fn upsert_remote(store: &mut Store, change: &Change) -> Result<(), String> {
                 // One Global per workspace: adopt the remote one, keeping
                 // local-only variables of an unsynced local Global.
                 if let Some(local) = local.filter(|l| l.id != e.id) {
-                    let was_synced = store
-                        .sync_state
+                    let was_synced = st(store, scope)
                         .synced
                         .contains_key(&sync_key(EntityType::Environment, &local.id));
                     if !was_synced {
@@ -1511,9 +1888,32 @@ fn upsert_remote(store: &mut Store, change: &Change) -> Result<(), String> {
     Ok(())
 }
 
-/// Apply pulled changes (parents first) with LWW + conflict copies.
-pub fn apply_pull(store: &mut Store, mut changes: Vec<Change>, cursor: u64) -> PullReport {
+/// How [`apply_pull_in`] treats one pull.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PullOptions {
+    /// Another active space failed this run (B7): apply upserts only and
+    /// keep the old cursor when the pull held deletes, so they are pulled
+    /// again (after [`MAX_DEFERRED_RUNS`] such runs they apply anyway).
+    pub defer_deletes: bool,
+}
+
+/// Apply pulled token-sync changes (parents first) with LWW + conflict
+/// copies.
+pub fn apply_pull(store: &mut Store, changes: Vec<Change>, cursor: u64) -> PullReport {
+    apply_pull_in(store, LEGACY, changes, cursor, PullOptions::default())
+}
+
+/// Apply changes pulled from `scope` (B2–B5 and B7 in account mode).
+pub fn apply_pull_in(
+    store: &mut Store,
+    scope: &Scope,
+    mut changes: Vec<Change>,
+    cursor: u64,
+    opts: PullOptions,
+) -> PullReport {
     let mut report = PullReport::default();
+    let account = store.account_mode();
+    let first_pull = st(store, scope).last_sync_at.is_none();
     // Latest change per entity wins within a batch.
     changes.sort_by_key(|c| c.rev.unwrap_or(0));
     let mut latest: Vec<Change> = Vec::new();
@@ -1527,22 +1927,31 @@ pub fn apply_pull(store: &mut Store, mut changes: Vec<Change>, cursor: u64) -> P
     deletes.sort_by_key(|c| std::cmp::Reverse(c.entity_type.depth()));
     let had_remote_projects = upserts.iter().any(|c| c.entity_type == EntityType::Project);
 
-    let my_device = store.sync_state.device_id.clone();
+    let my_device = store.device_id().to_string();
     for change in &upserts {
         let key = sync_key(change.entity_type, &change.id);
-        let synced_at = store.sync_state.synced.get(&key).copied();
+        if !accepts_upsert(store, scope, change) {
+            report.foreign += 1;
+            continue;
+        }
+        if account && let Some(by) = &change.updated_by {
+            store
+                .space_sync_mut(scope)
+                .attribution
+                .insert(key.clone(), by.clone());
+        }
+        let synced_at = st(store, scope).synced.get(&key).copied();
         let remote_device = change.device_id.clone().unwrap_or_default();
         match local_meta(store, change.entity_type, &change.id) {
             Some((local_updated, _)) => {
-                let resend = is_resend(store, &key, local_updated);
+                let resend = is_resend(store, scope, &key, local_updated);
                 let dirty = synced_at != Some(local_updated)
                     && !resend
                     && !read_only_entity(store, change.entity_type, &change.id);
                 let local_device = if dirty {
                     my_device.clone()
                 } else {
-                    store
-                        .sync_state
+                    st(store, scope)
                         .origins
                         .get(&key)
                         .cloned()
@@ -1552,17 +1961,26 @@ pub fn apply_pull(store: &mut Store, mut changes: Vec<Change>, cursor: u64) -> P
                 let order = (change.updated_at, remote_device.as_str())
                     .cmp(&(local_updated, local_device.as_str()));
                 if order == std::cmp::Ordering::Equal {
-                    store
-                        .sync_state
-                        .synced
-                        .insert(key.clone(), change.updated_at);
-                    store.sync_state.resend.remove(&key);
+                    let state = st_mut(store, scope);
+                    state.synced.insert(key.clone(), change.updated_at);
+                    state.resend.remove(&key);
                     continue; // same version
                 }
-                if (dirty || resend) && order == std::cmp::Ordering::Less {
+                // A local edit stamped by a clock that ran ahead, while the
+                // server's version changed: never let the future timestamp
+                // win. The remote version is applied and ours becomes a
+                // conflict copy (06 §9 "restamp versus conflict copy").
+                let skewed = account
+                    && dirty
+                    && store.space_sync(scope).skewed.contains_key(&key)
+                    && synced_at != Some(change.updated_at);
+                if !skewed && (dirty || resend) && order == std::cmp::Ordering::Less {
                     // A local edit wins, or the restored server lost our
                     // newer version: keep it, it will be pushed.
                     continue;
+                }
+                if skewed {
+                    store.space_sync_mut(scope).skewed.remove(&key);
                 }
                 if dirty && let Some(copy_id) = conflict_copy(store, change.entity_type, &change.id)
                 {
@@ -1578,8 +1996,7 @@ pub fn apply_pull(store: &mut Store, mut changes: Vec<Change>, cursor: u64) -> P
                 }
             }
             None => {
-                if let Some(t) = store
-                    .sync_state
+                if let Some(t) = st(store, scope)
                     .tombstones
                     .iter()
                     .find(|t| t.id == change.id && t.entity_type == change.entity_type)
@@ -1590,44 +2007,57 @@ pub fn apply_pull(store: &mut Store, mut changes: Vec<Change>, cursor: u64) -> P
                         continue; // our delete is newer
                     }
                     let id = change.id.clone();
-                    store.sync_state.tombstones.retain(|t| t.id != id);
+                    st_mut(store, scope).tombstones.retain(|t| t.id != id);
                 }
             }
         }
-        match upsert_remote(store, change) {
+        match upsert_remote(store, scope, change) {
             Ok(()) => {
                 // Merged Globals carry a fresh local updatedAt and stay dirty.
                 let stored = local_meta(store, change.entity_type, &change.id).map(|m| m.0);
+                let state = st_mut(store, scope);
                 if stored == Some(change.updated_at) {
-                    store
-                        .sync_state
-                        .synced
-                        .insert(key.clone(), change.updated_at);
+                    state.synced.insert(key.clone(), change.updated_at);
                     if remote_device.is_empty() || remote_device == my_device {
-                        store.sync_state.origins.remove(&key);
+                        state.origins.remove(&key);
                     } else {
-                        store
-                            .sync_state
-                            .origins
-                            .insert(key.clone(), remote_device.clone());
+                        state.origins.insert(key.clone(), remote_device.clone());
                     }
                 }
-                store.sync_state.sync_skipped.remove(&key);
-                store.sync_state.resend.remove(&key);
+                state.sync_skipped.remove(&key);
+                state.resend.remove(&key);
                 report.applied += 1;
             }
             Err(e) => report.skipped.push(e),
         }
     }
 
+    // B7: hold deletes back while another space failed this run.
+    let defer = opts.defer_deletes
+        && !deletes.is_empty()
+        && (!account || store.space_sync(scope).deferred_runs < MAX_DEFERRED_RUNS);
+    if defer {
+        report.deferred = deletes.len();
+        deletes.clear();
+    }
     for change in &deletes {
         let key = sync_key(change.entity_type, &change.id);
         let Some((local_updated, _)) = local_meta(store, change.entity_type, &change.id) else {
-            store.sync_state.synced.remove(&key);
-            store.sync_state.tombstones.retain(|t| t.id != change.id);
+            let state = st_mut(store, scope);
+            state.synced.remove(&key);
+            state.tombstones.retain(|t| t.id != change.id);
             continue;
         };
-        let dirty = store.sync_state.synced.get(&key) != Some(&local_updated)
+        // B5: a pulled tombstone only touches this space's entities.
+        if account && scope_of_local(store, change.entity_type, &change.id).as_ref() != Some(scope)
+        {
+            let state = st_mut(store, scope);
+            state.synced.remove(&key);
+            state.tombstones.retain(|t| t.id != change.id);
+            report.foreign += 1;
+            continue;
+        }
+        let dirty = st(store, scope).synced.get(&key) != Some(&local_updated)
             && !read_only_entity(store, change.entity_type, &change.id);
         let remote_device = change.device_id.clone().unwrap_or_default();
         if dirty
@@ -1637,48 +2067,70 @@ pub fn apply_pull(store: &mut Store, mut changes: Vec<Change>, cursor: u64) -> P
         }
         for (t, id) in remove_local(store, change.entity_type, &change.id) {
             let k = sync_key(t, &id);
-            store.sync_state.synced.remove(&k);
-            store.sync_state.origins.remove(&k);
-            store.sync_state.sync_skipped.remove(&k);
-            store.sync_state.resend.remove(&k);
-            store.sync_state.tombstones.retain(|x| x.id != id);
+            let state = st_mut(store, scope);
+            state.synced.remove(&k);
+            state.origins.remove(&k);
+            state.sync_skipped.remove(&k);
+            state.resend.remove(&k);
+            state.tombstones.retain(|x| x.id != id);
+            if account {
+                store.space_sync_mut(scope).attribution.remove(&k);
+            }
         }
         report.deleted += 1;
     }
 
     // A fresh device connecting to an existing workspace: drop its empty,
-    // never-synced "Default" project in favour of the pulled ones.
-    if had_remote_projects {
+    // never-synced "Default" project in favour of the pulled ones. In
+    // account mode only on the first pull of Personal or a legacy space,
+    // and only for a Default that is unbound or bound to this space.
+    let personal_like = !account
+        || *scope == Scope::Legacy
+        || store
+            .binding(scope.id())
+            .is_some_and(|b| b.kind == crate::spaces::SpaceKind::Personal);
+    if had_remote_projects && personal_like && (!account || first_pull) {
         let empties: Vec<String> = store
             .projects
             .values()
             .filter(|t| {
                 t.collections.is_empty()
                     && t.project.name == "Default"
-                    && !store
-                        .sync_state
+                    && !st(store, scope)
                         .synced
                         .contains_key(&sync_key(EntityType::Project, &t.project.id))
                     && !store
                         .environments
                         .iter()
                         .any(|e| e.project_id.as_deref() == Some(t.project.id.as_str()))
+                    && (!account
+                        || match store.bindings.project_spaces.get(&t.project.id) {
+                            None => true,
+                            Some(s) => Scope::from_id(s) == *scope,
+                        })
             })
             .map(|t| t.project.id.clone())
             .collect();
         if empties.len() < store.projects.len() {
             for id in empties {
                 store.forget_project(&id);
+                store.bindings.project_spaces.remove(&id);
             }
         }
     }
 
     // Restore detection ran before this (see `SyncClient::pull_since`), so
-    // the server's cursor is taken as is, even when it went down.
-    if let Some(sync) = store.workspace.sync.as_mut() {
-        sync.cursor = cursor;
+    // the server's cursor is taken as is, even when it went down. Deferred
+    // deletes keep the old cursor so they are pulled again.
+    if !defer {
+        store.set_scope_cursor(scope, cursor);
     }
-    store.sync_state.last_sync_at = Some(now_ms());
+    if account {
+        let ss = store.space_sync_mut(scope);
+        ss.deferred_runs = if defer { ss.deferred_runs + 1 } else { 0 };
+        ss.foreign += report.foreign as u64;
+    }
+    st_mut(store, scope).last_sync_at = Some(now_ms());
     report
 }
 
@@ -1686,6 +2138,10 @@ pub fn apply_pull(store: &mut Store, mut changes: Vec<Change>, cursor: u64) -> P
 /// per `(type, id)`, so a newer build can apply them later. Returns how many
 /// were remembered.
 pub fn remember_unknown(store: &mut Store, unknown: Vec<Value>) -> usize {
+    remember_unknown_in(store, LEGACY, unknown)
+}
+
+pub fn remember_unknown_in(store: &mut Store, scope: &Scope, unknown: Vec<Value>) -> usize {
     let n = unknown.len();
     if n == 0 {
         return 0;
@@ -1695,7 +2151,8 @@ pub fn remember_unknown(store: &mut Store, unknown: Vec<Value>) -> usize {
         (s("type"), s("id"))
     };
     let rev = |x: &Value| x.get("rev").and_then(Value::as_u64).unwrap_or(0);
-    let list = std::mem::take(&mut store.sync_state.unknown_changes);
+    let state = st_mut(store, scope);
+    let list = std::mem::take(&mut state.unknown_changes);
     let mut slots: Vec<Option<Value>> = list.into_iter().map(Some).collect();
     let mut index: std::collections::HashMap<(String, String), usize> = slots
         .iter()
@@ -1713,16 +2170,16 @@ pub fn remember_unknown(store: &mut Store, unknown: Vec<Value>) -> usize {
         index.insert(id, slots.len());
         slots.push(Some(v));
     }
-    store.sync_state.unknown_changes = slots.into_iter().flatten().collect();
-    cap_unknown(store);
+    state.unknown_changes = slots.into_iter().flatten().collect();
+    cap_unknown(state);
     n
 }
 
 /// Keep [`SyncState::unknown_changes`] within [`MAX_UNKNOWN_CHANGES`] and
 /// [`MAX_UNKNOWN_BYTES`], dropping the oldest (lowest `rev`) first and
 /// noting that something was dropped.
-fn cap_unknown(store: &mut Store) {
-    let list = &mut store.sync_state.unknown_changes;
+fn cap_unknown(state: &mut SyncState) {
+    let list = &mut state.unknown_changes;
     let size = |v: &Value| serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0);
     let mut bytes: usize = list.iter().map(size).sum();
     if list.len() <= MAX_UNKNOWN_CHANGES && bytes <= MAX_UNKNOWN_BYTES {
@@ -1737,7 +2194,7 @@ fn cap_unknown(store: &mut Store) {
         drop += 1;
     }
     list.drain(..drop);
-    store.sync_state.unknown_changes_truncated = true;
+    state.unknown_changes_truncated = true;
 }
 
 /// The server was restored from a backup (06-go-server §9): forget what it
@@ -1746,34 +2203,47 @@ fn cap_unknown(store: &mut Store) {
 /// conflict and an older one never overwrites them. LWW keeps this
 /// idempotent.
 pub fn mark_restored(store: &mut Store) {
-    let clean: Vec<(String, i64)> = local_entities(store)
+    mark_restored_in(store, LEGACY)
+}
+
+/// [`mark_restored`] for every entity bound to `scope`.
+pub fn mark_restored_in(store: &mut Store, scope: &Scope) {
+    let state = st(store, scope);
+    let clean: Vec<(String, i64)> = local_entities(store, scope)
         .into_iter()
         .map(|(t, id, updated, _)| (sync_key(t, &id), updated))
         .filter(|(key, updated)| {
-            store.sync_state.synced.get(key) == Some(updated)
-                || store.sync_state.resend.get(key) == Some(updated)
+            state.synced.get(key) == Some(updated) || state.resend.get(key) == Some(updated)
         })
         .collect();
-    store.sync_state.resend = clean.into_iter().collect();
-    store.sync_state.synced.clear();
-    store.sync_state.unknown_changes.clear();
-    store.sync_state.unknown_changes_truncated = false;
-    if let Some(sync) = store.workspace.sync.as_mut() {
-        sync.cursor = 0;
-    }
+    let state = st_mut(store, scope);
+    state.resend = clean.into_iter().collect();
+    state.synced.clear();
+    state.unknown_changes.clear();
+    state.unknown_changes_truncated = false;
+    store.set_scope_cursor(scope, 0);
 }
 
 /// [`mark_restored`] when the server was restored, the epoch, then
 /// [`remember_unknown`] and [`apply_pull`] for one pull.
 pub fn apply_pulled(store: &mut Store, pulled: Pulled) -> PullReport {
+    apply_pulled_in(store, LEGACY, pulled, PullOptions::default())
+}
+
+pub fn apply_pulled_in(
+    store: &mut Store,
+    scope: &Scope,
+    pulled: Pulled,
+    opts: PullOptions,
+) -> PullReport {
     if pulled.restored {
-        mark_restored(store);
+        mark_restored_in(store, scope);
     }
     if let Some(e) = pulled.sync_epoch.filter(|e| !e.is_empty()) {
-        store.sync_state.sync_epoch = Some(e);
+        st_mut(store, scope).sync_epoch = Some(e);
     }
-    let unknown = remember_unknown(store, pulled.unknown);
-    let mut report = apply_pull(store, pulled.changes, pulled.cursor);
+    let unknown = remember_unknown_in(store, scope, pulled.unknown);
+    let mut report = apply_pull_in(store, scope, pulled.changes, pulled.cursor, opts);
     report.unknown = unknown;
     report.restored = pulled.restored;
     report
@@ -1787,15 +2257,14 @@ pub struct PullStart {
 }
 
 pub fn pull_start(store: &Store) -> Result<PullStart, SyncError> {
-    let since = store
-        .workspace
-        .sync
-        .as_ref()
-        .map(|s| s.cursor)
-        .ok_or(SyncError::NotConnected)?;
+    pull_start_in(store, LEGACY)
+}
+
+pub fn pull_start_in(store: &Store, scope: &Scope) -> Result<PullStart, SyncError> {
+    let since = store.scope_cursor(scope).ok_or(SyncError::NotConnected)?;
     Ok(PullStart {
         since,
-        epoch: store.sync_state.sync_epoch.clone(),
+        epoch: st(store, scope).sync_epoch.clone(),
     })
 }
 
@@ -1827,10 +2296,20 @@ pub async fn pull_from(
 /// Push everything dirty (of a type the server accepts) in batches of
 /// [`BATCH`].
 pub async fn push_all(client: &SyncClient, store: &mut Store) -> Result<usize, SyncError> {
+    let scope = client.scope().clone();
+    push_all_in(client, store, &scope).await
+}
+
+pub async fn push_all_in(
+    client: &SyncClient,
+    store: &mut Store,
+    scope: &Scope,
+) -> Result<usize, SyncError> {
     let mut applied = 0;
-    for batch in plan_push(store) {
-        for (sent, results) in push_batch(client, batch).await? {
-            applied += apply_push_results(store, &sent, &results);
+    for batch in plan_push_in(store, scope) {
+        for p in push_batch_timed(client, batch).await? {
+            applied +=
+                apply_push_results_in(store, scope, &p.sent, &p.results, p.server_time).applied;
         }
     }
     store.save_sync_state()?;
@@ -1847,37 +2326,41 @@ async fn pull_with_info(
     store: &mut Store,
     server: Option<&ServerInfo>,
 ) -> Result<PullReport, SyncError> {
-    let start = pull_start(store)?;
+    let scope = client.scope().clone();
+    let start = pull_start_in(store, &scope)?;
     let pulled = pull_from(client, &start, server).await?;
-    let report = apply_pulled(store, pulled);
+    let report = apply_pulled_in(store, &scope, pulled, PullOptions::default());
     store.save_all()?;
     Ok(report)
 }
 
-/// Full cycle: discovery (when due), pull (LWW + conflict copies), then
-/// push local changes.
+/// Full cycle for one scope: discovery (when due), pull (LWW + conflict
+/// copies), then push local changes. The client's scope decides which
+/// bookkeeping is used.
 pub async fn sync_now(client: &SyncClient, store: &mut Store) -> Result<SyncReport, SyncError> {
-    if store.workspace.sync.is_none() {
+    let scope = client.scope().clone();
+    if store.scope_cursor(&scope).is_none() {
         return Err(SyncError::NotConnected);
     }
-    let info = refresh_server_info(client, server_info_due(store, now_ms())).await;
+    let info = refresh_server_info(client, server_info_due_in(store, &scope, now_ms())).await;
     if let Some(info) = &info {
-        record_server_info(store, info.as_ref());
+        record_server_info_in(store, &scope, info.as_ref());
     }
     // Pull first so conflicts are resolved locally (and a freshly connected
     // device adopts the remote tree) before anything is pushed.
     let report = pull_with_info(client, store, info.as_ref().and_then(Option::as_ref)).await?;
-    let pushed = push_all(client, store).await?;
+    store.restamp_skewed(&scope, now_ms());
+    let pushed = push_all_in(client, store, &scope).await?;
     Ok(SyncReport {
         pushed,
         pulled: report.applied,
         deleted: report.deleted,
         conflicts: report.conflicts,
         skipped: report.skipped,
-        too_large: skipped_entities(store),
-        unsupported: unsupported_entities(store),
+        too_large: skipped_entities_in(store, &scope),
+        unsupported: unsupported_entities_in(store, &scope),
         restored: report.restored,
-        cursor: store.workspace.sync.as_ref().map(|s| s.cursor).unwrap_or(0),
+        cursor: store.scope_cursor(&scope).unwrap_or(0),
     })
 }
 
@@ -1910,8 +2393,21 @@ pub fn disconnect(store: &mut Store) -> Result<(), SyncError> {
     Ok(())
 }
 
-/// Build a client from the store's sync config.
+/// The token-sync client: `workspace.sync` in pure-legacy mode, or the
+/// legacy binding and its token (from the secret store) in account mode.
 pub fn client_for(store: &Store) -> Result<SyncClient, SyncError> {
+    if store.account_mode() {
+        let link = store
+            .bindings
+            .legacy
+            .as_ref()
+            .ok_or(SyncError::NotConnected)?;
+        let token = store
+            .legacy_token
+            .as_deref()
+            .ok_or(SyncError::NotConnected)?;
+        return SyncClient::new(&link.worker_url, Some(token));
+    }
     let cfg = store
         .workspace
         .sync

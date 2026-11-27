@@ -196,8 +196,11 @@ test("browser sign-in: waiting, success, avatar menu, devices, sign out", async 
   await page.getByTestId("confirm-ok").click();
   await expect(page.getByTestId("device-row")).toHaveCount(1);
 
-  // Footer avatar menu.
+  // Footer avatar menu. Closing Settings brings up the first-sync checklist (UX §10): keep all.
   await page.getByTestId("dialog-close").click();
+  await expect(page.getByTestId("first-sync-dialog")).toBeVisible();
+  await page.getByTestId("first-sync-keep").click();
+  await expect(page.getByTestId("first-sync-dialog")).toHaveCount(0);
   await expect(page.getByTestId("account-avatar")).toHaveText("PS");
   await page.getByTestId("account-avatar").click();
   await expect(page.getByTestId("account-menu-heading")).toContainText("priya@acme.dev · reqharbor.acme.dev");
@@ -284,9 +287,13 @@ test("token sync under Sync › Advanced still works while signed in", async ({ 
   await openAccount(page, "?mockAccount=signedIn");
   await expect(page.getByTestId("account-profile")).toBeVisible();
   await page.getByTestId("settings-nav-sync").click();
+  // Signed in, token sync sits under a collapsed Advanced (UX §11).
+  await expect(page.getByTestId("sync-worker-url")).toHaveCount(0);
+  await page.getByTestId("sync-advanced").click();
   await page.getByTestId("sync-worker-url").fill("https://sync.example.dev");
   await page.getByTestId("sync-connect").click();
   await expect(page.getByTestId("sync-token")).toHaveValue(/^rh_/);
+  await expect(page.getByTestId("legacy-block")).toContainText("Synced with a token");
   await page.getByTestId("dialog-close").click();
   await expect(page.getByTestId("sync-indicator")).toContainText("Synced");
   await expect(page.getByTestId("account-avatar")).toBeVisible();

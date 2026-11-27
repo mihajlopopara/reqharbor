@@ -7,6 +7,7 @@
   import { toasts } from "../stores/toasts.svelte";
   import { call, toCommandError, type ShareInfo, type SharePreview, type ShareKind } from "../api";
   import { copyText } from "../api/platform";
+  import { locationCanShare } from "../util/spaces";
 
   /** Share dialog (AC-SHARE-1/2/4, DESIGN §5.11). */
   let { kind, entityId, name }: { kind: ShareKind; entityId: string; name: string } = $props();
@@ -17,7 +18,25 @@
   let existing = $state<ShareInfo | null>(null);
   let busy = $state(false);
   let error = $state<string | null>(null);
-  let needsSync = $state(!app.sync.connected);
+  /**
+   * UX §12.3: in account mode sharing needs the project to sync (a space, or token sync) right now:
+   * a paused (another account), signed-out, removed or unavailable location can't share (06 §9).
+   */
+  const projectLoc = $derived(app.activeProjectId ? app.locationById.get(app.activeProjectId) : undefined);
+  // svelte-ignore state_referenced_locally
+  let needsSync = $state(app.sync.accountMode ? !locationCanShare(app.locationById.get(app.activeProjectId ?? "")) || !app.sync.connected : !app.sync.connected);
+  const personal = $derived(app.sync.spaces.find((x) => x.kind === "personal" && x.state === "active") ?? null);
+  const accountCopy = $derived(app.auth.enabled);
+
+  async function syncToPersonal() {
+    if (!personal || !app.activeProjectId) return;
+    const pname = app.project?.name ?? "The project";
+    if (await app.setProjectLocation(app.activeProjectId, personal.spaceId)) {
+      toasts.success(`${pname} now syncs to Personal`);
+      needsSync = false;
+      void loadPreview();
+    }
+  }
 
   const close = () => (ui.shareDialog = null);
 
@@ -93,16 +112,64 @@
     <div class="empty" data-testid="share-needs-sync">
       <Icon name="cloud-off" />
       <h3>Sharing needs sync</h3>
-      <p>Connect a ReqHarbor Worker to create read-only share links.</p>
-      <button
-        class="btn btn-primary"
-        type="button"
-        onclick={() => {
-          close();
-          ui.settingsDialog = { section: "sync" };
-        }}
-        data-testid="share-setup-sync">Set up sync</button
-      >
+      {#if !accountCopy}
+        <p>Connect a ReqHarbor Worker to create read-only share links.</p>
+        <button
+          class="btn btn-primary"
+          type="button"
+          onclick={() => {
+            close();
+            ui.settingsDialog = { section: "sync" };
+          }}
+          data-testid="share-setup-sync">Set up sync</button
+        >
+      {:else if app.signedIn && projectLoc?.spaceId && projectLoc.state !== "active"}
+        <p data-testid="share-paused">This project's sync is paused, so it can't be shared. Resolve it in Settings › Sync first.</p>
+        <button
+          class="btn btn-primary"
+          type="button"
+          onclick={() => {
+            close();
+            ui.settingsDialog = { section: "sync" };
+          }}
+          data-testid="share-open-sync">Open Sync settings</button
+        >
+      {:else if app.signedIn && personal}
+        <p>Sharing needs this project to sync. Change its sync location to Personal first.</p>
+        <button class="btn btn-primary" type="button" onclick={syncToPersonal} data-testid="share-sync-personal">Sync to Personal</button>
+        {#if projectLoc}
+          <button
+            class="link"
+            type="button"
+            onclick={() => {
+              close();
+              ui.syncLocation = { projectId: projectLoc.projectId };
+            }}
+            data-testid="share-choose-location">Choose location…</button
+          >
+        {/if}
+      {:else}
+        <p>Sharing needs this project to sync. Change its sync location to Personal first.</p>
+        <button
+          class="btn btn-primary"
+          type="button"
+          onclick={() => {
+            close();
+            ui.settingsDialog = { section: "account" };
+          }}
+          data-testid="share-setup-sync">Sign in and sync to Personal</button
+        >
+        <button
+          class="link"
+          type="button"
+          onclick={() => {
+            close();
+            ui.syncAdvanced = true;
+            ui.settingsDialog = { section: "sync" };
+          }}
+          data-testid="share-token-sync">Sync with a token instead</button
+        >
+      {/if}
     </div>
   {:else}
     <section>

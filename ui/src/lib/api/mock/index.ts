@@ -49,6 +49,7 @@ import { applyDefaultScheme, paramsToUrl, urlToParams, encodeQueryValue } from "
 import { prettyJson, jsonErrorPosition } from "../../util/json";
 import { MockError, fail } from "./errors";
 import { MockAccounts, type MockAccountOptions } from "./account";
+import { MockSpaces, type MockSpaceMode, type MockSpacesOptions } from "./spaces";
 import { seed, defaultSettings } from "./seed";
 import { importCurl, looksLikeCurl, exportCurl } from "./curl";
 import { convertSpec, reportOf } from "./openapi";
@@ -284,6 +285,12 @@ export interface MockOptions {
   accountsEnabled?: boolean;
   /** Sign-in switches (see ./account.ts). */
   accounts?: MockAccountOptions;
+  /** Personal sync switches (see ./spaces.ts). */
+  spaces?: MockSpacesOptions;
+  /** Token sync connected at launch (`?mockLegacy=1`). */
+  legacy?: boolean;
+  /** The sync after a legacy merge fails (`?mockMergeSyncFails=1`). */
+  mergeSyncFails?: boolean;
 }
 
 export class MockServer {
@@ -315,9 +322,14 @@ export class MockServer {
     skippedEntities: [],
     unsupportedEntities: [],
     warning: null,
+    accountMode: false,
+    spaces: [],
+    legacy: null,
+    firstSyncPending: false,
   };
   syncToken: string | null = null;
   accounts: MockAccounts;
+  spaces: MockSpaces;
   private clock = 0;
   private opts: MockOptions;
 
@@ -328,7 +340,30 @@ export class MockServer {
       delay: (ms) => this.delay(ms),
       now: () => this.now(),
       settings: () => this.settings,
+      onSignedIn: (a) => {
+        const legacy = this.sync.connected && this.sync.workerUrl ? { workerUrl: this.sync.workerUrl, remoteWorkspaceId: this.sync.remoteWorkspaceId ?? "LEGACYWS" } : null;
+        const fresh = this.spaces.signIn(a, legacy);
+        this.emitStatus();
+        if (fresh) this.emit("sync://notice", { kind: "success", message: this.spaces.freshNotice() });
+      },
+      onSignedOut: () => {
+        this.spaces.signOut();
+        this.emitStatus();
+      },
     });
+    this.spaces = new MockSpaces(
+      {
+        projects: () => this.projects,
+        counts: (id) => ({ collections: this.collections.filter((c) => c.projectId === id).length, requests: this.requestsOfProject(id).length }),
+        forget: (id) => this.forgetProject(id),
+        rename: (id, name) => {
+          const p = this.projects.find((x) => x.id === id);
+          if (p) p.name = name;
+        },
+        now: () => this.now(),
+      },
+      opts.spaces,
+    );
     this.accounts.status.enabled = opts.accountsEnabled ?? true;
     const now = this.now();
     const s = seed(now, opts.empty);
@@ -345,6 +380,35 @@ export class MockServer {
       const ts = now - h.ageMs;
       this.recordCanned(h.request, h.projectId, ts);
     }
+    if (opts.legacy) this.connect("https://sync.example.dev", `rh_${ulid()}`);
+    // `?mockAccount=signedIn` (and friends): this device was set up earlier, so it is already in
+    // account mode with every project in Personal (or migrated token sync with `mockLegacy`).
+    const account = this.accounts.status.account;
+    if (account) {
+      const legacy = this.sync.connected && this.sync.workerUrl ? { workerUrl: this.sync.workerUrl, remoteWorkspaceId: this.sync.remoteWorkspaceId ?? "LEGACYWS" } : null;
+      this.spaces.signIn(account, legacy, true);
+      if (opts.spaces?.foreign) this.spaces.makeForeign();
+    }
+  }
+
+  /** The status the UI sees: the token-sync part plus the per-space part (account mode). */
+  syncStatus(): SyncStatus {
+    return this.spaces.apply(this.sync);
+  }
+
+  emitStatus(): void {
+    this.emit("sync://status", this.syncStatus());
+  }
+
+  /** Drop a project and everything in it (no tombstones). */
+  private forgetProject(projectId: string): void {
+    const cols = new Set(this.collections.filter((c) => c.projectId === projectId).map((c) => c.id));
+    this.requests = this.requests.filter((r) => !cols.has(r.collectionId));
+    this.folders = this.folders.filter((f) => !cols.has(f.collectionId));
+    this.collections = this.collections.filter((c) => !cols.has(c.id));
+    this.environments = this.environments.filter((e) => e.projectId !== projectId);
+    this.projects = this.projects.filter((p) => p.id !== projectId);
+    this.spaces.onDelete(projectId);
   }
 
   private now(): number {
@@ -458,10 +522,10 @@ export class MockServer {
     return e;
   }
   private markChanged(): void {
-    if (this.sync.connected) {
+    if (this.sync.connected || this.spaces.syncable()) {
       this.sync.pendingChanges++;
       this.refreshSkipped();
-      this.emit("sync://status", this.sync);
+      this.emitStatus();
     }
   }
   private refreshSkipped(): void {
@@ -745,8 +809,20 @@ export class MockServer {
     };
   }
 
+  /** Where a share of this entity goes: its project's space (account mode) or token sync. */
+  private shareBase(kind: "collection" | "request", entityId: string): { url: string; spaceId: string | null } {
+    if (!this.spaces.accountMode) return { url: this.sync.workerUrl ?? "", spaceId: null };
+    const pid = kind === "collection" ? this.collection(entityId).projectId : this.collection(this.request(entityId).collectionId).projectId;
+    const loc = this.spaces.location(pid, this.sync.connected);
+    if (!loc.spaceId) return fail("sync_not_connected", "Sharing needs this project to sync. Change its sync location to Personal first.");
+    if (loc.spaceId === "legacy") return { url: this.sync.workerUrl ?? "", spaceId: "legacy" };
+    // Only an active binding of the signed-in account gets this session's tokens (06 §9).
+    if (loc.state !== "active") return fail("sync_not_connected", "This project's sync is paused, so it can't be shared. Resolve it in Settings › Sync first.");
+    return { url: this.accounts.status.account?.serverUrl ?? "", spaceId: loc.spaceId };
+  }
+
   private requireSync(): void {
-    if (!this.sync.connected) fail("sync_not_connected", "Sync is not connected. Set up sync in Settings → Sync.");
+    if (!this.sync.connected && !this.spaces.syncable()) fail("sync_not_connected", "Sync is not connected. Set up sync in Settings → Sync.");
   }
 
   private snapshotFor(kind: ShareKind, entityId: string, includeCredentials: boolean, environmentId: string | null | undefined) {
@@ -947,7 +1023,7 @@ export class MockServer {
         corruptFiles: this.opts.corrupt
           ? [{ originalPath: "/mock/reqharbor/projects/01JCORRUPT.json", renamedTo: "/mock/reqharbor/projects/01JCORRUPT.corrupt-1764000000000.json", error: "expected value at line 1 column 1" }]
           : [],
-        sync: this.sync,
+        sync: this.syncStatus(),
         platform,
         dataDir: "/mock/reqharbor",
         appVersion: MOCK_APP_VERSION,
@@ -967,9 +1043,10 @@ export class MockServer {
 
     list_projects: () => this.sortedProjects(),
     get_project_tree: ({ projectId }) => this.tree(projectId),
-    create_project: ({ name }) => {
+    create_project: ({ name, location }) => {
       const ts = this.now();
       const p: Project = { id: ulid(ts), workspaceId: this.workspace.id, name: this.name(name), sortOrder: this.projects.length, activeEnvironmentId: null, createdAt: ts, updatedAt: ts };
+      this.spaces.onCreate(p.id, location);
       this.projects.push(p);
       this.markChanged();
       return this.tree(p.id);
@@ -977,6 +1054,7 @@ export class MockServer {
     rename_project: ({ projectId, name }) => {
       const p = this.project(projectId);
       this.ensureContainer(p, "This project");
+      this.spaces.guard(projectId);
       p.name = this.name(name);
       return clone(this.touch(p));
     },
@@ -997,6 +1075,7 @@ export class MockServer {
         this.environments.push(ne);
       }
       p.activeEnvironmentId = src.activeEnvironmentId ? (envMap.get(src.activeEnvironmentId) ?? null) : null;
+      this.spaces.onDuplicate(src.id, p.id);
       for (const c of this.collections.filter((x) => x.projectId === src.id)) {
         this.copyCollectionTree(c, p.id, this.folders.filter((f) => f.collectionId === c.id), this.requests.filter((r) => r.collectionId === c.id), c.name, c.sortOrder);
       }
@@ -1017,6 +1096,7 @@ export class MockServer {
       this.environments = this.environments.filter((e) => e.projectId !== projectId);
       this.projects = this.projects.filter((p) => p.id !== projectId);
       this.projects.sort((a, b) => a.sortOrder - b.sortOrder).forEach((p, i) => (p.sortOrder = i));
+      this.spaces.onDelete(projectId);
       this.markChanged();
       return this.sortedProjects();
     },
@@ -1548,7 +1628,7 @@ export class MockServer {
 
     get_sync_status: () => {
       this.refreshSkipped();
-      return clone(this.sync);
+      return clone(this.syncStatus());
     },
     sync_create_workspace: async ({ workerUrl }) => {
       const url = this.workerUrl(workerUrl);
@@ -1562,17 +1642,18 @@ export class MockServer {
       await this.delay(150);
       if (!/^rh_[A-Za-z0-9_-]{10,}$/.test(token.trim())) {
         this.sync = { ...this.sync, state: "unauthorized", connected: false, lastError: "401 unauthorized: invalid token" };
-        this.emit("sync://status", this.sync);
+        this.emitStatus();
         return fail("sync_unauthorized", "Token rejected — sync disconnected. Enter a new token.");
       }
       this.connect(url, token.trim());
-      return clone(this.sync);
+      return clone(this.syncStatus());
     },
     sync_disconnect: () => {
+      if (this.spaces.accountMode) this.spaces.disconnectLegacy();
       this.sync = { ...this.sync, state: "disconnected", connected: false, workerUrl: null, remoteWorkspaceId: null, lastError: null, pendingChanges: 0, nextRetryAt: null, retryAttempt: 0, skippedEntities: [], unsupportedEntities: [], warning: null };
       this.syncToken = null;
-      this.emit("sync://status", this.sync);
-      return clone(this.sync);
+      this.emitStatus();
+      return clone(this.syncStatus());
     },
     sync_rotate_token: async () => {
       this.requireSync();
@@ -1586,26 +1667,77 @@ export class MockServer {
     },
     sync_now: async (): Promise<SyncReport> => {
       this.requireSync();
+      if (this.spaces.accountMode && this.accounts.status.signInRequired && !this.sync.connected) {
+        this.sync = { ...this.sync, state: "signInRequired", lastError: "Your session ended. Sign in again to keep syncing." };
+        this.emitStatus();
+        return fail("sign_in_required", "Your session ended. Sign in again to keep syncing.");
+      }
       if (this.sync.workerUrl?.includes("full")) {
         this.sync = { ...this.sync, state: "error", lastError: "quota_exceeded: workspace storage is full (50 MB)" };
-        this.emit("sync://status", this.sync);
+        this.emitStatus();
         return fail("sync_quota_exceeded", "quota_exceeded: The remote workspace is full (50 MB). Delete items or large bodies to keep syncing.");
       }
       if (this.sync.workerUrl?.includes("offline")) {
         const next = this.now() + 30000;
         this.sync = { ...this.sync, state: "offline", lastError: "network unreachable", nextRetryAt: next, retryAttempt: this.sync.retryAttempt + 1 };
-        this.emit("sync://status", this.sync);
+        this.emitStatus();
         return fail("sync_offline", "The sync server is unreachable. Retrying automatically.");
       }
       this.sync = { ...this.sync, state: "syncing" };
-      this.emit("sync://status", this.sync);
+      this.emitStatus();
       await this.delay(200);
       const pushed = this.sync.pendingChanges;
       this.refreshSkipped();
       const ts = this.now();
       this.sync = { ...this.sync, state: "idle", lastSyncAt: ts, lastPullAt: ts, pendingChanges: 0, lastError: null, nextRetryAt: null, retryAttempt: 0 };
-      this.emit("sync://status", this.sync);
+      this.spaces.synced(ts);
+      this.emitStatus();
       return { pushed, pulled: 0, deleted: 0, conflicts: [], skipped: [], cursor: ts, tooLarge: clone(this.sync.skippedEntities), unsupported: [], restored: false };
+    },
+
+    project_locations: () => this.spaces.locations(this.sync.connected),
+    project_set_location: ({ projectId, spaceId }) => {
+      this.project(projectId);
+      this.spaces.setLocation(projectId, spaceId);
+      this.markChanged();
+      this.emitStatus();
+      return this.spaces.locations(this.sync.connected);
+    },
+    first_sync_candidates: () => this.spaces.candidates(),
+    first_sync_apply: async ({ projectIds }) => {
+      this.spaces.applyFirstSync(projectIds);
+      await this.delay(100);
+      this.spaces.synced(this.now());
+      this.emitStatus();
+      return clone(this.syncStatus());
+    },
+    space_notice_later: ({ spaceIds }) => {
+      this.spaces.later(spaceIds, this.now());
+      return clone(this.syncStatus());
+    },
+    space_notice_resolve: ({ spaceId, keep }) => {
+      this.spaces.resolve(spaceId, keep);
+      this.emitStatus();
+      this.emit("sync://changed", { pushed: 0, pulled: 0, deleted: 0, conflicts: [], skipped: [], tooLarge: [], unsupported: [], restored: false, cursor: 0 });
+      return clone(this.syncStatus());
+    },
+    legacy_merge: async () => {
+      const n = this.spaces.merge();
+      await this.delay(200);
+      const ts = this.now();
+      this.emitStatus();
+      // `?mockMergeSyncFails=1`: the merge stands, the follow-up sync fails.
+      if (this.opts.mergeSyncFails) return { merged: n, report: null, syncError: { code: "sync_offline", message: "Offline: the server can't be reached" } };
+      this.spaces.synced(ts);
+      this.emitStatus();
+      return { merged: n, report: { pushed: n, pulled: 0, deleted: 0, conflicts: [], skipped: [], cursor: ts, tooLarge: [], unsupported: [], restored: false }, syncError: null };
+    },
+    legacy_disconnect: () => {
+      this.spaces.disconnectLegacy();
+      this.sync = { ...this.sync, connected: false, workerUrl: null, remoteWorkspaceId: null, state: "disconnected" };
+      this.syncToken = null;
+      this.emitStatus();
+      return clone(this.syncStatus());
     },
     sync_workspace_info: async () => {
       this.requireSync();
@@ -1634,11 +1766,12 @@ export class MockServer {
     share_preview: ({ kind, entityId, includeCredentials, environmentId }) => this.snapshotFor(kind, entityId, includeCredentials, environmentId).preview,
     share_create: async ({ kind, entityId, includeCredentials, environmentId }) => {
       this.requireSync();
+      const base = this.shareBase(kind, entityId);
       const { snapshot, preview } = this.snapshotFor(kind, entityId, includeCredentials, environmentId);
       await this.delay(120);
       const shareId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"[b % 62]).join("") + "x";
       const ts = this.now();
-      const info: ShareInfo = { shareId, url: `${this.sync.workerUrl}/s/${shareId}`, kind, entityId, name: preview.name, createdAt: ts, updatedAt: ts };
+      const info: ShareInfo = { shareId, url: `${base.url}/s/${shareId}`, kind, entityId, name: preview.name, createdAt: ts, updatedAt: ts, ...(base.spaceId ? { spaceId: base.spaceId } : {}) };
       this.shares.set(shareId, { info, snapshot, revoked: false });
       return clone(info);
     },
@@ -1712,6 +1845,7 @@ export class MockServer {
   private connect(workerUrl: string, token: string): void {
     const ts = this.now();
     this.syncToken = token;
+    if (this.spaces?.accountMode) this.spaces.legacy = { workerUrl, remoteWorkspaceId: this.sync.remoteWorkspaceId ?? ulid(ts), mode: "sync" };
     this.sync = {
       ...this.sync,
       state: "idle",
@@ -1726,7 +1860,7 @@ export class MockServer {
       pendingChanges: 0,
     };
     this.refreshSkipped();
-    this.emit("sync://status", this.sync);
+    this.emitStatus();
   }
 
   async invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknown> {
@@ -1767,6 +1901,13 @@ export function getMockServer(): MockServer {
       corrupt: qs.get("corrupt") === "1",
       newer: qs.get("newer") === "1",
       accountsEnabled: qs.get("mockAccounts") !== "off",
+      legacy: qs.get("mockLegacy") === "1",
+      mergeSyncFails: qs.get("mockMergeSyncFails") === "1",
+      spaces: {
+        mode: (qs.get("mockSpace") ?? undefined) as MockSpaceMode | undefined,
+        team: qs.get("mockTeam") === "1",
+        foreign: qs.get("mockForeign") === "1",
+      },
       accounts: {
         server: (qs.get("mockServer") ?? undefined) as MockAccountOptions["server"],
         methods: qs.get("mockMethods")?.split(",").map((m) => m.trim()).filter(Boolean),

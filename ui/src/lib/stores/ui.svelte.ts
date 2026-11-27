@@ -9,6 +9,17 @@ export interface MenuItem {
   heading?: boolean;
   /** Second line under the label. */
   sublabel?: string;
+  /** A heading styled as a group title (uppercase, muted), e.g. "PERSONAL" (UX §5.1). */
+  group?: boolean;
+  /** Right-aligned text on a heading, e.g. the team role. */
+  trailing?: string;
+  /** 16 px icon before the label (binding icons). */
+  icon?: string;
+  /** Why the item is disabled: shown as `title` and `aria-description`. */
+  reason?: string;
+  title?: string;
+  /** Accessible name when it should include more than the label ("Payments API, Acme"). */
+  ariaLabel?: string;
   shortcut?: string;
   danger?: boolean;
   disabled?: boolean;
@@ -57,6 +68,14 @@ class UiStore {
   picker = $state<PickerMode | null>(null);
   envPicker = $state(false);
   exportCurl = $state<{ anchor: HTMLElement | null } | null>(null);
+  /** Personal sync dialogs (UX §5.2, §5.3, §10, §11, §4.3/§6.9). */
+  newProject = $state(false);
+  syncLocation = $state<{ projectId: string } | null>(null);
+  firstSync = $state(false);
+  mergeLegacy = $state(false);
+  spaceNotice = $state<{ mode: "foreign" | "removed"; spaceIds: string[] } | null>(null);
+  /** Open Settings › Sync with Advanced expanded (token sync). */
+  syncAdvanced = $state(false);
   /** Tree node or env being renamed inline. */
   renaming = $state<{ kind: "collection" | "folder" | "request" | "environment" | "project"; id: string } | null>(null);
   /** Selected tree node (for New Folder / F2). */
@@ -71,7 +90,19 @@ class UiStore {
   formatTick = $state(0);
 
   get anyModalOpen(): boolean {
-    return !!(this.confirmState || this.importDialog || this.shareDialog || this.settingsDialog || this.picker || this.envPicker);
+    return !!(
+      this.confirmState ||
+      this.importDialog ||
+      this.shareDialog ||
+      this.settingsDialog ||
+      this.picker ||
+      this.envPicker ||
+      this.newProject ||
+      this.syncLocation ||
+      this.firstSync ||
+      this.mergeLegacy ||
+      this.spaceNotice
+    );
   }
 
   openMenu(items: MenuItem[], anchor: HTMLElement | { x: number; y: number }, opts: { alignRight?: boolean } = {}) {

@@ -5,11 +5,11 @@
   import { app } from "../stores/app.svelte";
   import { ui, type SettingsSection } from "../stores/ui.svelte";
   import AccountSection from "../components/AccountSection.svelte";
-  import { insecureAckFor, isInsecureUrl, parseServerUrl } from "../util/account";
+  import SyncSection from "../components/SyncSection.svelte";
   import { toasts } from "../stores/toasts.svelte";
-  import { call, toCommandError, type RemoteWorkspace, type ShareInfo, type Theme } from "../api";
+  import { call, toCommandError, type ShareInfo, type Theme } from "../api";
   import { copyText } from "../api/platform";
-  import { formatSize, relativeTime, dateTime, unsupportedNotice } from "../util/format";
+  import { dateTime } from "../util/format";
   import { SHORTCUT_LIST, shortcutKeys } from "../util/shortcuts";
 
   type Section = SettingsSection;
@@ -25,115 +25,6 @@
     { id: "shortcuts", label: "Shortcuts" },
     { id: "about", label: "About" },
   ];
-
-  // ───────── sync ─────────
-  const sync = $derived(app.sync);
-  // svelte-ignore state_referenced_locally
-  let workerUrl = $state(app.sync.workerUrl ?? "");
-  let mode = $state<"create" | "connect">("create");
-  let token = $state("");
-  let shownToken = $state<{ token: string; note: string | null } | null>(null);
-  let busy = $state(false);
-  let syncError = $state<{ code: string; message: string } | null>(null);
-  let info = $state<RemoteWorkspace | null>(null);
-
-  async function loadInfo() {
-    if (!app.sync.connected) return;
-    try {
-      info = await call("sync_workspace_info", {});
-    } catch (e) {
-      const err = toCommandError(e);
-      if (err.code !== "sync_not_connected") syncError = err;
-    }
-  }
-
-  async function run<T>(fn: () => Promise<T>): Promise<T | null> {
-    busy = true;
-    syncError = null;
-    try {
-      return await fn();
-    } catch (e) {
-      syncError = toCommandError(e);
-      return null;
-    } finally {
-      busy = false;
-    }
-  }
-
-  /**
-   * 06 §9: plain http to a non-loopback host needs "Continue anyway" for token sync too. The
-   * choice is kept per origin in settings.json `knownServers[].insecureAck`, as SignInFlow does.
-   */
-  const legacyInsecure = $derived(isInsecureUrl(workerUrl));
-  const legacyAck = $derived(insecureAckFor(app.knownServers, workerUrl));
-
-  function setLegacyAck(on: boolean) {
-    const p = parseServerUrl(workerUrl);
-    if (!p.ok) return;
-    const prev = app.knownServers.find((k) => k.url === p.origin);
-    app.rememberServer(p.origin, { insecureAck: on, lastUsedAt: prev?.lastUsedAt ?? Date.now() });
-  }
-
-  async function connectOrCreate() {
-    if (!workerUrl.trim()) return;
-    if (legacyInsecure && !legacyAck) return;
-    if (mode === "create") {
-      const res = await run(() => call("sync_create_workspace", { workerUrl: workerUrl.trim(), name: app.workspaceName }));
-      if (res) {
-        shownToken = { token: res.token, note: null };
-        toasts.success("Sync workspace created");
-      }
-    } else {
-      const res = await run(() => call("sync_connect", { workerUrl: workerUrl.trim(), token: token.trim() }));
-      if (res) {
-        app.sync = res;
-        token = "";
-        toasts.success("Sync connected");
-        await app.reloadAll();
-      }
-    }
-    app.sync = await call("get_sync_status", {});
-    await loadInfo();
-  }
-
-  async function syncNow() {
-    const rep = await run(() => call("sync_now", {}));
-    app.sync = await call("get_sync_status", {});
-    if (rep) {
-      toasts.success(`Synced · ${rep.pushed} pushed, ${rep.pulled} pulled`);
-      if (rep.tooLarge.length) toasts.warning(`Not synced (too large): ${rep.tooLarge.map((s) => s.name).join(", ")}`);
-      const notice = unsupportedNotice(rep.unsupported?.length ?? 0);
-      if (notice) toasts.warning(notice);
-      await loadInfo();
-    }
-  }
-
-  async function rotate() {
-    const ok = await ui.confirm({ title: "Rotate sync token?", body: "The current token stops working immediately on every other device. You'll get a new token to copy.", confirmLabel: "Rotate token", danger: false });
-    if (!ok) return;
-    busy = true;
-    try {
-      const res = await call("sync_rotate_token", {});
-      shownToken = { token: res.token, note: null };
-    } catch (e) {
-      const err = toCommandError(e);
-      const d = err.details as { token?: string } | undefined;
-      if (d?.token) shownToken = { token: d.token, note: err.message };
-      else syncError = err;
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function disconnect() {
-    const res = await run(() => call("sync_disconnect", {}));
-    if (res) {
-      app.sync = res;
-      info = null;
-      shownToken = null;
-      toasts.info("Sync disconnected — local data is untouched");
-    }
-  }
 
   // ───────── shares ─────────
   let shares = $state<ShareInfo[] | null>(null);
@@ -167,7 +58,7 @@
   }
   async function revokeShare(s: ShareInfo) {
     try {
-      await call("share_revoke", { shareId: s.shareId });
+      await call("share_revoke", { shareId: s.shareId, spaceId: s.spaceId ?? null });
       app.rememberShareOptions(s.shareId, null);
       toasts.success("Share revoked");
       await loadShares();
@@ -180,16 +71,22 @@
     if (section === "shares" && shares === null) void loadShares();
   });
 
-  onMount(() => {
-    void loadInfo();
-  });
-
   function setTheme(t: Theme) {
     app.updateSettings({ theme: t }, true);
   }
 
-  const usagePct = $derived(info?.bytesUsed != null && info.quotaBytes ? Math.min(100, (info.bytesUsed / info.quotaBytes) * 100) : null);
-  const retryIn = $derived(sync.nextRetryAt ? Math.max(0, Math.round((sync.nextRetryAt - Date.now()) / 1000)) : null);
+  /** UX §12.1: shares grouped by space (PERSONAL, …, LEGACY) in account mode. */
+  const spaceName = (id: string | null | undefined) => (id === "legacy" ? "Legacy" : (app.sync.spaces.find((s) => s.spaceId === id)?.name ?? ""));
+  const shareGroups = $derived.by(() => {
+    const list = shares ?? [];
+    if (!app.sync.accountMode) return [{ name: "", items: list }];
+    const names = [...new Set(list.map((s) => spaceName(s.spaceId)))];
+    return names.map((name) => ({ name, items: list.filter((s) => spaceName(s.spaceId) === name) }));
+  });
+  function go(s: Section) {
+    if (s === "sync") ui.syncAdvanced = true;
+    section = s;
+  }
 </script>
 
 <Dialog title="Settings" width={760} height={540} testid="settings-dialog" onclose={close}>
@@ -201,7 +98,7 @@
     </nav>
     <div class="content">
       {#if section === "account"}
-        <AccountSection ongo={(s) => (section = s)} />
+        <AccountSection ongo={go} />
       {:else if section === "general"}
         <h3>General</h3>
         <div class="field">
@@ -217,100 +114,7 @@
           Copy as cURL keeps <span class="mono">{"{{variables}}"}</span>
         </label>
       {:else if section === "sync"}
-        <h3>Sync</h3>
-        {#if sync.state === "unauthorized"}
-          <div class="hint danger" role="alert" data-testid="sync-unauthorized"><Icon name="alert" />Token rejected — sync disconnected. Enter a new token.</div>
-        {/if}
-        {#if shownToken}
-          <div class="token-box" data-testid="sync-token-box">
-            <span class="label">Workspace token</span>
-            <div class="row">
-              <input class="input mono" readonly value={shownToken.token} aria-label="Workspace token" data-testid="sync-token" />
-              <button class="btn btn-secondary" type="button" onclick={async () => { await copyText(shownToken?.token ?? ""); toasts.success("Token copied"); }}>Copy</button>
-            </div>
-            <div class="hint warn"><Icon name="alert" />{shownToken.note ? `${shownToken.note} ` : ""}Copy it now — it won't be shown again.</div>
-          </div>
-        {/if}
-        {#if sync.connected}
-          <div class="status" data-testid="sync-status">
-            <Icon name={sync.state === "offline" ? "cloud-off" : "cloud"} />
-            <span>
-              {#if sync.state === "offline"}
-                Offline — {retryIn !== null ? `retrying in ${retryIn} s` : "will retry"}
-              {:else if sync.state === "syncing"}
-                Syncing…
-              {:else if sync.state === "error"}
-                Sync error{sync.lastError ? `: ${sync.lastError}` : ""}
-              {:else}
-                Synced {sync.lastSyncAt ? relativeTime(sync.lastSyncAt, app.now) === "now" ? "just now" : `${relativeTime(sync.lastSyncAt, app.now)} ago` : ""}
-              {/if}
-            </span>
-          </div>
-          <div class="faint small mono">{sync.workerUrl}</div>
-          {#if info}
-            <div class="usage" data-testid="sync-usage">
-              <div class="row between small"><span>{info.entityCount} items synced</span>
-                {#if info.bytesUsed != null}<span>{formatSize(info.bytesUsed)}{info.quotaBytes ? ` of ${formatSize(info.quotaBytes)}` : ""}</span>{/if}
-              </div>
-              {#if usagePct !== null}<div class="meter"><div class="fill" class:high={usagePct > 85} style:width="{usagePct}%"></div></div>{/if}
-            </div>
-          {/if}
-          {#if sync.warning}
-            <div class="hint warn" data-testid="sync-warning-text"><Icon name="alert" />{sync.warning}</div>
-          {/if}
-          <div class="row">
-            <button class="btn btn-primary" type="button" disabled={busy} onclick={syncNow} data-testid="sync-now">Sync now</button>
-            <button class="btn btn-secondary" type="button" disabled={busy} onclick={rotate} data-testid="sync-rotate">Rotate token…</button>
-            <button class="btn btn-ghost btn-danger" type="button" disabled={busy} onclick={disconnect} data-testid="sync-disconnect">Disconnect</button>
-          </div>
-        {:else}
-          {#if app.auth.enabled}
-            <p class="faint small" data-testid="sync-advanced-note">Sync without an account: connect this device to a server with a workspace token.</p>
-          {/if}
-          <label class="field">
-            <span>Server URL</span>
-            <input class="input mono" bind:value={workerUrl} placeholder="https://reqharbor.example.com" data-testid="sync-worker-url" />
-          </label>
-          {#if legacyInsecure}
-            <div class="hint warn insecure" data-testid="sync-insecure">
-              <Icon name="alert" /><span>This server doesn't use HTTPS. Your password, tokens and synced data can be read on the network.</span>
-              <label class="checkbox"><input type="checkbox" checked={legacyAck} onchange={(e) => setLegacyAck(e.currentTarget.checked)} data-testid="sync-insecure-ack" />Continue anyway</label>
-            </div>
-          {/if}
-          <div class="cards" role="radiogroup" aria-label="Connection mode">
-            <label class="card" class:on={mode === "create"}>
-              <input type="radio" name="sync-mode" value="create" bind:group={mode} data-testid="sync-mode-create" />
-              <span><b>Create workspace</b><br /><span class="faint small">Start syncing this device; you get a token for others.</span></span>
-            </label>
-            <label class="card" class:on={mode === "connect"}>
-              <input type="radio" name="sync-mode" value="connect" bind:group={mode} data-testid="sync-mode-connect" />
-              <span><b>Connect with token</b><br /><span class="faint small">Join an existing workspace from another device.</span></span>
-            </label>
-          </div>
-          {#if mode === "connect"}
-            <label class="field">
-              <span>Token</span>
-              <input class="input mono" type="password" bind:value={token} placeholder="rh_…" data-testid="sync-token-input" />
-            </label>
-          {/if}
-          <div class="row">
-            <button class="btn btn-primary" type="button" disabled={busy || !workerUrl.trim() || (mode === "connect" && !token.trim()) || (legacyInsecure && !legacyAck)} onclick={connectOrCreate} data-testid="sync-connect">
-              {mode === "create" ? "Create workspace" : "Connect"}
-            </button>
-          </div>
-        {/if}
-        {#if syncError}
-          <div class="hint danger" role="alert" data-testid="sync-error">
-            <Icon name="alert" />
-            {#if syncError.code === "sync_quota_exceeded"}
-              Workspace storage is full. {syncError.message}
-            {:else if syncError.code === "sync_too_large"}
-              An item is too large to sync. {syncError.message}
-            {:else}
-              {syncError.message}
-            {/if}
-          </div>
-        {/if}
+        <SyncSection ongo={(s) => (section = s)} />
       {:else if section === "shares"}
         <h3>Shares</h3>
         {#if sharesError}
@@ -323,7 +127,9 @@
           <table class="tbl" data-testid="shares-table">
             <thead><tr><th>Name</th><th>Kind</th><th>Created</th><th>Updated</th><th></th></tr></thead>
             <tbody>
-              {#each shares as s (s.shareId)}
+              {#each shareGroups as g (g.name)}
+              {#if g.name}<tr class="group"><th colspan="5" data-testid="shares-group">{g.name}</th></tr>{/if}
+              {#each g.items as s (s.shareId)}
                 <tr>
                   <td>{s.name ?? s.shareId}</td>
                   <td class="faint">{s.kind ?? "—"}</td>
@@ -335,6 +141,7 @@
                     <button class="link danger" type="button" onclick={() => revokeShare(s)}>Revoke</button>
                   </td>
                 </tr>
+              {/each}
               {/each}
             </tbody>
           </table>
@@ -398,73 +205,8 @@
     font-size: var(--fs-xl);
     font-weight: var(--fw-semibold);
   }
-  .row {
-    display: flex;
-    gap: var(--sp-4);
-    align-items: center;
-    flex-wrap: wrap;
-  }
-  .between {
-    justify-content: space-between;
-  }
   .small {
     font-size: var(--fs-sm);
-  }
-  .status {
-    display: flex;
-    gap: var(--sp-3);
-    align-items: center;
-  }
-  .usage {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-2);
-    max-width: 420px;
-  }
-  .meter {
-    height: 6px;
-    border-radius: var(--r-pill);
-    background: var(--bg-input);
-    overflow: hidden;
-  }
-  .fill {
-    height: 100%;
-    background: var(--accent);
-  }
-  .fill.high {
-    background: var(--warning);
-  }
-  .cards {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--sp-4);
-  }
-  .card {
-    display: flex;
-    gap: var(--sp-4);
-    align-items: flex-start;
-    padding: var(--sp-5);
-    border-radius: var(--r-md);
-    background: var(--bg-input);
-    border: 1px solid transparent;
-    cursor: pointer;
-  }
-  .card.on {
-    border-color: var(--border-focus);
-  }
-  .insecure {
-    flex-wrap: wrap;
-  }
-  .insecure .checkbox {
-    flex-basis: 100%;
-  }
-  .token-box {
-    display: flex;
-    flex-direction: column;
-    gap: var(--sp-3);
-  }
-  .token-box .input {
-    flex: 1;
   }
   .tbl {
     width: 100%;
@@ -480,6 +222,12 @@
   .tbl td {
     padding: var(--sp-3);
     border-top: 1px solid var(--border-subtle);
+  }
+  .tbl .group th {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding-top: var(--sp-5);
   }
   .acts {
     white-space: nowrap;

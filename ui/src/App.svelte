@@ -15,6 +15,7 @@
   import Toasts from "./lib/components/Toasts.svelte";
   import ConfirmDialog from "./lib/dialogs/ConfirmDialog.svelte";
   import EnvPicker from "./lib/dialogs/EnvPicker.svelte";
+  import SyncPrompts from "./lib/components/SyncPrompts.svelte";
 
   // Rarely used dialogs are code-split.
   const ImportDialog = () => import("./lib/dialogs/ImportDialog.svelte");
@@ -22,6 +23,11 @@
   const SettingsDialog = () => import("./lib/dialogs/SettingsDialog.svelte");
   const PickerDialog = () => import("./lib/dialogs/PickerDialog.svelte");
   const ExportCurl = () => import("./lib/dialogs/ExportCurl.svelte");
+  const NewProjectDialog = () => import("./lib/dialogs/NewProjectDialog.svelte");
+  const SyncLocationDialog = () => import("./lib/dialogs/SyncLocationDialog.svelte");
+  const FirstSyncDialog = () => import("./lib/dialogs/FirstSyncDialog.svelte");
+  const MergeLegacyDialog = () => import("./lib/dialogs/MergeLegacyDialog.svelte");
+  const SpaceNoticeDialog = () => import("./lib/dialogs/SpaceNoticeDialog.svelte");
 
   const SIDEBAR = { def: 300, min: 220, max: 480, snap: 160, rail: 44 };
   const PANE_MIN = 360;
@@ -261,6 +267,22 @@
 {/if}
 {#if ui.exportCurl}
   {#await ExportCurl() then M}<M.default anchor={ui.exportCurl.anchor} />{/await}
+{/if}
+<SyncPrompts />
+{#if ui.newProject}
+  {#await NewProjectDialog() then M}<M.default />{/await}
+{/if}
+{#if ui.syncLocation}
+  {#await SyncLocationDialog() then M}<M.default projectId={ui.syncLocation?.projectId ?? ""} />{/await}
+{/if}
+{#if ui.firstSync}
+  {#await FirstSyncDialog() then M}<M.default />{/await}
+{/if}
+{#if ui.mergeLegacy}
+  {#await MergeLegacyDialog() then M}<M.default />{/await}
+{/if}
+{#if ui.spaceNotice}
+  {#await SpaceNoticeDialog() then M}<M.default mode={ui.spaceNotice?.mode ?? "foreign"} spaceIds={ui.spaceNotice?.spaceIds ?? []} />{/await}
 {/if}
 <ConfirmDialog />
 

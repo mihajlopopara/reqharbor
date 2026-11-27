@@ -621,6 +621,46 @@ pub struct SessionInfo {
     pub current: bool,
 }
 
+/// One row of `GET /v1/me/spaces` (06 §4; the shape is final in M1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MySpace {
+    pub space_id: String,
+    /// `personal` | `team` | …
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub team_name: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub bytes_used: Option<u64>,
+    #[serde(default)]
+    pub quota_bytes: Option<u64>,
+}
+
+/// A space this account left or lost (M2 fills it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Departed {
+    pub space_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub team_name: Option<String>,
+}
+
+/// `GET /v1/me/spaces`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MySpaces {
+    pub spaces: Vec<MySpace>,
+    #[serde(default)]
+    pub departed: Vec<Departed>,
+}
+
 const DAY_MS: i64 = 86_400_000;
 
 /// Seconds, milliseconds or an ISO date, as ms.
@@ -850,6 +890,12 @@ impl AuthClient {
             )
             .await?;
         Ok(list.sessions)
+    }
+
+    /// `GET /v1/me/spaces` (04 §6.6 step 1).
+    pub async fn spaces(&self, access: &str) -> Result<MySpaces, AuthError> {
+        self.json(self.http.get(self.url("/v1/me/spaces")).bearer_auth(access))
+            .await
     }
 
     pub async fn revoke_session(&self, access: &str, id: &str) -> Result<(), AuthError> {
@@ -1113,6 +1159,22 @@ impl Session {
             .await
     }
 
+    pub async fn spaces(&self) -> Result<MySpaces, AuthError> {
+        self.call(|t| async move { self.client.spaces(&t).await })
+            .await
+    }
+
+    /// A second 401 after a refresh on another client (space sync): the
+    /// session is gone (AC-AUTH-9).
+    pub fn mark_sign_in_required(&self) {
+        self.sign_in_required.store(true, Ordering::SeqCst);
+    }
+
+    /// The server origin this session talks to.
+    pub fn origin(&self) -> &str {
+        self.client.base_url()
+    }
+
     /// Revoke this session on the server (best effort: a dead or
     /// unreachable session is still signed out locally by the caller).
     pub async fn logout(&self) -> Result<(), AuthError> {
@@ -1173,6 +1235,9 @@ pub struct AccountFile {
     pub server: Option<Discovery>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub sign_in_required: bool,
+    /// Space bindings (04 §6.1; C2). Written by the store only.
+    #[serde(flatten)]
+    pub bindings: crate::spaces::Bindings,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -1191,10 +1256,16 @@ impl Default for AccountFile {
             account: None,
             server: None,
             sign_in_required: false,
+            bindings: crate::spaces::Bindings::default(),
             extra: Extra::new(),
         }
     }
 }
+
+/// Serialises every read-modify-write of `account.json` in this process:
+/// the sign-in runtime writes the account part and the store writes the
+/// bindings, from different threads.
+static ACCOUNT_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl AccountFile {
     /// `Ok(None)` when the file is missing. A damaged file is renamed to
@@ -1223,10 +1294,21 @@ impl AccountFile {
         atomic_write(&dir.join(ACCOUNT_FILE), &bytes)
     }
 
+    /// Load (or start) the file, change it, and write it (or remove it when
+    /// nothing is left), all under one process-wide lock. Returns the file
+    /// as written.
+    pub fn update(dir: &Path, f: impl FnOnce(&mut AccountFile)) -> Result<AccountFile, StoreError> {
+        let _guard = ACCOUNT_FILE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut file = AccountFile::load(dir)?.unwrap_or_default();
+        f(&mut file);
+        file.save_or_remove(dir)?;
+        Ok(file)
+    }
+
     /// Write the file, or remove it when nothing is left in it (pure-legacy
     /// mode means `account.json` is absent, 04 §6.1).
     pub fn save_or_remove(&self, dir: &Path) -> Result<(), StoreError> {
-        if self.account.is_none() && self.extra.is_empty() {
+        if self.account.is_none() && self.extra.is_empty() && self.bindings.is_empty() {
             return match std::fs::remove_file(dir.join(ACCOUNT_FILE)) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1389,12 +1471,14 @@ pub async fn complete_sign_in(
         method,
         session_id: session.session_id().await,
     };
-    let mut file = AccountFile::load(dir)?.unwrap_or_default();
-    let previous = file.account.take();
-    file.account = Some(account.clone());
-    file.server = discovery;
-    file.sign_in_required = false;
-    if let Err(e) = file.save(dir) {
+    let mut previous = None;
+    let written = AccountFile::update(dir, |file| {
+        previous = file.account.take();
+        file.account = Some(account.clone());
+        file.server = discovery;
+        file.sign_in_required = false;
+    });
+    if let Err(e) = written {
         // Leave no orphaned tokens behind.
         let _ = delete_tokens(secrets.clone(), session.secret_key().to_string()).await;
         return Err(e.into());
@@ -1560,7 +1644,9 @@ mod tests {
         assert_eq!(AccountFile::load(dir.path()).unwrap(), None);
         let mut f = AccountFile::default();
         f.extra
-            .insert("spaces".into(), serde_json::json!([{"spaceId": "s1"}]));
+            .insert("teamsCache".into(), serde_json::json!([{"teamId": "t1"}]));
+        f.bindings.migrated_at = Some(1);
+        f.bindings.project_spaces.insert("p1".into(), "s1".into());
         f.account = Some(Account {
             server_url: "https://rh.acme.dev".into(),
             server_instance_id: "I".into(),
@@ -1576,13 +1662,18 @@ mod tests {
         assert_eq!(back, f);
         let raw = std::fs::read_to_string(dir.path().join(ACCOUNT_FILE)).unwrap();
         assert!(raw.contains("\"schemaVersion\": 1"));
-        assert!(raw.contains("\"spaces\""));
+        assert!(raw.contains("\"teamsCache\""));
+        assert!(raw.contains("\"projectSpaces\""));
+        assert!(raw.contains("\"migratedAt\": 1"));
         // Unknown keys keep the file alive when the account goes away.
         let mut gone = back.clone();
         gone.account = None;
         gone.save_or_remove(dir.path()).unwrap();
         assert!(dir.path().join(ACCOUNT_FILE).exists());
         gone.extra.clear();
+        gone.save_or_remove(dir.path()).unwrap();
+        assert!(dir.path().join(ACCOUNT_FILE).exists(), "bindings keep it");
+        gone.bindings = Default::default();
         gone.save_or_remove(dir.path()).unwrap();
         assert!(!dir.path().join(ACCOUNT_FILE).exists());
         // A damaged file is quarantined, not fatal.

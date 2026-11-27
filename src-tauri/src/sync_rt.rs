@@ -5,16 +5,28 @@
 //! No timers run while idle: tasks are only spawned in response to a save,
 //! a focus event, a failure (one retry timer) or an explicit "Sync now".
 
+use crate::auth_rt::AuthState;
 use crate::error::{CmdResult, CommandError};
 use crate::state::{AppState, SyncStatus};
 use crate::sync_policy::{self, FailureAction};
 use reqharbor_core::model::now_ms;
+use reqharbor_core::space_sync;
 use reqharbor_core::sync::{self, SyncError, SyncReport};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const EVENT_STATUS: &str = "sync://status";
 pub const EVENT_CHANGED: &str = "sync://changed";
+/// A one-off message for a toast (the fresh-device sign-in, UX §10).
+pub const EVENT_NOTICE: &str = "sync://notice";
+
+/// Payload of [`EVENT_NOTICE`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncNotice {
+    /// "info" or "success".
+    pub kind: &'static str,
+    pub message: String,
+}
 /// Debounce between a local save and the push (AC-SYNC-2).
 pub const PUSH_DEBOUNCE: Duration = Duration::from_secs(2);
 
@@ -23,12 +35,69 @@ fn emit_status(app: &AppHandle, status: &SyncStatus) {
 }
 
 fn current_token(state: &AppState) -> Option<String> {
-    state
-        .store()
-        .workspace
-        .sync
-        .as_ref()
-        .map(|s| s.token.clone())
+    let store = state.store();
+    if store.account_mode() {
+        return store.legacy_token.clone();
+    }
+    store.workspace.sync.as_ref().map(|s| s.token.clone())
+}
+
+/// Re-read the per-space status lines (account mode) and tell the UI.
+pub fn refresh_status(app: &AppHandle) -> SyncStatus {
+    let state = app.state::<AppState>();
+    let status = {
+        let mut store = state.store();
+        let pending = space_sync::pending_total(&store);
+        let skipped = space_sync::skipped_total(&mut store);
+        let unsupported = space_sync::unsupported_total(&store);
+        state.update_sync(|s| {
+            if store.account_mode() {
+                s.pending_changes = pending;
+                s.warning = sync_policy::sync_warning(&skipped, &unsupported);
+                s.skipped_entities = skipped;
+                s.unsupported_entities = unsupported;
+            }
+            sync_policy::refresh_spaces(s, &store);
+        })
+    };
+    emit_status(app, &status);
+    status
+}
+
+/// One account-mode run (04 §6.6): reconcile, pull, apply, push, status.
+async fn run_account(app: &AppHandle, token: Option<String>) -> CmdResult<SyncReport> {
+    let state = app.state::<AppState>();
+    let session = app.state::<AuthState>().session();
+    let run = space_sync::run(state.store_mutex(), session, space_sync::RUN_BUDGET).await;
+    if run.sign_in_required {
+        crate::auth_rt::signed_out_by_server(app);
+    }
+    let rotated = current_token(&state) != token;
+    let mut action = FailureAction::Stop;
+    state.update_sync(|s| action = sync_policy::on_account_run(s, &run, now_ms(), rotated));
+    match action {
+        FailureAction::Disconnect => {
+            // AC-SYNC-7 for the legacy token only: forget it, keep data.
+            let mut store = state.store();
+            let secrets = app.state::<AuthState>().secrets();
+            let _ = store.legacy_disconnect(secrets.as_ref());
+        }
+        FailureAction::Retry(delay) => schedule_retry(app, delay),
+        FailureAction::Stop => {}
+    }
+    refresh_status(app);
+    if run.changed() {
+        let _ = app.emit(EVENT_CHANGED, &run.report);
+    }
+    match run.error() {
+        Some(e) if run.scopes.iter().all(|s| s.error.is_some()) => {
+            Err(CommandError::from(e.clone()))
+        }
+        _ if run.sign_in_required && run.scopes.is_empty() => {
+            Err(CommandError::from(SyncError::SignInRequired))
+        }
+        _ => Ok(run.report),
+    }
 }
 
 /// Discovery (when due), pull with restore detection, then push the types
@@ -80,6 +149,12 @@ async fn sync_once(state: &AppState, client: &sync::SyncClient) -> Result<SyncRe
 pub async fn run_sync(app: &AppHandle) -> CmdResult<SyncReport> {
     let state = app.state::<AppState>();
     let _serial = state.sync_lock.lock().await;
+    if state.store().account_mode() {
+        let token = current_token(&state);
+        emit_status(app, &state.update_sync(sync_policy::begin));
+        state.retry.cancel();
+        return run_account(app, token).await;
+    }
     let (client, token) = {
         let store = state.store();
         let client = sync::client_for(&store)?;
@@ -146,15 +221,20 @@ fn schedule_retry(app: &AppHandle, delay: Duration) {
     });
 }
 
-/// Called after every local mutation: push within 2 s (debounced).
+/// Called after every local mutation: push within 2 s (debounced) when any
+/// scope can sync (04 §6.6: any active binding, or token sync).
 pub fn schedule_push(app: &AppHandle) {
     let state = app.state::<AppState>();
     let pending = {
         let store = state.store();
-        if store.workspace.sync.is_none() {
+        if !store.sync_active() {
             return;
         }
-        sync::pending_count(&store)
+        if store.account_mode() {
+            space_sync::pending_total(&store)
+        } else {
+            sync::pending_count(&store)
+        }
     };
     let status = state.update_sync(|s| s.pending_changes = pending);
     emit_status(app, &status);

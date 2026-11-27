@@ -39,6 +39,9 @@
     "check-circle": '<circle cx="8" cy="8" r="5.5"/><path d="M5.5 8.2l1.8 1.8 3.2-3.6"/>',
     "x-circle": '<circle cx="8" cy="8" r="5.5"/><path d="M6 6l4 4M10 6l-4 4"/>',
     upload: '<path d="M8 10.5v-8M5 5.5l3-3 3 3M3 13.5h10"/>',
+    users: '<circle cx="6" cy="5.5" r="2.25"/><path d="M2 13c0-2.2 1.8-3.75 4-3.75S10 10.8 10 13"/><path d="M10.5 3.6a2.2 2.2 0 0 1 0 4.1M12 9.6c1.2.5 2 1.7 2 3.4"/>',
+    device: '<rect x="2" y="3" width="12" height="8" rx="1.5"/><path d="M5.5 13.5h5M8 11v2.5"/>',
+    key: '<circle cx="5.5" cy="10.5" r="2.75"/><path d="M7.5 8.5l5.5-5.5M11 5l1.5 1.5M9.5 6.5L11 8"/>',
   };
 </script>
 

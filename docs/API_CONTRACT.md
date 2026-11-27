@@ -52,6 +52,15 @@ Backend: `src-tauri/src/commands.rs` (thin wrappers) over `crates/core` (`reqhar
 | `settings.json` may hold `knownServers` (UI-managed suggestions and per-origin choices, never secret). New files `account.json` and `secrets.json` (0600 fallback store). | §3.11, §4 |
 | Sync › Advanced: the field is labelled "Server URL"; a bad URL now reads "Server URL must start with https:// or http://". | §3.9 |
 
+### Accounts: personal sync and bindings (accounts plan M1-client C2)
+
+| Change | Where |
+|---|---|
+| New commands `project_locations`, `project_set_location`, `first_sync_candidates`, `first_sync_apply`, `space_notice_resolve`, `space_notice_later`, `legacy_merge`, `legacy_disconnect`; event `sync://notice`. `create_project` gains `location?`; `share_revoke` gains `spaceId?`. | §3.12 |
+| `SyncStatus` gains `accountMode`, `spaces: SpaceStatus[]`, `legacy: LegacyStatus \| null`, `firstSyncPending`; `SyncStateName` gains `signInRequired` and `paused`. `ShareInfo` gains `spaceId?`. | §3.9, §3.12 |
+| New error codes `read_only_role`, `space_unavailable`, `forbidden_role`; sync errors `sign_in_required`, `client_too_old`, `server_full` (retried), `rate_limited` (retried). A legacy 403 `legacy_disabled` reads "This server no longer accepts token sync. Sign in instead." | §1, §3.12 |
+| New file `sync-spaces.json` (+ backup); `account.json` holds the bindings. Signing in removes `sync` from `workspace.json`. | §3.12, §4 |
+
 ## 1. Calling convention
 
 ```ts
@@ -256,6 +265,7 @@ Events (subscribe with `listen`):
 | event | payload | UI action |
 |---|---|---|
 | `sync://status` | `SyncStatus` | sidebar sync indicator (§5.14 of DESIGN): hidden when `!connected` (unless `unauthorized`), `syncing` → dimmed icon, `offline` → warning, `unauthorized` → danger "Sync off" |
+| `sync://notice` | `SyncNotice` `{ kind, message }` | toast `message` (the fresh-device sign-in, UX §10) and reload |
 | `sync://changed` | `SyncReport` | reload `list_projects`, the open `get_project_tree`, `list_environments`; for each `conflicts[]` toast "Kept your edit as “{name}”" (AC-SYNC-4) |
 
 Synced: projects, collections, folders, requests, environments (secret values blanked; local secret values are kept on pull). Never synced: history, settings (AC-SYNC-3, AC-ENV-7).
@@ -288,7 +298,7 @@ Sanitising (AC-SHARE-2): secret variables are always removed from the attached e
 
 ### 3.11 Accounts (Settings → Account)
 
-There is no default server: the user types an address. The account is **inert for sync** in this milestone (personal spaces come with C2); token sync under Sync › Advanced is unchanged and may be used at the same time, even with another server.
+There is no default server: the user types an address. Signing in turns on personal sync (§3.12); token sync under Sync › Advanced keeps working at the same time, even with another server.
 
 | command | args | result |
 |---|---|---|
@@ -320,9 +330,39 @@ Plain-http acknowledgement: "Continue anyway" is stored per origin as `knownServ
 
 Mock backend switches (browser only): `?mockServer=ok|tokenOnly|legacyOnly|futureApi|otherPublicUrl|unreachable|notReqharbor|insecure|setup|tooOld` (also picked by a host containing the word, e.g. `https://tokenonly.example`), `?mockMethods=password,github,oidc`, `?mockAuth=ok|timeout|offline|denied|email_in_use|no_port|no_browser|keychain`, `?mockAuthDelay=<ms>` (0 = wait for `window.__mock.accounts.finishBrowser()`), `?mockAccount=signedIn|signInRequired|keychainUnreadable|file`, `?mockAccounts=off`.
 
+### 3.12 Personal sync and bindings (04 §6–§7, 06-go-server §9)
+
+**Modes.** *Pure-legacy* (no bindings in `account.json`): every project syncs with token sync exactly as in §3.9, byte for byte. *Account mode* (`account.json` has `migratedAt`, set by the first sign-in): `account.json → projectSpaces` is authoritative; a project without an entry is "This device only" and never produces traffic. Each bound space keeps its own cursor and bookkeeping in `sync-spaces.json` (same shape as `sync-state.json`, without the device id; written atomically with a backup).
+
+**Sign-in migration** (once, 04 §7). With token sync: the token moves to the secret store (`legacy:<remoteWorkspaceId>`; written first, so a failure changes nothing), the cursor and bookkeeping move into `sync-spaces.json["legacy"]`, every project and the Global bind to `legacy`, and `sync` is removed from `workspace.json` (a downgraded client stops syncing and can't push account data into the legacy workspace). Without token sync: nothing is bound until the first-sync answer (`firstSyncPending`), except a fresh device's untouched Default, which binds to Personal. Later sign-ins only pause bindings of another server, instance or account (`SpaceStatus.state = "paused"`, `reason = "foreignAccount"`): they never pull or push and are resolved with `space_notice_resolve`; signing back in as the account that bound them resumes them (no notice). A binding belongs to an account only for the same origin, user and `instanceId`; while the account's `instanceId` is unknown (no discovery yet) nothing binds or pushes, and the next discovery fills it in. The Global binds to Personal only after the first-sync answer with at least one project (or on a fresh device); "Keep all on this device" and Keep for another account's space leave it local. A fresh device's sign-in ends with `sync://notice` ("Signed in · syncing 4 projects from your account and 1 team."). A `sync` block that a downgraded build wrote to `workspace.json` in account mode for another workspace stays on disk until its token is in the secret store (`legacy:<remoteWorkspaceId>`), then leaves the file. Signing out keeps the bindings; account spaces show `signedOut` and token sync keeps going.
+
+**Run** (account mode): `GET /v1/me/spaces` (a binding is added for each new space of this account; a bound space is marked `removed` only when this 200 list lacks it); then pull every syncable scope in the order personal → legacy → teams within 30 s; apply under the store lock; push. Space calls use `/v1/spaces/{id}/sync` with the session (a 401 refreshes once and retries once; a dead session gives `signInRequired`, data untouched). 403 `not_a_member` / 404 `space_not_found` make the space `unavailable` (retried, data untouched). Pulled `updatedBy` is kept per space (`attribution`), never in the entity JSON. Push filtering by `sync.types` and restore detection (`syncEpoch`, cursor going down) apply per space as in §3.9.
+
+**Binding rules.** B1: bindings change only by a local action (sign-in migration, first-sync answer, Sync location…, merge, a space notice, or a project new to this device arriving in a space). B2: a pulled project known here but bound elsewhere is ignored. B3: a pulled child applies only when the parent named in its data, and its current local project, are bound to that space (nothing is relocated across spaces). B4: the Global environment syncs only with `globalSpace` (Personal, or legacy before the merge). B5: a pulled tombstone deletes only entities of that space. B7: when any space failed transiently in a run, the others apply upserts only and keep their cursor if the pull held deletes; after 3 such runs deletes apply anyway.
+
+**Clock skew** (04 §6.9, 06 §9): a per-change `clock_skew` keeps the change dirty and sets the space issue ("Your computer's clock is ahead by about 7 minutes. Changes can't sync until it's fixed."). Push responses carry `serverTime`; once the clock is within 60 s of it, entities rejected for skew whose remote version is unchanged are restamped to `max(now, syncedAt + 1)` and pushed ("Your clock was corrected; 3 changes will sync now."); one whose remote version changed meanwhile becomes a conflict copy instead, so a future timestamp never wins.
+
+| command | args | result |
+|---|---|---|
+| `create_project` | `name, location?` | `ProjectTree`. `location` omitted/null: Personal when signed in (D11), legacy with only token sync, else local; `"local"`; or a space id (`not_found` if unknown). |
+| `project_locations` | – | `ProjectLocation[]` in switcher order (pure-legacy: `legacy` when token sync is on, else `local`). |
+| `project_set_location` | `projectId, spaceId \| null` | `ProjectLocation[]`. To Personal: binds and stamps every entity newer (so an earlier "stop syncing" tombstone can't hide it). To `null`: tombstones in the old space for what it holds ("Removes it from your other devices. This copy stays."). Team moves arrive with teams (`invalid`). A legacy-bound project can't move to Personal here (`invalid`, B6: only `legacy_merge` does that, stopping token sync in the same step); legacy → `null` is allowed. |
+| `first_sync_candidates` | – | `FirstSyncCandidate[]` (unbound projects while `firstSyncPending`) |
+| `first_sync_apply` | `projectIds` | `SyncStatus`. The listed projects bind to Personal, the rest stay local; `[]` = "Keep all on this device". Nothing uploads before this, the Global included; it binds with the first checked project. |
+| `space_notice_resolve` | `spaceId, keep` | `SyncStatus`. For a paused or removed space: keep → its projects become local-only (team projects renamed "X (from Team)"); remove → they are dropped from this device. No tombstone either way. A Global held by that space stays local. |
+| `space_notice_later` | `spaceIds` | `SyncStatus`. × on the notice ("decide later", UX §6.9): the first × is remembered; after 7 days, while signed in, Keep applies by itself. |
+| `legacy_merge` | – | `LegacyMergeResult` `{ merged, report, syncError }`: the merge is local and done once it returns; the follow-up sync is reported on its own (`syncError` set, the merged data syncs later). Legacy projects and the Global rebind to Personal with the **same ids** and are re-sent (with their original device ids, so a second device's merge converges without duplicates); legacy switches to `sharesOnly` (no more pulls or pushes; share calls keep working). Idempotent. |
+| `legacy_disconnect` | – | `SyncStatus`. Forgets the legacy token; projects still bound to it become local-only. |
+
+Shares in account mode go to the entity's project space (`sync_not_connected` "Sharing needs this project to sync. Change its sync location to Personal first." for a local-only project; "This project's sync is paused, so it can't be shared. Resolve it in Settings › Sync first." when its binding isn't an active one of the signed-in account on the session's server — no request is sent then, so one server's tokens never go to another); `share_list` merges every space, tagging `spaceId`.
+
+The viewer guard (04 §6.8): every project-tree mutator refuses with `read_only_role` for a project in a space where the account is a viewer (teams, M2).
+
+Mock switches: `?mockSpace=quota|server_full|skew|client_too_old|unavailable`, `?mockTeam=1`, `?mockLegacy=1`, `?mockForeign=1` (with `mockAccount=signedIn`).
+
 ## 4. Storage (for reference)
 
-App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping, incl. `unknownChanges`), `history.jsonl`, `account.json` (signed in only; no tokens), `secrets.json` (only when the 0600 file store is used). Unknown keys in these files are preserved on rewrite (AC-FWD-1). Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
+App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping, incl. `unknownChanges`), `history.jsonl`, `account.json` (signed in, or bindings kept after sign-out; no tokens), `sync-spaces.json` + `sync-spaces.backup.json` (account mode), `secrets.json` (only when the 0600 file store is used). Unknown keys in these files are preserved on rewrite (AC-FWD-1). Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
 
 ## 5. Not provided by the backend (UI responsibility)
 

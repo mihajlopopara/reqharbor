@@ -14,6 +14,7 @@ import {
   type Environment,
   type HistorySummary,
   type Project,
+  type ProjectLocation,
   type ProjectTree,
   type Request,
   type ResponseMeta,
@@ -95,7 +96,16 @@ const defaultSync: SyncStatus = {
   skippedEntities: [],
   unsupportedEntities: [],
   warning: null,
+  accountMode: false,
+  spaces: [],
+  legacy: null,
+  firstSyncPending: false,
 };
+
+/** A key of what decides the project switcher's groups (bindings and space states). */
+function spacesKey(s: SyncStatus): string {
+  return `${s.accountMode}|${s.spaces.map((x) => `${x.spaceId}:${x.state}:${x.projectCount}`).join(",")}|${s.legacy?.mode ?? ""}`;
+}
 
 class AppStore {
   ready = $state(false);
@@ -124,6 +134,8 @@ class AppStore {
   sync = $state.raw<SyncStatus>(defaultSync);
   /** Sign-in state (`auth://status`). */
   auth = $state.raw<AuthStatus>(DEFAULT_AUTH);
+  /** Where each project syncs (account mode; the grouped switcher, UX §5.1). */
+  locations = $state.raw<ProjectLocation[]>([]);
   now = $state(Date.now());
 
   // editor
@@ -161,6 +173,9 @@ class AppStore {
   /** Not-synced items by id, with the reason (`SkippedEntity.reason`). */
   skippedReasons = $derived(new Map(this.sync.skippedEntities.map((s) => [s.id, s.reason] as const)));
   mod = $derived(this.platform === "macos" ? "⌘" : "Ctrl+");
+  locationById = $derived(new Map(this.locations.map((l) => [l.projectId, l] as const)));
+  /** Signed in with a readable session (the account part of the UI is on). */
+  signedIn = $derived(this.auth.enabled && !!this.auth.account && !this.auth.keychainUnreadable);
 
   private settingsTimer: ReturnType<typeof setTimeout> | null = null;
   private tick: ReturnType<typeof setInterval> | null = null;
@@ -169,12 +184,17 @@ class AppStore {
   async init(): Promise<void> {
     try {
       // QA-R2-007: subscribe before the startup load so an early pull isn't missed.
-      await listen("sync://status", (s) => (this.sync = s));
+      await listen("sync://status", (s) => this.onSyncStatus(s));
       await listen("auth://status", (s) => this.onAuth(s));
       await listen("sync://changed", (r) => {
         void this.reloadAll();
         for (const c of r.conflicts) toasts.warning(`Sync conflict: kept your edit as “${c.name}”`);
         if (r.restored) toasts.info(RESTORED_NOTICE);
+      });
+      await listen("sync://notice", (n) => {
+        void this.reloadAll();
+        if (n.kind === "success") toasts.success(n.message);
+        else toasts.info(n.message);
       });
       const b = await call("bootstrap", {});
       this.platform = b.platform;
@@ -183,7 +203,7 @@ class AppStore {
       this.settings = b.settings;
       this.projects = b.projects;
       this.environments = b.environments;
-      this.sync = b.sync;
+      this.sync = { ...defaultSync, ...b.sync };
       this.auth = { ...this.auth, enabled: !!b.accounts };
       if (b.accounts) {
         try {
@@ -197,7 +217,7 @@ class AppStore {
       this.exportKeepVariables = !!extra.exportKeepVariables;
       const pid = b.projects.find((p) => p.id === b.settings.activeProjectId)?.id ?? b.projects[0]?.id ?? null;
       this.activeProjectId = pid;
-      await Promise.all([this.loadTree(), this.loadVariables(), this.loadHistory(), this.loadDynamicVariables()]);
+      await Promise.all([this.loadTree(), this.loadVariables(), this.loadHistory(), this.loadDynamicVariables(), this.loadLocations()]);
       const last = b.settings.lastOpenedRequestId;
       if (last && this.index?.requestById.has(last)) this.openRequest(last, { reveal: true });
       for (const c of b.corruptFiles) {
@@ -206,7 +226,7 @@ class AppStore {
         toasts.error(`${name} couldn't be read${saved}`, c.renamedTo ? { actionLabel: "Copy path", action: () => void copyText(c.renamedTo) } : {});
       }
       // Anything that changed between bootstrap and now is picked up here.
-      this.sync = await call("get_sync_status", {});
+      this.onSyncStatus(await call("get_sync_status", {}));
       this.tick = setInterval(() => (this.now = Date.now()), 60_000);
       this.ready = true;
     } catch (e) {
@@ -218,7 +238,24 @@ class AppStore {
     if (this.tick) clearInterval(this.tick);
   }
 
+  /** A new sync status; the switcher's groups reload when bindings or space states change. */
+  onSyncStatus(s: SyncStatus) {
+    const next = { ...defaultSync, ...s };
+    const changed = spacesKey(next) !== spacesKey(this.sync);
+    this.sync = next;
+    if (changed) void this.loadLocations();
+  }
+
+  async loadLocations() {
+    try {
+      this.locations = await call("project_locations", {});
+    } catch {
+      this.locations = [];
+    }
+  }
+
   async reloadAll() {
+    void this.loadLocations();
     this.projects = await call("list_projects", {});
     if (!this.projects.some((p) => p.id === this.activeProjectId)) this.activeProjectId = this.projects[0]?.id ?? null;
     this.environments = await call("list_environments", {});
@@ -366,6 +403,11 @@ class AppStore {
     if (next.signIn.state === "success" && prev.signIn.state !== "success" && next.account) {
       toasts.success(`Signed in as ${next.account.name || next.account.email}`);
       this.rememberServer(next.account.serverUrl, { name: next.account.serverName, lastUsedAt: Date.now() });
+    }
+    // Signing in or out changes where projects sync (and their pause state).
+    if (!!prev.account !== !!next.account || prev.account?.userId !== next.account?.userId) {
+      void this.reloadAll();
+      void call("get_sync_status", {}).then((s) => this.onSyncStatus(s), () => {});
     }
   }
 
@@ -947,15 +989,31 @@ class AppStore {
   }
 
   // ───────────── projects ─────────────
-  async createProject(name: string) {
+  /** `location`: undefined = default (Personal when signed in), "local", or a space id (UX §5.2). */
+  async createProject(name: string, location?: string | null): Promise<boolean> {
     try {
-      const t = await call("create_project", { name });
+      const t = await call("create_project", { name, location: location ?? null });
       this.projects = await call("list_projects", {});
+      await this.loadLocations();
       await this.switchProject(t.project.id);
       ui.renaming = null;
       toasts.success(`Created project “${t.project.name}”`);
+      return true;
     } catch (e) {
       this.reportError(e);
+      return false;
+    }
+  }
+
+  /** Sync location… (AC-PROJ-3): a space id, or null for this device only. */
+  async setProjectLocation(projectId: string, spaceId: string | null): Promise<boolean> {
+    try {
+      this.locations = await call("project_set_location", { projectId, spaceId });
+      this.onSyncStatus(await call("get_sync_status", {}));
+      return true;
+    } catch (e) {
+      this.reportError(e);
+      return false;
     }
   }
 
@@ -964,6 +1022,7 @@ class AppStore {
       const t = await call("duplicate_project", { projectId: id });
       this.projects = await call("list_projects", {});
       this.environments = await call("list_environments", {});
+      await this.loadLocations();
       await this.switchProject(t.project.id);
       toasts.success(`Duplicated as “${t.project.name}”`);
     } catch (e) {
@@ -987,6 +1046,7 @@ class AppStore {
     try {
       this.projects = await call("delete_project", { projectId: id });
       this.environments = await call("list_environments", {});
+      void this.loadLocations();
       if (this.activeProjectId === id) {
         this.activeProjectId = null;
         await this.switchProject(this.projects[0].id);

@@ -31,7 +31,6 @@ fn main() {
             let dir = app.path().app_data_dir()?;
             let store = Store::open(&dir)
                 .map_err(|e| format!("Cannot open data dir {}: {e}", dir.display()))?;
-            let connected = store.workspace.sync.is_some();
             let state = AppState::new(store).map_err(|e| e.message)?;
             app.manage(state);
             // Sign-in state: account.json plus the keychain (or 0600 file).
@@ -46,6 +45,9 @@ fn main() {
             );
             let signed_in = enabled && auth.account_origin().is_some();
             app.manage(auth);
+            // Account mode: the signed-in account and the legacy token.
+            auth_rt::attach_store(app.handle());
+            let connected = app.state::<AppState>().store().sync_active();
             if signed_in {
                 // 06 §9: rediscover the account's server at app start.
                 let handle = app.handle().clone();
@@ -141,6 +143,14 @@ fn main() {
             commands::auth_me,
             commands::auth_sessions,
             commands::auth_session_revoke,
+            commands::project_locations,
+            commands::project_set_location,
+            commands::first_sync_candidates,
+            commands::first_sync_apply,
+            commands::space_notice_resolve,
+            commands::space_notice_later,
+            commands::legacy_merge,
+            commands::legacy_disconnect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ReqHarbor");

@@ -41,6 +41,12 @@ impl AppState {
         })
     }
 
+    /// The store's mutex, for runs that lock it briefly per step
+    /// (`space_sync::run`).
+    pub fn store_mutex(&self) -> &Mutex<Store> {
+        &self.store
+    }
+
     /// Lock the store. Never hold the guard across an `.await`.
     pub fn store(&self) -> MutexGuard<'_, Store> {
         self.store.lock().unwrap_or_else(|p| p.into_inner())

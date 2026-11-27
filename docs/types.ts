@@ -332,6 +332,12 @@ export type CommandErrorCode =
   | "server_error"
   /** Any other refusal from an account endpoint (message from the server). */
   | "auth_rejected"
+  // ── accounts: personal sync and bindings (04 §6, 06-go-server §9) ──
+  /** The project syncs with a space where this account is a viewer (04 §6.8). */
+  | "read_only_role"
+  /** 403 `not_a_member` / 404 `space_not_found` on a space call: temporarily unavailable, never a removal. */
+  | "space_unavailable"
+  | "forbidden_role"
   | "internal";
 
 export type PrepareErrorDetails =
@@ -539,7 +545,11 @@ export interface OpenApiImportResult {
   tree: ProjectTree;
 }
 
-export type SyncStateName = "disconnected" | "idle" | "syncing" | "offline" | "unauthorized" | "error";
+/**
+ * `signInRequired`: account mode, the session ended (account spaces wait; token sync keeps going).
+ * `paused`: account mode with nothing syncing right now (signed out, or every space paused).
+ */
+export type SyncStateName = "disconnected" | "idle" | "syncing" | "offline" | "unauthorized" | "error" | "signInRequired" | "paused";
 
 export interface SyncStatus {
   state: SyncStateName;
@@ -564,6 +574,85 @@ export interface SyncStatus {
   unsupportedEntities: SkippedEntity[];
   /** Non-fatal warning for the sync indicator, e.g. "1 item is too large to sync (over 512 KB): Big upload". */
   warning: string | null;
+  /** `account.json` holds bindings (04 §6.1): every project syncs with its own space or stays on this device. */
+  accountMode: boolean;
+  /** One entry per bound space: personal first, then teams, then the legacy workspace (UX §6.6, §11). */
+  spaces: SpaceStatus[];
+  /** The token-synced workspace while in account mode (UX §11 "LEGACY WORKSPACE"). */
+  legacy: LegacyStatus | null;
+  /** The first-sync checklist is waiting for an answer (UX §10): open `FirstSyncDialog`. */
+  firstSyncPending: boolean;
+}
+
+// ───────────────────────────── Spaces (04 §6, 06-go-server §9) ─────────────────────────────
+
+export type SpaceKind = "personal" | "team" | "legacy";
+/** "unknown": a role from a newer server, treated as read-only. */
+export type SpaceRole = "viewer" | "editor" | "admin" | "owner" | "unknown";
+/**
+ * `paused` (another server, instance or account signed in: `reason: "foreignAccount"`), `unavailable`
+ * (a transient 403/404; retried, local data untouched), `removed` (only after an authoritative
+ * `/v1/me/spaces`), `signedOut` (no account signed in), `sharesOnly` (legacy after the merge).
+ */
+export type SpaceStateName = "active" | "paused" | "unavailable" | "removed" | "signedOut" | "sharesOnly";
+
+/** A per-space problem; `message` is the UX §6.7 copy. */
+export interface SpaceIssue {
+  code: "quota" | "serverFull" | "clockSkew" | "clockFixed" | "clientTooOld" | "unavailable" | "legacyDisabled" | "error" | (string & {});
+  message: string;
+  at: number;
+}
+
+export interface SpaceStatus {
+  spaceId: string;
+  kind: SpaceKind;
+  /** "Personal", the team name, or "Legacy". */
+  name: string;
+  role: SpaceRole | null;
+  state: SpaceStateName;
+  /** Why it is paused ("foreignAccount") or removed ("removed", "left", …). */
+  reason: string | null;
+  issue: SpaceIssue | null;
+  lastSyncAt: number | null;
+  pendingChanges: number;
+  projectCount: number;
+  bytesUsed: number | null;
+  quotaBytes: number | null;
+  /** Items held back because this server doesn't take their type yet. */
+  unsupported: number;
+  /** The account that bound the space ("These projects were synced by priya@acme.dev"). */
+  accountEmail: string;
+}
+
+export interface LegacyStatus {
+  workerUrl: string;
+  remoteWorkspaceId: string;
+  /** "sharesOnly" after the merge: no pulls or pushes, share links still manageable. */
+  mode: "sync" | "sharesOnly";
+  projectCount: number;
+  /** The token could not be read from the secret store. */
+  tokenMissing: boolean;
+}
+
+/** Where a project syncs (the grouped project switcher, UX §5.1). */
+export interface ProjectLocation {
+  projectId: string;
+  /** null: this device only. */
+  spaceId: string | null;
+  kind: "personal" | "team" | "legacy" | "local";
+  /** "Personal", the team name, "Legacy workspace" or "This device only". */
+  label: string;
+  role: SpaceRole | null;
+  /** The binding's state; null for local-only projects. */
+  state: SpaceStateName | null;
+}
+
+/** One row of the first-sync checklist (UX §10). */
+export interface FirstSyncCandidate {
+  projectId: string;
+  name: string;
+  collections: number;
+  requests: number;
 }
 
 export interface SkippedEntity {
@@ -607,6 +696,25 @@ export interface ConflictCopy {
 
 export type EntityType = "project" | "collection" | "folder" | "request" | "environment";
 
+/** Payload of `sync://notice`: "Signed in · syncing 4 projects from your account and 1 team." */
+export interface SyncNotice {
+  kind: "info" | "success";
+  message: string;
+}
+
+/**
+ * `legacy_merge`: the merge is local and complete once the command returns; the follow-up sync
+ * is reported separately, so a failed sync never reads as a failed merge.
+ */
+export interface LegacyMergeResult {
+  /** Projects moved from the legacy workspace into Personal. */
+  merged: number;
+  /** The follow-up sync, when it succeeded. */
+  report: SyncReport | null;
+  /** Why the follow-up sync failed; the merged data syncs on a later run. */
+  syncError: CommandError | null;
+}
+
 export interface SyncReport {
   pushed: number;
   pulled: number;
@@ -640,6 +748,8 @@ export interface ShareInfo {
   name: string | null;
   createdAt: number | null;
   updatedAt: number | null;
+  /** Account mode: the space the share lives in ("legacy" for token sync). */
+  spaceId?: string | null;
 }
 
 export interface SharePreview {
@@ -790,6 +900,8 @@ export interface KnownServer {
 export interface Events {
   /** Sync indicator state changed (AC-SYNC-2/6/7). */
   "sync://status": SyncStatus;
+  /** A one-off message to toast, e.g. the fresh-device sign-in (UX §10). */
+  "sync://notice": SyncNotice;
   /** A pull changed local data: reload project trees + environments; toast conflicts. */
   "sync://changed": SyncReport;
   /** Sign-in progress, sign-out, session ended (AC-AUTH-9). */
@@ -806,7 +918,8 @@ export interface Commands {
 
   list_projects: { args: {}; result: Project[] };
   get_project_tree: { args: { projectId: string }; result: ProjectTree };
-  create_project: { args: { name: string }; result: ProjectTree };
+  /** `location`: omitted/null = default (Personal when signed in), "local" = this device only, or a space id. */
+  create_project: { args: { name: string; location?: string | null }; result: ProjectTree };
   rename_project: { args: { projectId: string; name: string }; result: Project };
   duplicate_project: { args: { projectId: string }; result: ProjectTree };
   delete_project: { args: { projectId: string }; result: Project[] };
@@ -904,7 +1017,7 @@ export interface Commands {
     };
     result: ShareInfo;
   };
-  share_revoke: { args: { shareId: string }; result: null };
+  share_revoke: { args: { shareId: string; spaceId?: string | null }; result: null };
   share_list: { args: {}; result: ShareInfo[] };
   import_share: { args: { url: string; projectId: string }; result: ShareImportResult };
   preview_share: {
@@ -927,6 +1040,22 @@ export interface Commands {
   auth_sessions: { args: {}; result: SessionInfo[] };
   /** Another device's session; this device signs out with auth_sign_out. */
   auth_session_revoke: { args: { sessionId: string }; result: null };
+
+  /** Where every project syncs (account mode; pure-legacy: "legacy" when token sync is on, else "local"). */
+  project_locations: { args: {}; result: ProjectLocation[] };
+  /** Sync location… (B1): a space id, or null for this device only. Team moves arrive with teams. */
+  project_set_location: { args: { projectId: string; spaceId: string | null }; result: ProjectLocation[] };
+  first_sync_candidates: { args: {}; result: FirstSyncCandidate[] };
+  /** The checked projects sync to Personal; the rest stay on this device (also "Keep all": `[]`). */
+  first_sync_apply: { args: { projectIds: string[] }; result: SyncStatus };
+  /** SpaceNoticeDialog: keep its projects as local-only copies, or remove them from this device. */
+  space_notice_resolve: { args: { spaceId: string; keep: boolean }; result: SyncStatus };
+  /** × on the space notice ("decide later", UX §6.9): Keep applies by itself after 7 days. */
+  space_notice_later: { args: { spaceIds: string[] }; result: SyncStatus };
+  /** Merge the token-synced workspace into Personal (same ids), then sync. Safe to repeat. */
+  legacy_merge: { args: {}; result: LegacyMergeResult };
+  /** Forget the legacy token; its share links keep working on the server. */
+  legacy_disconnect: { args: {}; result: SyncStatus };
 }
 
 export type CommandName = keyof Commands;

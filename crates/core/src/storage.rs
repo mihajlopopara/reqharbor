@@ -39,6 +39,10 @@ pub enum StoreError {
     /// (AC-FWD-3/4).
     #[error("{0}")]
     ReadOnlyNewer(String),
+    /// The project syncs with a space where this account is a viewer
+    /// (04 §6.8 `read_only_role`).
+    #[error("{0}")]
+    ReadOnlyRole(String),
 }
 
 impl From<std::io::Error> for StoreError {
@@ -354,6 +358,22 @@ pub struct Store {
     /// Unknown top-level keys of `workspace.json`, `environments.json` and
     /// `settings.json`, written back unchanged (AC-FWD-1).
     pub file_extras: FileExtras,
+    /// The binding part of `account.json` (04 §6.1); empty in pure-legacy
+    /// mode. See [`crate::spaces`].
+    pub bindings: crate::spaces::Bindings,
+    /// `sync-spaces.json`: per-space cursors and bookkeeping (account mode).
+    pub spaces_state: crate::spaces::SpacesFile,
+    /// The signed-in account (set by the shell after sign-in and sign-out).
+    pub account: Option<crate::spaces::AccountIdent>,
+    /// The legacy `rh_` token in account mode, read from the secret store
+    /// (never written to disk by the store).
+    pub legacy_token: Option<String>,
+    /// A `sync` block found in `workspace.json` in account mode that isn't
+    /// the migrated legacy link (a downgraded client connected token sync
+    /// again). It stays on disk until [`Store::secure_stray_sync`] has
+    /// moved its token to the secret store, so the only copy of that
+    /// credential is never dropped.
+    pub stray_sync: Option<SyncConfig>,
 }
 
 /// Unknown file-level keys, per file (AC-FWD-1).
@@ -452,6 +472,23 @@ impl Store {
             sync_state.device_id = new_id();
         }
         let history = History::open(dir.join("history.jsonl"))?;
+        let account_file = crate::auth::AccountFile::load(&dir)?;
+        let account = account_file
+            .as_ref()
+            .and_then(|f| f.account.as_ref())
+            .map(crate::spaces::AccountIdent::from);
+        let bindings = account_file.map(|f| f.bindings).unwrap_or_default();
+        let spaces_state = if bindings.migrated_at.is_some() {
+            let main = dir.join(crate::spaces::SPACES_FILE);
+            let before = corrupt.len();
+            let mut s = read_json::<crate::spaces::SpacesFile>(&main, &mut corrupt)?;
+            if s.is_none() && corrupt.len() > before {
+                s = read_json(&dir.join(crate::spaces::SPACES_BACKUP), &mut corrupt)?;
+            }
+            s.unwrap_or_default()
+        } else {
+            crate::spaces::SpacesFile::default()
+        };
 
         let mut store = Store {
             dir,
@@ -464,7 +501,30 @@ impl Store {
             corrupt,
             removed_projects: BTreeSet::new(),
             file_extras,
+            bindings,
+            spaces_state,
+            account,
+            legacy_token: None,
+            stray_sync: None,
         };
+        // A migration interrupted after account.json was written: finish it
+        // (a downgraded client must not find `sync` in workspace.json).
+        if store.account_mode()
+            && let Some(cfg) = store.workspace.sync.take()
+        {
+            if store
+                .bindings
+                .legacy
+                .as_ref()
+                .is_some_and(|l| l.remote_workspace_id == cfg.remote_workspace_id)
+            {
+                store.legacy_token = Some(cfg.token);
+                store.save_workspace()?;
+            } else {
+                // Another token: kept on disk until it is in the secret store.
+                store.stray_sync = Some(cfg);
+            }
+        }
         if fresh_workspace {
             store.save_workspace()?;
         }
@@ -510,11 +570,15 @@ impl Store {
     // ------------------------------------------------------------ persistence
 
     pub fn save_workspace(&self) -> Result<()> {
+        let mut workspace = self.workspace.clone();
+        if workspace.sync.is_none() {
+            workspace.sync = self.stray_sync.clone();
+        }
         write_json(
             &self.dir.join("workspace.json"),
             &WorkspaceFile {
                 schema_version: SCHEMA_VERSION,
-                workspace: self.workspace.clone(),
+                workspace,
                 extra: self.file_extras.workspace.clone(),
             },
         )
@@ -557,13 +621,16 @@ impl Store {
         )
     }
 
+    /// `sync-state.json` (with its backup) and, in account mode,
+    /// `sync-spaces.json`.
     pub fn save_sync_state(&self) -> Result<()> {
         let file = SyncStateFile {
             schema_version: SCHEMA_VERSION,
             state: self.sync_state.clone(),
         };
         write_json(&self.dir.join("sync-state.json"), &file)?;
-        write_json(&self.dir.join(SYNC_STATE_BACKUP), &file)
+        write_json(&self.dir.join(SYNC_STATE_BACKUP), &file)?;
+        self.save_spaces_state()
     }
 
     /// Persist everything (used after sync pulls).
@@ -579,7 +646,11 @@ impl Store {
             }
         }
         self.save_environments()?;
-        self.save_sync_state()
+        self.save_sync_state()?;
+        if self.account_mode() {
+            self.save_bindings()?;
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------- lookups
@@ -671,15 +742,21 @@ impl Store {
 
     // ---------------------------------------------------------- tombstones
 
-    fn tombstone(&mut self, entity_type: EntityType, id: &str) {
-        // Only entities the server knows about need a tombstone.
-        if self
-            .sync_state
-            .synced
-            .contains_key(&sync_key(entity_type, id))
-        {
-            self.sync_state.tombstones.retain(|t| t.id != id);
-            self.sync_state.tombstones.push(Tombstone {
+    /// Record a delete in the space the entity syncs with (`scope`, resolved
+    /// by the caller **before** the entity is removed, 04 §6.1). Only
+    /// entities that space knows about need a tombstone; a local-only
+    /// project records none.
+    fn tombstone(
+        &mut self,
+        scope: Option<&crate::spaces::Scope>,
+        entity_type: EntityType,
+        id: &str,
+    ) {
+        let Some(scope) = scope else { return };
+        let st = self.space_state_mut(scope);
+        if st.synced.contains_key(&sync_key(entity_type, id)) {
+            st.tombstones.retain(|t| t.id != id);
+            st.tombstones.push(Tombstone {
                 id: id.to_string(),
                 entity_type,
                 deleted_at: now_ms(),
@@ -694,7 +771,21 @@ impl Store {
 
     // ---------------------------------------------------------------- projects
 
+    /// Create a project with the default binding (04 §6.1 "New projects").
     pub fn create_project(&mut self, name: &str) -> Result<ProjectTree> {
+        let space = self.default_location();
+        self.create_project_at(name, space)
+    }
+
+    /// Create a project bound to `space` (`None`: this device only).
+    pub fn create_project_at(&mut self, name: &str, space: Option<String>) -> Result<ProjectTree> {
+        if let Some(sp) = &space
+            && sp != crate::spaces::LEGACY_SPACE
+            && self.account_mode()
+            && self.binding(sp).is_none()
+        {
+            return Err(StoreError::NotFound(format!("Space {sp}")));
+        }
         let name = non_empty(name)?;
         let now = now_ms();
         let sort_order = self
@@ -718,11 +809,16 @@ impl Store {
         let id = tree.project.id.clone();
         self.projects.insert(id.clone(), tree.clone());
         self.save_project(&id)?;
+        if self.account_mode() {
+            self.bind_new_project(&id, space);
+            self.save_bindings()?;
+        }
         Ok(tree)
     }
 
     pub fn rename_project(&mut self, id: &str, name: &str) -> Result<Project> {
         let name = non_empty(name)?;
+        self.write_guard(id)?;
         let t = self.project_mut(id)?;
         ensure_entity_editable(t.project.is_editable(), &t.project.name, "This project")?;
         t.project.name = name;
@@ -824,6 +920,22 @@ impl Store {
         self.projects.insert(new_pid.clone(), tree.clone());
         self.save_project(&new_pid)?;
         self.save_environments()?;
+        if self.account_mode() {
+            // The copy syncs where its source does, when this account may
+            // write there; otherwise where new projects go.
+            let same = self
+                .bindings
+                .project_spaces
+                .get(id)
+                .cloned()
+                .filter(|_| self.write_guard(id).is_ok());
+            let space = match same {
+                Some(s) => Some(s),
+                None => self.default_location(),
+            };
+            self.bind_new_project(&new_pid, space);
+            self.save_bindings()?;
+        }
         Ok(tree)
     }
 
@@ -834,6 +946,7 @@ impl Store {
             ));
         }
         first_read_only(self.project(id)?, |_| true, |_| true, |_| true, "delete")?;
+        self.write_guard(id)?;
         if let Some(e) = self
             .environments
             .iter()
@@ -844,20 +957,22 @@ impl Store {
                 "delete",
             ));
         }
+        let scope = self.scope_of_project(id);
+        let sc = scope.as_ref();
         let tree = self
             .projects
             .remove(id)
             .ok_or_else(|| StoreError::NotFound(format!("Project {id}")))?;
         for r in &tree.requests {
-            self.tombstone(EntityType::Request, &r.id);
+            self.tombstone(sc, EntityType::Request, &r.id);
         }
         for f in &tree.folders {
-            self.tombstone(EntityType::Folder, &f.id);
+            self.tombstone(sc, EntityType::Folder, &f.id);
         }
         for c in &tree.collections {
-            self.tombstone(EntityType::Collection, &c.id);
+            self.tombstone(sc, EntityType::Collection, &c.id);
         }
-        self.tombstone(EntityType::Project, id);
+        self.tombstone(sc, EntityType::Project, id);
         let env_ids: Vec<String> = self
             .environments
             .iter()
@@ -865,12 +980,15 @@ impl Store {
             .map(|e| e.id.clone())
             .collect();
         for eid in &env_ids {
-            self.tombstone(EntityType::Environment, eid);
+            self.tombstone(sc, EntityType::Environment, eid);
         }
         self.environments
             .retain(|e| e.project_id.as_deref() != Some(id));
         let _ = std::fs::remove_file(self.project_path(id));
         self.save_environments()?;
+        if self.bindings.project_spaces.remove(id).is_some() {
+            self.save_bindings()?;
+        }
         self.persist_tombstones()
     }
 
@@ -883,6 +1001,7 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound(format!("Project {id}")))?;
         let p = list.remove(pos);
         ensure_entity_editable(p.is_editable(), &p.name, "This project")?;
+        self.write_guard(id)?;
         list.insert(index.min(list.len()), p);
         let now = now_ms();
         // Read-only projects (AC-FWD-4) keep their sort order; the others
@@ -917,6 +1036,7 @@ impl Store {
 
     pub fn create_collection(&mut self, project_id: &str, name: &str) -> Result<Collection> {
         let name = non_empty(name)?;
+        self.write_guard(project_id)?;
         let now = now_ms();
         let t = self.project_mut(project_id)?;
         let sort_order = t
@@ -946,6 +1066,7 @@ impl Store {
     pub fn update_collection(&mut self, update: &Collection) -> Result<Collection> {
         let name = non_empty(&update.name)?;
         let pid = self.project_of(NodeKind::Collection, &update.id)?;
+        self.write_guard(&pid)?;
         let t = self.project_mut(&pid)?;
         let c = t
             .collections
@@ -975,6 +1096,7 @@ impl Store {
 
     pub fn duplicate_collection(&mut self, id: &str) -> Result<ProjectTree> {
         let pid = self.project_of(NodeKind::Collection, id)?;
+        self.write_guard(&pid)?;
         let src = self.project(&pid)?.clone();
         let c = src
             .collections
@@ -1009,6 +1131,8 @@ impl Store {
 
     pub fn delete_collection(&mut self, id: &str) -> Result<ProjectTree> {
         let pid = self.project_of(NodeKind::Collection, id)?;
+        self.write_guard(&pid)?;
+        let scope = self.scope_of_project(&pid);
         first_read_only(
             self.project(&pid)?,
             |_| false,
@@ -1033,12 +1157,12 @@ impl Store {
         t.folders.retain(|f| f.collection_id != id);
         t.collections.retain(|c| c.id != id);
         for r in &reqs {
-            self.tombstone(EntityType::Request, r);
+            self.tombstone(scope.as_ref(), EntityType::Request, r);
         }
         for f in &folders {
-            self.tombstone(EntityType::Folder, f);
+            self.tombstone(scope.as_ref(), EntityType::Folder, f);
         }
-        self.tombstone(EntityType::Collection, id);
+        self.tombstone(scope.as_ref(), EntityType::Collection, id);
         self.save_project(&pid)?;
         self.persist_tombstones()?;
         Ok(self.project(&pid)?.clone())
@@ -1054,6 +1178,7 @@ impl Store {
     ) -> Result<Folder> {
         let name = non_empty(name)?;
         let pid = self.project_of(NodeKind::Collection, collection_id)?;
+        self.write_guard(&pid)?;
         let t = self.project_mut(&pid)?;
         if let Some(parent) = parent_folder_id
             && !t
@@ -1083,6 +1208,7 @@ impl Store {
     pub fn rename_folder(&mut self, id: &str, name: &str) -> Result<Folder> {
         let name = non_empty(name)?;
         let pid = self.project_of(NodeKind::Folder, id)?;
+        self.write_guard(&pid)?;
         let t = self.project_mut(&pid)?;
         let f = t
             .folders
@@ -1099,6 +1225,7 @@ impl Store {
 
     pub fn duplicate_folder(&mut self, id: &str) -> Result<ProjectTree> {
         let pid = self.project_of(NodeKind::Folder, id)?;
+        self.write_guard(&pid)?;
         let src = self.project(&pid)?.clone();
         let folder = src
             .folders
@@ -1161,6 +1288,8 @@ impl Store {
 
     pub fn delete_folder(&mut self, id: &str) -> Result<ProjectTree> {
         let pid = self.project_of(NodeKind::Folder, id)?;
+        self.write_guard(&pid)?;
+        let scope = self.scope_of_project(&pid);
         let ids = descendant_folders(self.project(&pid)?, id);
         first_read_only(
             self.project(&pid)?,
@@ -1179,10 +1308,10 @@ impl Store {
         t.requests.retain(|r| !reqs.contains(&r.id));
         t.folders.retain(|f| !ids.contains(&f.id));
         for r in &reqs {
-            self.tombstone(EntityType::Request, r);
+            self.tombstone(scope.as_ref(), EntityType::Request, r);
         }
         for f in &ids {
-            self.tombstone(EntityType::Folder, f);
+            self.tombstone(scope.as_ref(), EntityType::Folder, f);
         }
         self.save_project(&pid)?;
         self.persist_tombstones()?;
@@ -1207,6 +1336,7 @@ impl Store {
             )));
         }
         let pid = self.project_of(NodeKind::Collection, collection_id)?;
+        self.write_guard(&pid)?;
         let t = self.project_mut(&pid)?;
         if let Some(fid) = folder_id
             && !t
@@ -1240,6 +1370,7 @@ impl Store {
     /// Requests from a newer ReqHarbor are refused (`ReadOnlyNewer`).
     pub fn save_request(&mut self, update: &Request) -> Result<Request> {
         let pid = self.project_of(NodeKind::Request, &update.id)?;
+        self.write_guard(&pid)?;
         if let Some(stored) = self.request(&update.id) {
             ensure_editable(stored)?;
         }
@@ -1276,6 +1407,7 @@ impl Store {
         let name = non_empty(name)?;
         let pid = self.project_of(NodeKind::Request, id)?;
         self.ensure_request_editable(id)?;
+        self.write_guard(&pid)?;
         let t = self.project_mut(&pid)?;
         let r = t
             .requests
@@ -1292,6 +1424,7 @@ impl Store {
     pub fn duplicate_request(&mut self, id: &str) -> Result<Request> {
         let pid = self.project_of(NodeKind::Request, id)?;
         self.ensure_request_editable(id)?;
+        self.write_guard(&pid)?;
         let t = self.project_mut(&pid)?;
         let src = t
             .requests
@@ -1313,9 +1446,11 @@ impl Store {
 
     pub fn delete_request(&mut self, id: &str) -> Result<ProjectTree> {
         let pid = self.project_of(NodeKind::Request, id)?;
+        self.write_guard(&pid)?;
+        let scope = self.scope_of_project(&pid);
         let t = self.project_mut(&pid)?;
         t.requests.retain(|r| r.id != id);
-        self.tombstone(EntityType::Request, id);
+        self.tombstone(scope.as_ref(), EntityType::Request, id);
         self.save_project(&pid)?;
         self.persist_tombstones()?;
         Ok(self.project(&pid)?.clone())
@@ -1334,6 +1469,7 @@ impl Store {
         index: usize,
     ) -> Result<ProjectTree> {
         let pid = self.project_of(kind, id)?;
+        self.write_guard(&pid)?;
         if kind == NodeKind::Request {
             self.ensure_request_editable(id)?;
         }
@@ -1537,6 +1673,7 @@ impl Store {
         folders: Vec<Folder>,
         requests: Vec<Request>,
     ) -> Result<ProjectTree> {
+        self.write_guard(project_id)?;
         let t = self.project_mut(project_id)?;
         collection.project_id = project_id.to_string();
         collection.sort_order = t
@@ -1593,6 +1730,7 @@ impl Store {
             ));
         };
         self.project(pid)?;
+        self.write_guard(pid)?;
         let now = now_ms();
         let sort_order = self
             .environments
@@ -1622,6 +1760,12 @@ impl Store {
     pub fn update_environment(&mut self, update: &Environment) -> Result<Environment> {
         let name = non_empty(&update.name)?;
         check_variable_names(&update.variables)?;
+        if let Some(pid) = self
+            .environment(&update.id)
+            .and_then(|e| e.project_id.clone())
+        {
+            self.write_guard(&pid)?;
+        }
         let e = self
             .environments
             .iter_mut()
@@ -1669,8 +1813,12 @@ impl Store {
                 "The Global environment cannot be deleted".into(),
             ));
         }
+        if let Some(pid) = &env.project_id {
+            self.write_guard(pid)?;
+        }
+        let scope = self.scope_of_env(&env);
         self.environments.retain(|e| e.id != id);
-        self.tombstone(EntityType::Environment, id);
+        self.tombstone(scope.as_ref(), EntityType::Environment, id);
         // Clear active selections pointing at it.
         // A read-only project (AC-FWD-4) keeps its now dangling selection,
         // which resolves to no environment.
