@@ -4,6 +4,7 @@
 use reqharbor_core::auth::AuthError;
 use reqharbor_core::curl::CurlError;
 use reqharbor_core::format::FormatError;
+use reqharbor_core::graphql::GraphqlError;
 use reqharbor_core::openapi::OpenApiError;
 use reqharbor_core::prepare::PrepareError;
 use reqharbor_core::storage::StoreError;
@@ -51,6 +52,35 @@ impl From<PrepareError> for CommandError {
         }
         let mut err = CommandError::new("validation", e.to_string());
         err.details = serde_json::to_value(&e).ok();
+        err
+    }
+}
+
+impl From<GraphqlError> for CommandError {
+    fn from(e: GraphqlError) -> Self {
+        let message = e.to_string();
+        let (code, details) = match e {
+            GraphqlError::Prepare(p) => return p.into(),
+            GraphqlError::Network(s) => ("graphql_network", serde_json::json!({ "kind": s.kind })),
+            GraphqlError::IntrospectionDisabled(server_message) => (
+                "graphql_introspection_disabled",
+                serde_json::json!({ "serverMessage": server_message }),
+            ),
+            GraphqlError::IntrospectionFailed { status, .. } => (
+                "graphql_introspection_failed",
+                serde_json::json!({ "status": status }),
+            ),
+            GraphqlError::Invalid(_) => ("graphql_schema_invalid", serde_json::Value::Null),
+            GraphqlError::TooLarge(size) => (
+                "graphql_schema_too_large",
+                serde_json::json!({ "sizeBytes": size }),
+            ),
+            GraphqlError::Io(_) => ("io", serde_json::Value::Null),
+        };
+        let mut err = CommandError::new(code, message);
+        if !details.is_null() {
+            err.details = Some(details);
+        }
         err
     }
 }

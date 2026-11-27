@@ -4,6 +4,7 @@
 mod auth_rt;
 mod commands;
 mod error;
+mod graphql_rt;
 mod registry;
 mod secret_store;
 mod state;
@@ -166,6 +167,11 @@ fn main() {
             commands::ws_send,
             commands::ws_ping,
             commands::ws_close,
+            graphql_rt::graphql_fetch_schema,
+            graphql_rt::graphql_cached_schema,
+            graphql_rt::graphql_load_schema_file,
+            graphql_rt::graphql_store_schema,
+            graphql_rt::graphql_clear_schema,
             teams_rt::teams_list,
             teams_rt::team_create,
             teams_rt::team_get,

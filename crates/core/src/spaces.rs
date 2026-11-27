@@ -1085,8 +1085,7 @@ impl Store {
             let from_kind = self.binding(from).map(|b| b.kind);
             if matches!(from_kind, Some(SpaceKind::Team | SpaceKind::Unknown)) {
                 return Err(StoreError::Invalid(
-                    "A project leaves a team with Move… (new ids), or use Copy to project…"
-                        .into(),
+                    "A project leaves a team with Move… (new ids), or use Copy to project…".into(),
                 ));
             }
         }
@@ -1669,7 +1668,9 @@ impl Store {
     /// role is read-only now. Freeze the unsynced changes for the banner.
     pub fn role_refused(&mut self, scope: &Scope) {
         let Scope::Space(id) = scope else { return };
-        let Some(b) = self.binding_mut(id) else { return };
+        let Some(b) = self.binding_mut(id) else {
+            return;
+        };
         if b.role.is_some_and(|r| r.can_write()) || b.role.is_none() {
             b.role = Some(Role::Viewer);
         }
@@ -1715,7 +1716,9 @@ impl Store {
             return None;
         }
         let a = self.space_sync(&scope).attribution.get(&key)?;
-        if a.user_id.is_empty() || Some(a.user_id.as_str()) == self.account.as_ref().map(|w| w.user_id.as_str()) {
+        if a.user_id.is_empty()
+            || Some(a.user_id.as_str()) == self.account.as_ref().map(|w| w.user_id.as_str())
+        {
             return None;
         }
         Some(EditedBy {

@@ -554,7 +554,9 @@ pub async fn ticket(link: &InviteLink) -> Result<String, AuthError> {
         )
         .await?;
     if t.ticket.is_empty() {
-        return Err(AuthError::Protocol("ticket response without a ticket".into()));
+        return Err(AuthError::Protocol(
+            "ticket response without a ticket".into(),
+        ));
     }
     Ok(t.ticket)
 }

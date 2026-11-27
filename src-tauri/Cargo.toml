@@ -32,3 +32,5 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# graphql_rt tests run a tiny HTTP server.
+tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "time"] }

@@ -87,7 +87,11 @@ async fn list_create_and_detail() {
     assert_eq!(teams::create(&s, "Globex").await.unwrap().team_id, "T2");
     let d = teams::detail(&s, "T1", "U1").await.unwrap();
     assert_eq!(d.members.len(), 2);
-    assert_eq!(d.invites.unwrap()[0].max_uses, None, "admins see invite links");
+    assert_eq!(
+        d.invites.unwrap()[0].max_uses,
+        None,
+        "admins see invite links"
+    );
     assert_eq!(d.me, "U1");
 }
 
@@ -135,14 +139,21 @@ async fn member_calls_send_the_documented_bodies_and_refusals_keep_their_code() 
         other => panic!("{other:?}"),
     };
     assert_eq!(
-        code(teams::remove_member(&s, "T1", "U1", false).await.unwrap_err()),
+        code(
+            teams::remove_member(&s, "T1", "U1", false)
+                .await
+                .unwrap_err()
+        ),
         "transfer_required"
     );
     assert_eq!(
         code(teams::transfer(&s, "T1", "U2").await.unwrap_err()),
         "quota_exceeded"
     );
-    assert_eq!(code(teams::leave(&s, "T1").await.unwrap_err()), "last_owner");
+    assert_eq!(
+        code(teams::leave(&s, "T1").await.unwrap_err()),
+        "last_owner"
+    );
 }
 
 #[tokio::test]
@@ -162,8 +173,13 @@ async fn the_server_url_wins_and_teams_disabled_is_a_code() {
         .mount(&server)
         .await;
     let s = session(&server);
-    let c = teams::create_invite(&s, "T1", "viewer", None, 30).await.unwrap();
-    assert_eq!(c.url, "https://rh.example.com/i#rhi_abc", "REQHARBOR_PUBLIC_URL's link");
+    let c = teams::create_invite(&s, "T1", "viewer", None, 30)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.url, "https://rh.example.com/i#rhi_abc",
+        "REQHARBOR_PUBLIC_URL's link"
+    );
     assert!(matches!(
         teams::list(&s).await.unwrap_err(),
         AuthError::Refused { code, .. } if code == "teams_disabled"
@@ -209,7 +225,9 @@ async fn invites_create_preview_accept_and_ticket() {
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/invites/ticket"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ticket": "tk_1", "expiresAt": 1})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"ticket": "tk_1", "expiresAt": 1})),
+        )
         .mount(&server)
         .await;
     let s = session(&server);
@@ -265,6 +283,9 @@ async fn a_401_refreshes_once_and_retries() {
         .await;
     let s = session(&server);
     let l = teams::list(&s).await.unwrap();
-    assert!(l.teams.is_empty() && l.create_lock().is_none(), "no limits sent: no lock");
+    assert!(
+        l.teams.is_empty() && l.create_lock().is_none(),
+        "no limits sent: no lock"
+    );
     assert_eq!(s.refresh_count(), 1);
 }

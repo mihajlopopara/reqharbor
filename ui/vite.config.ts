@@ -25,9 +25,22 @@ export default defineConfig({
     chunkSizeWarningLimit: 400,
   },
   // Unit tests run in node but must use Svelte's client runtime for runes stores.
-  ...(process.env.VITEST ? { resolve: { conditions: ["browser"] } } : {}),
+  // One graphql-js instance in tests, as in the app bundle: the GraphQL packages' ESM builds
+  // (Node would load graphql-language-service's CommonJS build with a second graphql-js).
+  ...(process.env.VITEST
+    ? {
+        resolve: {
+          conditions: ["browser"],
+          alias: [
+            { find: /^graphql$/, replacement: fileURLToPath(new URL("./node_modules/graphql/index.mjs", import.meta.url)) },
+            { find: /^graphql-language-service$/, replacement: fileURLToPath(new URL("./node_modules/graphql-language-service/esm/index.js", import.meta.url)) },
+          ],
+        },
+      }
+    : {}),
   test: {
     include: ["tests/unit/**/*.test.ts"],
     environment: "node",
+    server: { deps: { inline: ["graphql-language-service", "cm6-graphql"] } },
   },
 });

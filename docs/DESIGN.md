@@ -1,6 +1,6 @@
 # ReqHarbor — Design Spec (MVP)
 
-Status: ready for build · Owner: Design · Last updated: 2026-11-26 · Implements PRODUCT.md §2.1, §4, §5, §6
+Status: ready for build · Owner: Design · Last updated: 2026-11-27 · Implements PRODUCT.md §2.1, §4, §5, §6
 Files: `docs/design/tokens.css` (import as-is, single source of truth for values), `docs/design/mockup.html` (visual reference, open in a browser, theme toggle top-right).
 
 ## 1. Principles
@@ -141,14 +141,33 @@ Type select (dropdown, 180px): None, Inherit, Basic, Bearer, API Key. Fields sta
 - Sub-tabs as compact chips (22px, radius 4): None · JSON · XML · Text · Form · Form-encode · GraphQL · Binary. Selected chip: `--accent-soft` bg, `--accent-fg` text.
 - Label row: "JSON Content" (11.5, `--text-3`) left, **Format** link right (⌘⇧F; shown for JSON/XML/GraphQL variables). Format error: inline danger hint "Invalid JSON at line 4, col 12", cursor moved there, text untouched.
 - Editor: CodeMirror 6, mono 12.5/19, gutter 44px line numbers in `--text-3`, active line `--bg-code-active-line`, no gutter border, bracket matching, fold arrows on hover. Syntax via `--syn-*` tokens. Unresolved `{{vars}}` decorated as in the URL.
-- GraphQL: Query editor (flex) above Variables editor (min 80px) separated by a horizontal splitter; invalid variables JSON → danger hint under Variables and Send shows tooltip "Fix GraphQL variables".
+- GraphQL: Query editor (flex 2) above Variables editor (flex 1, min 100px); invalid variables JSON → danger hint under Variables and Send shows tooltip "Fix GraphQL variables". Schema bar, operation picker, lint, hover and the Docs explorer: §5.9a.
 - Form / Form-encode: KV table (§5.7). Form file rows show a "Choose file…" button + filename.
 - Binary: drop zone (only dashed border in the app, 1px `--border-strong`, radius 6, 120px): "Drop a file or **Choose file…**"; selected → file name, size, path (mono, ellipsis middle), "Replace" / "Remove".
 - None: muted line "This request has no body."
 
+### 5.9a GraphQL body (AC-GQL-*)
+Same chrome as the other bodies: chips row, then a **schema bar**, then the two bordered editor cards, optionally the Docs explorer beside them.
+- **Schema bar** (one 28px line under the chips, 11.5px, pane padding 12px; never wraps: the status text ellipsizes, links don't shrink). Leading 14px book icon `--text-3`.
+  - None: `--text-3` "No schema · needed for completion and checks" · right: links **Fetch schema** (disabled with tooltip "Enter a URL first" when the URL is empty) and **Load from file…**.
+  - Fetching / loading: 12px spinner (static under reduced motion) + `--text-3` "Fetching schema…" + **Cancel** link.
+  - Ready: "Schema" `--text-1` + `--text-3` " · 42 types · fetched 2m ago" (file: " · from schema.graphql · loaded 2m ago"; tooltip: URL · size) · optional `--warning` "⚠ Schema has problems: queries aren't validated" · right: Refresh icon button (14px, "Refresh schema (introspection)"), ghost small **Docs** toggle (`aria-pressed`), `⋯` (Refresh schema, Load from file…, separator, Forget schema).
+  - Errors sit under the bar as a hint (§4 Invalid): `.hint.warn` for "Introspection is disabled on this server." + the server's message in mono `--text-3` + **Load from file…**; `.hint.danger` for network / other failures + **Retry**; an × dismisses.
+- **Query card head:** "Query" left; right: **Operation** picker when the document has ≥ 2 named operations (label 11.5 `--text-3` + 22px select, mono 11.5, "GetUser · query", max 200px, chevron like DR-012) and **Format** (tooltip "Prettify the query ⌘⇧F"). **Variables card head:** "Variables" + `--text-3` " · GetUser" (with several operations), Insert fake data, Format.
+- **Syntax colours** (cm6-graphql tags → tokens): keywords `--syn-bool`; fields `--syn-key`; type names `--syn-tag`; arguments `--syn-attr`; `$variables` and enum values `--syn-number`; directives `--syn-attr`; strings / descriptions `--syn-string`; `#` comments `--syn-comment`; punctuation `--syn-punct`. `{{vars}}` keep §5.4 decorations on top.
+- **Autocomplete popover:** the §5.4 completion list (mono 11.5, `--accent-soft` selected row); GraphQL labels in `--text-1` (environment variables stay `--var-fg`), type / detail `--text-3`; the description shows in a side info panel (`--bg-raised`, UI font 11.5 `--text-2`, max 320px).
+- **Diagnostics:** errors get a wavy `--danger` underline, warnings a wavy `--warning` one (no bitmap squiggles, same style as unresolved variables); hovering shows the lint tooltip: `--bg-raised`, 3px left border in the severity colour, 11.5px message, max 420px. **Hover docs:** popover above the word: signature in mono `--syn-key`, description below in `--text-2`, max 360px.
+- **Docs explorer** (§1 principle 2: a hairline, not a card): 280px column right of the editors with a 1px `--border-subtle` left rule, `--bg-pane`. When the editors' area is narrower than 640px (container query) it moves **below** the editors at 45% height (min 180px) with a top hairline, so the caret stays visible while inserting.
+  - Head 30px (`--bg-sidebar`, like the card heads): Back chevron (type pages) or book icon · title (`--fs-md` 500: "Schema" or the type name) · Close ×.
+  - Pill search (26px) "Search types and fields"; results are 26px rows: mono `Type.field(arg)` + `--text-3` type / kind right-aligned.
+  - Home: group headers (`--fs-xs` uppercase +0.06em `--text-3`) **Root types** (`query` in `--syn-bool` + type name `--syn-tag`) and **All types n** (name `--syn-tag` + kind `--text-3`).
+  - Type page: kind (`--fs-xs` uppercase) + "implements" links, description `--text-2`, then **Fields** / **Input fields** / **Values** / **Members**. Field rows: mono 11.5 signature `name(arg: Type = default): Type` — name `--syn-key`, args `--syn-attr`, defaults `--syn-number`, punctuation `--syn-punct`, every named type a `--syn-tag` link (underline on hover); description below `--text-2`; deprecated names struck through with "Deprecated: reason" in `--warning`; hairlines between rows; the row a search or Cmd-click targeted gets `--accent-soft`. **Insert** is a 24px `+` icon button at the row's top-right, shown on row hover / keyboard focus (always on touch), only for object and interface fields.
+  - Esc in the explorer: clears the search, then goes back, then closes.
+- **Response:** GraphQL `errors` add a chip to the status strip after Time (§5.10): 22px, radius 3, `--danger` text on `--danger-soft`, alert icon + "2 GraphQL errors"; click opens a 340px popover anchored right (`--bg-raised`, max 320px tall, scrolls) listing each message with its path / location in mono `--text-3`, hairlines between.
+
 ### 5.10 Response viewer
 - **Row 1:** `--text-3` "Sent 2m ago · Staging" (history entries: "From history · Nov 24, 14:02" + **Re-send** link); icon buttons Copy body, Save to file, Layout toggle.
-- **Status strip (row 2):** `Status [200 OK]  Size 247 B  Time 184 ms` — labels `--text-2` 12.5, values `--text-1` mono tabular. Size tooltip "Wire size 198 B (gzip)". Unresolved vars at send time append an amber item "⚠ 2 unresolved variables" (click → list popover).
+- **Status strip (row 2):** `Status [200 OK]  Size 247 B  Time 184 ms` — labels `--text-2` 12.5, values `--text-1` mono tabular. Size tooltip "Wire size 198 B (gzip)". A GraphQL answer with `errors` appends the danger chip "⚠ 2 GraphQL errors" (§5.9a). Unresolved vars at send time append an amber item "⚠ 2 unresolved variables" (click → list popover).
 - **Tabs:** Response / Headers n / Cookies n. Right side: segmented Pretty | Raw (JSON/XML), Preview | Raw (images), hidden for plain text.
 - Pretty: read-only CodeMirror with highlighting, folding, line numbers; ⌘F opens search. Raw: same viewer, no highlighting, soft-wrap on.
 - Binary: centered info "application/pdf · 1.2 MB" + **Save to file** (secondary). Image preview: centered on a checkerboard of `--bg-input`/`--bg-pane`, max 100 %, with dimensions under it.

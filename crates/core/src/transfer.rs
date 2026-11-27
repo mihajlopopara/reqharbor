@@ -160,12 +160,8 @@ fn reid(
     envs: &[Environment],
     id_map: &mut BTreeMap<String, String>,
 ) -> (ProjectTree, Vec<Environment>) {
-    let mut map = |old: &str| -> String {
-        id_map
-            .entry(old.to_string())
-            .or_insert_with(new_id)
-            .clone()
-    };
+    let mut map =
+        |old: &str| -> String { id_map.entry(old.to_string()).or_insert_with(new_id).clone() };
     let pid = map(&tree.project.id);
     let mut out = tree.clone();
     out.project.id = pid.clone();
@@ -204,12 +200,7 @@ fn value<T: Serialize>(v: &T) -> Value {
 }
 
 /// The changes that put a (re-id'd) project into `to`, parents first.
-fn copy_changes(
-    tree: &ProjectTree,
-    envs: &[Environment],
-    device: &str,
-    team: bool,
-) -> Vec<Change> {
+fn copy_changes(tree: &ProjectTree, envs: &[Environment], device: &str, team: bool) -> Vec<Change> {
     let mut out = Vec::new();
     let mut push = |t: EntityType, id: &str, updated_at: i64, data: Value| {
         out.push(Change {
@@ -371,8 +362,7 @@ impl Store {
             id_map: BTreeMap::new(),
             applied: BTreeMap::new(),
             created_at: now_ms(),
-            target_cursor: target
-                .and_then(|t| self.scope_cursor(&Scope::from_id(t))),
+            target_cursor: target.and_then(|t| self.scope_cursor(&Scope::from_id(t))),
         };
         self.move_copy(&mut plan)?;
         self.save_plan(&plan)?;
@@ -394,9 +384,7 @@ impl Store {
         let device = self.device_id().to_string();
         Ok(copy_changes(&tree, &envs, &device, team)
             .into_iter()
-            .filter(|c| {
-                plan.applied.get(&sync_key(c.entity_type, &c.id)) != Some(&c.updated_at)
-            })
+            .filter(|c| plan.applied.get(&sync_key(c.entity_type, &c.id)) != Some(&c.updated_at))
             .collect())
     }
 
@@ -630,7 +618,11 @@ impl Store {
                     id: fresh(&c.id),
                     project_id: target_project.to_string(),
                     sort_order: next_sort(
-                        target_tree.collections.iter().map(|x| x.sort_order).collect(),
+                        target_tree
+                            .collections
+                            .iter()
+                            .map(|x| x.sort_order)
+                            .collect(),
                     ),
                     created_at: now,
                     updated_at: now,
@@ -701,7 +693,11 @@ impl Store {
                             id: new_id(),
                             project_id: target_project.to_string(),
                             sort_order: next_sort(
-                                target_tree.collections.iter().map(|x| x.sort_order).collect(),
+                                target_tree
+                                    .collections
+                                    .iter()
+                                    .map(|x| x.sort_order)
+                                    .collect(),
                             ),
                             created_at: now,
                             updated_at: now,
@@ -1119,8 +1115,10 @@ pub fn plain_credentials(r: &Request) -> Vec<CredentialRow> {
     let mut out = Vec::new();
     for h in &r.headers {
         let k = h.key.trim().to_ascii_lowercase();
-        if matches!(k.as_str(), "authorization" | "proxy-authorization" | "cookie")
-            && plain_text(&h.value)
+        if matches!(
+            k.as_str(),
+            "authorization" | "proxy-authorization" | "cookie"
+        ) && plain_text(&h.value)
         {
             let label = match k.as_str() {
                 "cookie" => "Cookie header",
@@ -1178,8 +1176,16 @@ fn file_paths(r: &Request) -> usize {
 
 fn request_text(r: &Request) -> Vec<String> {
     let mut v = vec![r.url.clone()];
-    v.extend(r.params.iter().flat_map(|k| [k.key.clone(), k.value.clone()]));
-    v.extend(r.headers.iter().flat_map(|k| [k.key.clone(), k.value.clone()]));
+    v.extend(
+        r.params
+            .iter()
+            .flat_map(|k| [k.key.clone(), k.value.clone()]),
+    );
+    v.extend(
+        r.headers
+            .iter()
+            .flat_map(|k| [k.key.clone(), k.value.clone()]),
+    );
     v.extend(r.body.text.clone());
     if let Some(g) = &r.body.graphql {
         v.push(g.query.clone());
@@ -1226,7 +1232,9 @@ impl Store {
             name: tree.project.name.clone(),
             target_name: space_name(self, target),
             target_kind: target_kind(self, target),
-            member_count: target.and_then(|t| self.binding(t)).and_then(|b| b.member_count),
+            member_count: target
+                .and_then(|t| self.binding(t))
+                .and_then(|b| b.member_count),
             items: 1
                 + tree.collections.len()
                 + tree.folders.len()
@@ -1285,7 +1293,10 @@ impl Store {
                     let c = src.collections.iter().find(|c| c.id == id);
                     (
                         c.map(|c| c.name.clone()).unwrap_or_default(),
-                        src.requests.iter().filter(|r| r.collection_id == id).collect(),
+                        src.requests
+                            .iter()
+                            .filter(|r| r.collection_id == id)
+                            .collect(),
                         src.folders.iter().filter(|f| f.collection_id == id).count(),
                         1,
                     )
@@ -1490,11 +1501,8 @@ pub async fn cancel_move(
     session: Option<Arc<Session>>,
     move_id: &str,
 ) -> std::result::Result<(), TransferError> {
-    let Some(plan) = store.with(|s| {
-        s.pending_moves()
-            .into_iter()
-            .find(|p| p.move_id == move_id)
-    }) else {
+    let Some(plan) = store.with(|s| s.pending_moves().into_iter().find(|p| p.move_id == move_id))
+    else {
         return Ok(());
     };
     let copy_here = plan
@@ -1613,10 +1621,16 @@ mod tests {
         .unwrap();
         let rows = collection_credentials(&c);
         assert_eq!(rows[0].field, "Collection auth: Basic auth password");
-        assert_eq!((rows[0].tab.as_str(), rows[0].request_name.as_str()), ("collection", "Billing"));
+        assert_eq!(
+            (rows[0].tab.as_str(), rows[0].request_name.as_str()),
+            ("collection", "Billing")
+        );
         // A variable reference isn't plain text.
         let c2 = Collection {
-            auth: serde_json::from_value(serde_json::json!({"type": "bearer", "token": "{{token}}"})).unwrap(),
+            auth: serde_json::from_value(
+                serde_json::json!({"type": "bearer", "token": "{{token}}"}),
+            )
+            .unwrap(),
             ..c
         };
         assert!(collection_credentials(&c2).is_empty());
@@ -1647,7 +1661,10 @@ mod tests {
         assert_eq!(child.parent_folder_id.as_ref(), Some(&parent.id));
         assert_eq!(copy.requests[0].folder_id.as_ref(), Some(&child.id));
         assert_eq!(cenvs[0].project_id.as_ref(), Some(&copy.project.id));
-        assert_eq!(copy.project.active_environment_id.as_ref(), Some(&cenvs[0].id));
+        assert_eq!(
+            copy.project.active_environment_id.as_ref(),
+            Some(&cenvs[0].id)
+        );
         // The same map gives the same ids again (resumable moves).
         let (again, _) = reid(&t, &envs, &mut map);
         assert_eq!(again, copy);

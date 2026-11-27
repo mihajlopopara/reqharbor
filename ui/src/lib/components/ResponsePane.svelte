@@ -8,6 +8,7 @@
   import { prettyJson } from "../util/json";
   import { withBaseHref } from "../util/preview";
   import { shortcutKeys } from "../util/shortcuts";
+  import { graphqlErrorsLabel, graphqlErrorsOf } from "../util/graphql";
   import CodeEditor from "./CodeEditor.svelte";
   import Icon from "./Icon.svelte";
 
@@ -18,6 +19,7 @@
   let mode = $state<"pretty" | "raw" | "preview">("pretty");
   let elapsed = $state(0);
   let showUnresolved = $state(false);
+  let showGqlErrors = $state(false);
 
   const view = $derived(app.currentResponse);
   const meta = $derived(view?.response ?? null);
@@ -27,6 +29,8 @@
   const limited = $derived(!!view?.bodyLimited);
   const previewHtml = $derived(kind === "html" && mode === "preview" && text !== null ? withBaseHref(text, meta?.finalUrl ?? view?.resolvedUrl) : "");
   const canPretty = $derived(!limited && (kind === "json" || kind === "xml" || kind === "html"));
+  /** AC-GQL-11: `errors` in a GraphQL answer, whatever the status. */
+  const gqlErrors = $derived(view?.graphql && kind === "json" && !limited ? graphqlErrorsOf(text) : []);
 
   let xmlPretty = $state<{ src: string; out: string | null } | null>(null);
   const prettyText = $derived.by(() => {
@@ -61,6 +65,7 @@
     lastKey = key;
     mode = kind === "image" ? "preview" : "pretty";
     showUnresolved = false;
+    showGqlErrors = false;
   });
 
   let imgUrl = $state<string | null>(null);
@@ -178,6 +183,24 @@
           ></span
         >
         <span>Time <b data-testid="response-time">{formatMs(meta.timeMs)}</b></span>
+        {#if gqlErrors.length}
+          <span class="unres-wrap">
+            <button class="gql-errs" type="button" onclick={() => (showGqlErrors = !showGqlErrors)} aria-expanded={showGqlErrors} data-testid="graphql-errors-badge">
+              <Icon name="alert" small />{graphqlErrorsLabel(gqlErrors.length)}
+            </button>
+            {#if showGqlErrors}
+              <div class="menu pop unres-list gql-list" role="dialog" aria-label="GraphQL errors" data-testid="graphql-errors-list">
+                {#each gqlErrors.slice(0, 20) as e, i (i)}
+                  <div class="gql-err">
+                    <span>{e.message}</span>
+                    {#if e.path || e.location}<span class="faint mono small">{[e.path, e.location ? `line ${e.location}` : null].filter(Boolean).join(" · ")}</span>{/if}
+                  </div>
+                {/each}
+                {#if gqlErrors.length > 20}<div class="faint small">and {gqlErrors.length - 20} more in the response</div>{/if}
+              </div>
+            {/if}
+          </span>
+        {/if}
       {:else if view?.error}
         <span
           >Status <span class="status-pill {view.error.kind === 'cancelled' ? 'scan' : 'serr'}" data-testid="response-status"
@@ -411,6 +434,41 @@
     color: var(--warning);
     font-size: var(--fs-md);
     padding: 0;
+  }
+  /* AC-GQL-11: danger chip (colored text on its soft tint, like status chips). */
+  .gql-errs {
+    display: inline-flex;
+    gap: var(--sp-2);
+    align-items: center;
+    height: 22px;
+    padding: 0 var(--sp-3);
+    border: 0;
+    border-radius: var(--r-xs);
+    background: var(--danger-soft);
+    color: var(--danger);
+    font-size: var(--fs-md);
+    white-space: nowrap;
+  }
+  .gql-errs:hover {
+    background: var(--bg-active);
+  }
+  .unres-list.gql-list {
+    left: auto;
+    right: 0;
+    width: 340px;
+    max-height: 320px;
+    overflow: auto;
+  }
+  .gql-err {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-1);
+    padding-bottom: var(--sp-2);
+    border-bottom: 1px solid var(--border-subtle);
+    word-break: break-word;
+  }
+  .gql-err:last-child {
+    border-bottom: 0;
   }
   .unres-list {
     position: absolute;

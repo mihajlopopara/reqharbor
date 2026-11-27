@@ -340,7 +340,10 @@ fn ac_ws_1_ws_config_defaults_round_trip_and_unknown_parts_are_read_only() {
         serde_json::from_value(json!({"id": "y", "kind": "ws", "minClientVersion": "0.0.1"}))
             .unwrap();
     kept.stamp_min_client_version();
-    assert_eq!(kept.min_client_version.as_deref(), Some(WS_MIN_CLIENT_VERSION));
+    assert_eq!(
+        kept.min_client_version.as_deref(),
+        Some(WS_MIN_CLIENT_VERSION)
+    );
     // Never the running version: a newer stamp is kept, the WS one isn't bumped
     // to this build (a later patch build mustn't lock out older WS builds).
     let mut newer: Request =

@@ -40,6 +40,8 @@ import { toasts } from "./toasts.svelte";
 import { ui } from "./ui.svelte";
 import { ws } from "./ws.svelte";
 import { messageError, switchKind } from "../util/ws";
+import { hasComments, withOperation } from "../util/graphql";
+import { shortcutText } from "../util/shortcuts";
 
 export const BODY_LIMIT = 5 * 1024 * 1024;
 
@@ -64,7 +66,12 @@ export interface ResponseView {
   bodyError: string | null;
   /** A WebSocket session restored from history (AC-WS-7). */
   wsSummary?: WsSessionSummary | null;
+  /** The request had a GraphQL body: the strip counts `errors` in a JSON answer (AC-GQL-11). */
+  graphql?: boolean;
 }
+
+/** Which GraphQL editor a Format error belongs to (AC-GQL-7). */
+export type FormatTarget = "body" | "query" | "variables";
 
 export const DEFAULT_AUTH: AuthStatus = {
   enabled: false,
@@ -158,7 +165,9 @@ class AppStore {
   inflight = $state.raw<Record<string, { executionId: string; startedAt: number }>>({});
   /** Inline validation shown in the request bar / body. */
   sendBlocked = $state<string | null>(null);
-  formatError = $state<{ message: string; line: number; column: number } | null>(null);
+  formatError = $state<{ message: string; line: number; column: number; target?: FormatTarget } | null>(null);
+  /** AC-GQL-7: Format removed `#` comments from this request's query. */
+  formatNotice = $state<{ requestId: string; message: string } | null>(null);
   /** Undo snapshot for "Imported from cURL". */
   private undoRequest: Request | null = null;
   exportKeepVariables = $state(false);
@@ -659,7 +668,8 @@ class AppStore {
 
   async send() {
     if (this.request.kind === "ws") return this.wsConnect();
-    const req = $state.snapshot(this.request) as Request;
+    // AC-GQL-9: send the operation the picker shows (stored requests may lack or carry a stale one).
+    const req = withOperation($state.snapshot(this.request) as Request);
     if (this.readOnly) {
       this.sendBlocked = NEEDS_NEWER_VERSION;
       return;
@@ -701,6 +711,7 @@ class AppStore {
         body: null,
         bodyLimited: false,
         bodyError: null,
+        graphql: req.body.type === "graphql",
       };
       this.setResponse(view);
       void this.loadHistory();
@@ -847,6 +858,7 @@ class AppStore {
         bodyLimited: false,
         bodyError: null,
         wsSummary: entry.ws ?? null,
+        graphql: entry.request.body?.type === "graphql",
       };
       this.setResponse(view);
       if (response) void this.fetchBody(view);
@@ -905,14 +917,39 @@ class AppStore {
   }
 
   // ───────────── body tools ─────────────
-  async formatBody(): Promise<{ line: number; column: number } | null> {
+  /**
+   * Format (AC-REQ-6) the body; for GraphQL (AC-GQL-7) the query (prettified), the variables
+   * (JSON), or both (`part` omitted, ⌘⇧F). Returns where a parse error is, text untouched.
+   */
+  async formatBody(part?: "query" | "variables"): Promise<{ line: number; column: number; target: FormatTarget } | null> {
     const b = this.request.body;
     this.formatError = null;
+    this.formatNotice = null;
+    let target: FormatTarget = "body";
     try {
       if (b.type === "json" || b.type === "xml") {
         b.text = await call("format_body", { kind: b.type as "json" | "xml", text: b.text ?? "" });
       } else if (b.type === "graphql" && b.graphql) {
-        b.graphql.variables = await call("format_body", { kind: "json", text: b.graphql.variables || "{}" });
+        const g = b.graphql;
+        if (part !== "variables" && g.query.trim()) {
+          target = "query";
+          const { prettifyQuery, GraphqlSyntaxError } = await import("../graphql/gql");
+          try {
+            const pretty = prettifyQuery(g.query);
+            if (pretty !== g.query) {
+              if (hasComments(g.query)) this.formatNotice = { requestId: this.request.id, message: `Comments were removed. ${shortcutText("Mod+Z", this.platform)} to undo.` };
+              g.query = pretty;
+            }
+          } catch (e) {
+            if (!(e instanceof GraphqlSyntaxError)) throw e;
+            this.formatError = { message: `Invalid GraphQL at line ${e.line}, col ${e.column}: ${e.message}`, line: e.line, column: e.column, target };
+            return { line: e.line, column: e.column, target };
+          }
+        }
+        if (part !== "query") {
+          target = "variables";
+          g.variables = await call("format_body", { kind: "json", text: g.variables || "{}" });
+        }
       }
       return null;
     } catch (e) {
@@ -920,8 +957,8 @@ class AppStore {
       if (err.code === "format_error") {
         const d = err.details as { message: string; line: number; column: number };
         const kind = b.type === "xml" ? "XML" : "JSON";
-        this.formatError = { message: `Invalid ${kind} at line ${d.line}, col ${d.column}`, line: d.line, column: d.column };
-        return { line: d.line, column: d.column };
+        this.formatError = { message: `Invalid ${kind} at line ${d.line}, col ${d.column}`, line: d.line, column: d.column, target };
+        return { line: d.line, column: d.column, target };
       }
       this.reportError(err);
       return null;
@@ -955,7 +992,7 @@ class AppStore {
   }
 
   async exportCurl(keepVariables: boolean): Promise<string> {
-    return call("export_curl", { request: $state.snapshot(this.request) as Request, projectId: this.activeProjectId, keepVariables });
+    return call("export_curl", { request: withOperation($state.snapshot(this.request) as Request), projectId: this.activeProjectId, keepVariables });
   }
 
   async copyCurl() {
@@ -970,7 +1007,7 @@ class AppStore {
 
   async copyRequestCurl(r: Request) {
     try {
-      await copyText(await call("export_curl", { request: r, projectId: this.activeProjectId, keepVariables: this.exportKeepVariables }));
+      await copyText(await call("export_curl", { request: withOperation(r), projectId: this.activeProjectId, keepVariables: this.exportKeepVariables }));
       toasts.success("cURL copied to clipboard");
     } catch (e) {
       this.reportError(e);

@@ -159,6 +159,30 @@ mod tests {
         );
         assert_eq!(r.body.body_type, BodyType::Graphql);
         assert_eq!(r.body.graphql.as_ref().unwrap().query, "{ me { id } }");
+        assert_eq!(r.body.graphql.as_ref().unwrap().operation_name, None);
+    }
+
+    #[test]
+    fn ac_gql_12_curl_import_keeps_operation_name() {
+        let r = imp(
+            r#"curl https://x.dev/graphql -H 'content-type: application/json' --data-raw '{"query":"query A { a } query B { b }","operationName":"B","variables":{}}'"#,
+        );
+        assert_eq!(r.body.body_type, BodyType::Graphql);
+        let g = r.body.graphql.as_ref().unwrap();
+        assert_eq!(g.operation_name.as_deref(), Some("B"));
+        assert_eq!(g.variables, "");
+        // Anything else stays a JSON body (lossless round-trip).
+        for body in [
+            r#"{"query":"{a}","operationName":null,"variables":{}}"#,
+            r#"{"query":"{a}","operationName":"","variables":{}}"#,
+            r#"{"query":"{a}","operationName":"A","variables":{},"extensions":{}}"#,
+            r#"{"query":"{a}","operationName":"A"}"#,
+        ] {
+            let r = imp(&format!(
+                "curl https://x.dev/graphql -H 'content-type: application/json' --data-raw '{body}'"
+            ));
+            assert_eq!(r.body.body_type, BodyType::Json, "{body}");
+        }
     }
 
     #[test]
@@ -434,6 +458,12 @@ mod tests {
             with(Body::graphql("{a}", ""), Auth::none())
                 .contains(r#"--data-raw '{"query":"{a}","variables":{}}'"#)
         );
+        // AC-GQL-12: the chosen operation goes into the JSON.
+        let mut named = Body::graphql("query A { a } query B { b }", "");
+        named.graphql.as_mut().unwrap().operation_name = Some("B".into());
+        assert!(with(named, Auth::none()).contains(
+            r#"--data-raw '{"query":"query A { a } query B { b }","operationName":"B","variables":{}}'"#
+        ));
         let fe = with(
             Body::form_encoded(vec![KeyValue::new("a b", "c d"), KeyValue::new("x", "1")]),
             Auth::none(),
@@ -725,9 +755,14 @@ mod tests {
                         Just(""),
                         Just("{\"a\": 1}"),
                         Just("{\"b\": [true, null, \"x'y\"]}")
-                    ]
+                    ],
+                    prop::option::of("[A-Za-z_][A-Za-z0-9_]{0,8}")
                 )
-                    .prop_map(|(q, v)| Body::graphql(q, v)),
+                    .prop_map(|(q, v, op)| {
+                        let mut b = Body::graphql(q, v);
+                        b.graphql.as_mut().unwrap().operation_name = op;
+                        b
+                    }),
                 "/[a-zA-Z0-9_. '-]{1,12}".prop_map(Body::binary),
             ]
         }

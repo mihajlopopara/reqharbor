@@ -22,12 +22,12 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { HighlightStyle, bracketMatching, foldGutter, foldKeymap, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { highlightSelectionMatches, openSearchPanel, search, searchKeymap } from "@codemirror/search";
-import { autocompletion, type CompletionContext, type CompletionResult } from "@codemirror/autocomplete";
+import { autocompletion, type CompletionContext, type CompletionResult, type CompletionSource } from "@codemirror/autocomplete";
 import { tags as t } from "@lezer/highlight";
 import type { VarLookup } from "../util/vars";
 import { VAR_RE, completeVar, dynamicInfo, dynamicTip, isResolvable } from "../util/vars";
 
-export type EditorLanguage = "json" | "xml" | "html" | "text";
+export type EditorLanguage = "json" | "xml" | "html" | "graphql" | "text";
 
 const langCache = new Map<EditorLanguage, Promise<Extension>>();
 
@@ -41,7 +41,9 @@ export function loadLanguage(lang: EditorLanguage): Promise<Extension> {
           ? import("@codemirror/lang-xml").then((m) => m.xml())
           : lang === "html"
             ? import("@codemirror/lang-html").then((m) => m.html())
-            : Promise.resolve([]);
+            : lang === "graphql"
+              ? import("cm6-graphql").then((m) => m.graphqlLanguageSupport())
+              : Promise.resolve([]);
     langCache.set(lang, p);
   }
   return p;
@@ -113,6 +115,18 @@ const theme = EditorView.theme({
   ".cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected]": { backgroundColor: "var(--accent-soft)", color: "var(--text-1)" },
   ".cm-completionLabel": { color: "var(--var-fg)" },
   ".cm-completion-dynamic .cm-completionLabel": { color: "var(--var-dynamic-fg)" },
+  ".cm-completion-gql .cm-completionLabel": { color: "var(--text-1)" },
+  ".cm-tooltip.cm-completionInfo": { maxWidth: "320px", padding: "6px 8px", fontFamily: "var(--font-ui)", fontSize: "var(--fs-sm)", color: "var(--text-2)" },
+  // AC-GQL-6: hover docs and lint (danger / warning wavy underlines, like unresolved variables).
+  ".cm-gql-tip": { padding: "6px 8px", maxWidth: "360px", fontSize: "var(--fs-sm)", fontFamily: "var(--font-ui)", color: "var(--text-1)" },
+  ".cm-gql-sig": { fontFamily: "var(--font-mono)", color: "var(--syn-key)", whiteSpace: "pre-wrap" },
+  ".cm-gql-doc": { color: "var(--text-2)", marginTop: "4px", whiteSpace: "pre-wrap" },
+  ".cm-lintRange-error": { backgroundImage: "none", textDecoration: "underline wavy var(--danger)", textUnderlineOffset: "3px" },
+  ".cm-lintRange-warning, .cm-lintRange-info": { backgroundImage: "none", textDecoration: "underline wavy var(--warning)", textUnderlineOffset: "3px" },
+  ".cm-tooltip-lint": { padding: "0" },
+  ".cm-diagnostic": { padding: "4px 8px", fontSize: "var(--fs-sm)", fontFamily: "var(--font-ui)", color: "var(--text-1)", borderLeftWidth: "3px", whiteSpace: "pre-wrap", maxWidth: "420px" },
+  ".cm-diagnostic-error": { borderLeftColor: "var(--danger)" },
+  ".cm-diagnostic-warning, .cm-diagnostic-info": { borderLeftColor: "var(--warning)" },
   ".cm-completionDetail": { color: "var(--text-3)", fontStyle: "normal", fontFamily: "var(--font-ui)", marginLeft: "12px" },
 });
 
@@ -127,6 +141,11 @@ const highlight = HighlightStyle.define([
   { tag: t.attributeName, color: "var(--syn-attr)" },
   { tag: [t.comment, t.meta, t.processingInstruction, t.documentMeta], color: "var(--syn-comment)" },
   { tag: t.keyword, color: "var(--syn-bool)" },
+  // GraphQL (cm6-graphql): type names, $variables, @directives, arguments, enum values.
+  { tag: t.atom, color: "var(--syn-tag)" },
+  { tag: t.variableName, color: "var(--syn-number)" },
+  { tag: t.modifier, color: "var(--syn-attr)" },
+  { tag: t.special(t.name), color: "var(--syn-number)" },
   { tag: t.invalid, color: "var(--danger)" },
 ]);
 
@@ -202,8 +221,8 @@ function varPlugin(getLookup: () => VarLookup | null): Extension {
 }
 
 /** `{{` autocomplete: environment variables, then the `$` catalogue. */
-function varCompletion(getLookup: () => VarLookup | null): Extension {
-  const source = (ctx: CompletionContext): CompletionResult | null => {
+function varCompletionSource(getLookup: () => VarLookup | null): CompletionSource {
+  return (ctx: CompletionContext): CompletionResult | null => {
     const lookup = getLookup();
     if (!lookup) return null;
     const line = ctx.state.doc.lineAt(ctx.pos);
@@ -222,7 +241,20 @@ function varCompletion(getLookup: () => VarLookup | null): Extension {
       })),
     };
   };
-  return autocompletion({ override: [source], icons: false, optionClass: (c) => (c.type === "dynamic" ? "cm-completion-dynamic" : "") });
+}
+
+/**
+ * One autocompletion for both `{{variables}}` and an editor's own source (GraphQL fields,
+ * variable names, set with `setAddons`): `override` would otherwise hide language sources.
+ */
+function completion(getLookup: () => VarLookup | null, getExtra: () => CompletionSource | null): Extension {
+  const vars = varCompletionSource(getLookup);
+  const extra: CompletionSource = (ctx) => getExtra()?.(ctx) ?? null;
+  return autocompletion({
+    override: [vars, extra],
+    icons: false,
+    optionClass: (c) => (c.type === "dynamic" ? "cm-completion-dynamic" : c.type === "gql" ? "cm-completion-gql" : ""),
+  });
 }
 
 export interface EditorOptions {
@@ -245,8 +277,13 @@ export interface EditorController {
   setLanguage(l: EditorLanguage, plain?: boolean): Promise<void>;
   setWrap(w: boolean): void;
   setLookup(l: VarLookup | null): void;
-  /** Replace the selection with `text`, put the caret after it and focus. */
-  insert(text: string): void;
+  /** Replace the selection with `text`, put the caret after it (or `caret` chars into it) and focus. */
+  insert(text: string, caret?: number): void;
+  /**
+   * Editor-specific extras (GraphQL lint / hover, variables lint) and a completion source used
+   * next to `{{variables}}` completion. Replaces the previous ones.
+   */
+  setAddons(extension: Extension, completion: CompletionSource | null): void;
   focus(): void;
   goTo(line: number, column: number): void;
   openSearch(): void;
@@ -257,9 +294,11 @@ export async function createEditor(parent: HTMLElement, opts: EditorOptions): Pr
   const langC = new Compartment();
   const wrapC = new Compartment();
   const varC = new Compartment();
+  const addonC = new Compartment();
   let lookup = opts.lookup ?? null;
+  let extraSource: CompletionSource | null = null;
   let suppress = false;
-  const varExtensions = (): Extension => [varPlugin(() => lookup), opts.readOnly ? [] : varCompletion(() => lookup)];
+  const varExtensions = (): Extension => varPlugin(() => lookup);
   const lang = opts.plain ? [] : await loadLanguage(opts.language);
   const extensions: Extension[] = [
     lineNumbers(),
@@ -281,6 +320,8 @@ export async function createEditor(parent: HTMLElement, opts: EditorOptions): Pr
     langC.of(lang),
     wrapC.of(opts.wrap ? EditorView.lineWrapping : []),
     varC.of(lookup ? varExtensions() : []),
+    opts.readOnly ? [] : completion(() => lookup, () => extraSource),
+    addonC.of([]),
     EditorState.readOnly.of(!!opts.readOnly),
     EditorView.contentAttributes.of({ "aria-label": opts.ariaLabel ?? "Editor" }),
     EditorView.updateListener.of((u) => {
@@ -316,9 +357,15 @@ export async function createEditor(parent: HTMLElement, opts: EditorOptions): Pr
       lookup = l;
       view.dispatch({ effects: varC.reconfigure(l ? varExtensions() : []) });
     },
-    insert(text) {
+    insert(text, caret) {
+      const from = view.state.selection.main.from;
       view.dispatch(view.state.replaceSelection(text));
+      if (caret !== undefined) view.dispatch({ selection: { anchor: from + Math.max(0, Math.min(caret, text.length)) } });
       view.focus();
+    },
+    setAddons(extension, source) {
+      extraSource = source;
+      view.dispatch({ effects: addonC.reconfigure(extension) });
     },
     focus: () => view.focus(),
     goTo(line, column) {

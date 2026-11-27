@@ -425,19 +425,31 @@ async fn live_team_invite_join_roles_and_removal() {
         AuthError::Refused { code, .. } if code == "invite_invalid"
     ));
     let me = member.session.spaces().await.unwrap();
-    assert!(me.spaces.iter().any(|s| s.space_id == space && s.role.as_deref() == Some("editor")));
+    assert!(
+        me.spaces
+            .iter()
+            .any(|s| s.space_id == space && s.role.as_deref() == Some("editor"))
+    );
 
     // A viewer's push is refused as a whole.
-    teams::set_role(&owner.session, &team.team_id, &member.account.user_id, "viewer")
-        .await
-        .unwrap();
+    teams::set_role(
+        &owner.session,
+        &team.team_id,
+        &member.account.user_id,
+        "viewer",
+    )
+    .await
+    .unwrap();
     let token = member.session.access_token().await.unwrap();
     let push = serde_json::json!({"changes": [{"type": "project", "id": "01JLIVETEAMPROJ00000000000",
         "updatedAt": reqharbor_core::model::now_ms(), "deleted": false,
         "data": {"id": "01JLIVETEAMPROJ00000000000", "name": "Nope"}, "deviceId": "live"}]});
     let resp = Browser::new()
         .http
-        .post(format!("{}/v1/spaces/{space}/sync", member.client.base_url()))
+        .post(format!(
+            "{}/v1/spaces/{space}/sync",
+            member.client.base_url()
+        ))
         .bearer_auth(&token)
         // Team spaces require the version header (06 §10 "M2 as built").
         .header(
@@ -510,14 +522,26 @@ async fn live_team_move_project_through_the_engine() {
         p
     };
     space_sync::run(&store, Some(session.clone()), RUN_BUDGET).await;
-    let moved = transfer::move_project(&store, Some(session.clone()), &pid, Some(&space), &|_, _| {})
-        .await
-        .unwrap();
+    let moved = transfer::move_project(
+        &store,
+        Some(session.clone()),
+        &pid,
+        Some(&space),
+        &|_, _| {},
+    )
+    .await
+    .unwrap();
     assert_ne!(moved.project_id, pid);
     space_sync::run(&store, Some(session.clone()), RUN_BUDGET).await;
-    let client = reqharbor_core::sync::SyncClient::for_space(&origin, &space, session.clone()).unwrap();
+    let client =
+        reqharbor_core::sync::SyncClient::for_space(&origin, &space, session.clone()).unwrap();
     let pulled = client.pull_all(0).await.unwrap();
-    assert!(pulled.changes.iter().any(|c| c.id == moved.project_id && !c.deleted));
+    assert!(
+        pulled
+            .changes
+            .iter()
+            .any(|c| c.id == moved.project_id && !c.deleted)
+    );
     assert!(!pulled.changes.iter().any(|c| c.id == pid));
     teams::delete(&session, &team.team_id).await.unwrap();
 }

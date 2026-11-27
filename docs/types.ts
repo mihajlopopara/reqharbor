@@ -203,6 +203,41 @@ export interface GraphqlBody {
   query: string;
   /** Variables as JSON text, exactly as edited. "" = no variables (sent as {}). */
   variables: string;
+  /**
+   * The operation to run when the document defines several (AC-GQL-9); sent as `operationName`.
+   * Omitted (or blank) = not sent. Older builds keep it as an unknown key and send without it.
+   */
+  operationName?: string;
+}
+
+/** A GraphQL schema for one endpoint (AC-GQL-2..5): fetched by introspection or loaded from a file. Local only, never synced. */
+export interface GraphqlSchema {
+  /** The resolved URL it belongs to (secret variables shown as `{{name}}`): the cache key. */
+  url: string;
+  /** When it was fetched or loaded (epoch ms). */
+  fetchedAt: number;
+  source: "introspection" | "file";
+  /** For a schema loaded from a file. */
+  fileName?: string;
+  /** "introspection": `schema` is JSON text `{"__schema": …}`; "sdl": GraphQL SDL text. */
+  format: "introspection" | "sdl";
+  schema: string;
+  sizeBytes: number;
+}
+
+/** Args shared by the graphql_* schema commands: the request as edited, resolved like `send_request`. */
+export interface GraphqlSchemaArgs {
+  request: Request;
+  projectId?: string | null;
+}
+
+/** graphql_cached_schema result. */
+export interface GraphqlCacheLookup {
+  /** The request's schema URL (the cache key: `{{$dynamic}}` literal, secrets as `{{name}}`). */
+  url: string;
+  /** The cached schema is the `known` one passed in: `schema` is left out (no 10 MB re-send). */
+  unchanged: boolean;
+  schema: GraphqlSchema | null;
 }
 
 export interface FormField {
@@ -333,9 +368,20 @@ export interface Settings {
 export interface CommandError {
   code: CommandErrorCode;
   message: string;
-  /** Present for code "validation" (PrepareErrorDetails) and "format_error" (FormatErrorDetails). */
-  details?: PrepareErrorDetails | FormatErrorDetails;
+  /** Present for code "validation" (PrepareErrorDetails), "format_error" (FormatErrorDetails) and the graphql_* codes (GraphqlErrorDetails). */
+  details?: PrepareErrorDetails | FormatErrorDetails | GraphqlErrorDetails;
 }
+
+/** `details` of the graphql_* error codes (AC-GQL-3, AC-GQL-5). */
+export type GraphqlErrorDetails =
+  /** graphql_network */
+  | { kind: ErrorKind }
+  /** graphql_introspection_disabled */
+  | { serverMessage: string }
+  /** graphql_introspection_failed */
+  | { status: number | null }
+  /** graphql_schema_too_large */
+  | { sizeBytes: number };
 
 export type CommandErrorCode =
   | "not_found"
@@ -425,6 +471,17 @@ export type CommandErrorCode =
   | "validation_failed"
   | "quota_exceeded"
   | "clock_skew"
+  // ── GraphQL schemas (AC-GQL-2..5) ──
+  /** graphql_fetch_schema: network failure; `details` = `{ kind: ErrorKind }`. */
+  | "graphql_network"
+  /** The server refuses introspection; `message` = "Introspection is disabled on this server", `details` = `{ serverMessage }`. */
+  | "graphql_introspection_disabled"
+  /** Any other answer without a schema; `message` says why, `details` = `{ status: number | null }`. */
+  | "graphql_introspection_failed"
+  /** graphql_load_schema_file: not SDL or introspection JSON. */
+  | "graphql_schema_invalid"
+  /** Over 10 MB; `details` = `{ sizeBytes }`. */
+  | "graphql_schema_too_large"
   | "internal";
 
 export type PrepareErrorDetails =
@@ -1337,6 +1394,25 @@ export interface Commands {
   /** Close (or stop connecting). `code`: 1000 or 3000–4999 (else "invalid"); reason ≤ 123 bytes. False when nothing was open. */
   ws_close: { args: { connectionId: string; code?: number | null; reason?: string | null }; result: boolean };
   cancel_request: { args: { executionId: string }; result: boolean };
+
+  /**
+   * AC-GQL-2..4: POST the introspection query with the request's URL, params, headers, auth, settings and variables;
+   * cache the schema for the schema URL unless `store` is false (the UI passes false, builds it, then calls
+   * graphql_store_schema). Not recorded in history. `executionId` makes it cancellable with cancel_request.
+   * Rejects with validation / read_only_newer (like send_request) or the graphql_* codes.
+   */
+  graphql_fetch_schema: { args: GraphqlSchemaArgs & { executionId?: string | null; store?: boolean | null }; result: GraphqlSchema };
+  /** The cached schema for the request's schema URL. Never sends. `known` = the schema already shown. */
+  graphql_cached_schema: { args: GraphqlSchemaArgs & { known?: { url: string; fetchedAt: number } | null }; result: GraphqlCacheLookup };
+  /** AC-GQL-5: SDL or introspection JSON from `path` (or `text`, browser mode); cached unless `store` is false. */
+  graphql_load_schema_file: {
+    args: GraphqlSchemaArgs & { path?: string | null; text?: string | null; fileName?: string | null; store?: boolean | null };
+    result: GraphqlSchema;
+  };
+  /** Cache a schema the UI has built successfully under `schema.url`; nothing is cached when the request's schema URL has changed since. */
+  graphql_store_schema: { args: GraphqlSchemaArgs & { schema: GraphqlSchema }; result: GraphqlSchema };
+  /** Forget the cached schema for the request's resolved URL; true when there was one. */
+  graphql_clear_schema: { args: GraphqlSchemaArgs; result: boolean };
   get_response_body: { args: { responseId: string; limit?: number | null }; result: ArrayBuffer };
   save_response_body: { args: { responseId: string; path: string }; result: null };
 

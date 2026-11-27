@@ -1012,7 +1012,9 @@ impl Store {
                 .space_state_mut(scope)
                 .tombstones
                 .iter_mut()
-                .filter(|t| t.entity_type != EntityType::Project && children.contains(t.id.as_str()))
+                .filter(|t| {
+                    t.entity_type != EntityType::Project && children.contains(t.id.as_str())
+                })
             {
                 t.extra
                     .insert(crate::sync::TOMBSTONE_PROJECT.to_string(), pid.clone());

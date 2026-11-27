@@ -8,9 +8,9 @@
 //! releases the space at once.
 
 use crate::auth_rt::AuthState;
-use crate::sync_rt::run_sync;
 use crate::error::{CmdResult, CommandError};
 use crate::state::{AppState, SyncStatus};
+use crate::sync_rt::run_sync;
 use reqharbor_core::auth::Session;
 use reqharbor_core::model::ProjectTree;
 use reqharbor_core::teams::{
@@ -248,7 +248,11 @@ pub async fn invite_revoke(app: AppHandle, team_id: String, invite_id: String) -
 /// Parse an invite link and apply the sign-in's plain-http rule (06 §9):
 /// the token goes to a non-loopback `http://` server only after "Continue
 /// anyway" (now, or remembered for that origin in `knownServers`).
-fn parse_link(app: &AppHandle, url: &str, insecure_confirmed: bool) -> CmdResult<teams::InviteLink> {
+fn parse_link(
+    app: &AppHandle,
+    url: &str,
+    insecure_confirmed: bool,
+) -> CmdResult<teams::InviteLink> {
     let link =
         teams::parse_invite_link(url).map_err(|m| CommandError::new("invite_not_a_link", m))?;
     let acked = crate::auth_rt::insecure_acknowledged(
@@ -277,7 +281,9 @@ mod tests {
     #[test]
     fn invite_tokens_go_to_plain_http_only_after_continue_anyway() {
         assert_eq!(
-            insecure_gate("http://192.168.1.5:8080", false).unwrap_err().code,
+            insecure_gate("http://192.168.1.5:8080", false)
+                .unwrap_err()
+                .code,
             "insecure_unconfirmed"
         );
         assert!(insecure_gate("http://192.168.1.5:8080", true).is_ok());

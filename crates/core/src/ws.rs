@@ -578,10 +578,12 @@ struct Handshake {
 }
 
 async fn open_socket(p: &PreparedWs) -> Result<(Socket, Handshake), SendError> {
-    let uri: Uri = p
-        .url
-        .parse()
-        .map_err(|e| err(ErrorKind::Other, format!("Invalid URL \"{}\": {e}", p.display_url)))?;
+    let uri: Uri = p.url.parse().map_err(|e| {
+        err(
+            ErrorKind::Other,
+            format!("Invalid URL \"{}\": {e}", p.display_url),
+        )
+    })?;
     let secure = uri.scheme_str() == Some("wss");
     let host = uri
         .host()
@@ -641,10 +643,12 @@ async fn open_socket(p: &PreparedWs) -> Result<(Socket, Handshake), SendError> {
         Box::new(tcp)
     };
 
-    let mut req = uri
-        .clone()
-        .into_client_request()
-        .map_err(|e| err(ErrorKind::Other, format!("Invalid URL \"{}\": {e}", p.display_url)))?;
+    let mut req = uri.clone().into_client_request().map_err(|e| {
+        err(
+            ErrorKind::Other,
+            format!("Invalid URL \"{}\": {e}", p.display_url),
+        )
+    })?;
     const OWN: [&str; 5] = [
         "connection",
         "upgrade",
@@ -2086,13 +2090,31 @@ mod tests {
     #[test]
     fn decoders_survive_multibyte_and_malformed_input() {
         for s in [
-            "é", "4é", "é0", "5é-", "51-é", "2/é,", "2/ns,é", "3/é", "2/ns", "61-", "5-", "4/",
-            "2/€,1[\"e\"]", "0\u{10FFFF}", "2\u{0}", "3\u{1F600}[1]", "29999999999999999999999[\"e\"]",
+            "é",
+            "4é",
+            "é0",
+            "5é-",
+            "51-é",
+            "2/é,",
+            "2/ns,é",
+            "3/é",
+            "2/ns",
+            "61-",
+            "5-",
+            "4/",
+            "2/€,1[\"e\"]",
+            "0\u{10FFFF}",
+            "2\u{0}",
+            "3\u{1F600}[1]",
+            "29999999999999999999999[\"e\"]",
         ] {
             let _ = decode(s);
             let _ = decode_eio(s);
         }
-        assert!(decode("4é").is_err(), "a garbage payload is an error, not a panic");
+        assert!(
+            decode("4é").is_err(),
+            "a garbage payload is an error, not a panic"
+        );
         assert!(decode("é").is_err());
     }
 

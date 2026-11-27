@@ -742,14 +742,20 @@ fn merge_cookie_headers(headers: &mut Vec<KeyValue>) {
     }
 }
 
-/// Detect a GraphQL body: a JSON object with exactly a string `query` and an
-/// object `variables` — the shape the exporter writes. `{"query": ...}` alone
-/// stays JSON (QA-R1-014), keeping cURL round-trips lossless.
+/// Detect a GraphQL body: a JSON object with exactly a string `query`, an
+/// object `variables` and optionally a non-empty string `operationName` —
+/// the shape the exporter writes (AC-GQL-12). `{"query": ...}` alone stays
+/// JSON (QA-R1-014), keeping cURL round-trips lossless.
 fn graphql_body(text: &str) -> Option<Body> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let obj = value.as_object()?;
     let query = obj.get("query")?.as_str()?;
-    if obj.len() != 2 {
+    let operation_name = match obj.get("operationName") {
+        None => None,
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+        Some(_) => return None,
+    };
+    if obj.len() != 2 + usize::from(operation_name.is_some()) {
         return None;
     }
     let variables = match obj.get("variables")? {
@@ -759,7 +765,11 @@ fn graphql_body(text: &str) -> Option<Body> {
         serde_json::Value::Object(_) => String::new(),
         _ => return None,
     };
-    Some(Body::graphql(query, variables))
+    let mut body = Body::graphql(query, variables);
+    if let Some(g) = body.graphql.as_mut() {
+        g.operation_name = operation_name;
+    }
+    Some(body)
 }
 
 /// Parse a browser-copied multipart body into form fields.

@@ -1090,7 +1090,8 @@ pub fn collect_push_in(store: &Store, scope: &Scope) -> Vec<Change> {
             let child_of_waiting = |c: &Change| {
                 c.deleted
                     && c.entity_type != EntityType::Project
-                    && tombstone_project(store, scope, c).is_some_and(|p| waiting_projects.contains(p))
+                    && tombstone_project(store, scope, c)
+                        .is_some_and(|p| waiting_projects.contains(p))
             };
             changes.retain(|c| {
                 let key = sync_key(c.entity_type, &c.id);
@@ -1633,9 +1634,7 @@ pub fn apply_push_results_in(
             out.rejected += 1;
             continue;
         }
-        if r.status == PushStatus::Rejected
-            && r.reason.as_deref() == Some(GLOBAL_ENV_NOT_ALLOWED)
-        {
+        if r.status == PushStatus::Rejected && r.reason.as_deref() == Some(GLOBAL_ENV_NOT_ALLOWED) {
             // Only a buggy client sends this (B4): dropped silently.
             let state = st_mut(store, scope);
             if change.deleted {
@@ -1717,9 +1716,7 @@ pub fn apply_push_results_in(
             .unwrap_or_else(|| "this team".into());
         let frozen = store.space_sync(scope).frozen.len();
         let message = if forbidden_projects > 0 {
-            format!(
-                "Only admins can delete projects in {name}. Discard to bring the project back."
-            )
+            format!("Only admins can delete projects in {name}. Discard to bring the project back.")
         } else {
             format!(
                 "Your role in {name} doesn't allow {}. Save them as a personal copy or discard them.",
@@ -1978,7 +1975,11 @@ fn conflict_copy(store: &mut Store, t: EntityType, id: &str) -> Option<String> {
     Some(copy_id)
 }
 
-pub(crate) fn remove_local(store: &mut Store, t: EntityType, id: &str) -> Vec<(EntityType, String)> {
+pub(crate) fn remove_local(
+    store: &mut Store,
+    t: EntityType,
+    id: &str,
+) -> Vec<(EntityType, String)> {
     let mut removed = Vec::new();
     match t {
         EntityType::Project => {
@@ -2481,7 +2482,7 @@ pub fn apply_pull_in(
                     (kid_dirty
                         && (updated, my_device.as_str())
                             > (change.updated_at, remote_device.as_str()))
-                    .then_some(k)
+                        .then_some(k)
                 })
                 .collect();
             if !newer.is_empty() {

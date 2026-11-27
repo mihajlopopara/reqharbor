@@ -1894,15 +1894,32 @@ async fn m2_a_malicious_editor_repush_of_old_ids_leaves_the_personal_copy_untouc
     evil.id = new_r.clone();
     evil.collection_id = a.with(|s| s.project(&new_p).unwrap().collections[0].id.clone());
     evil.updated_at = later;
-    seed(&g, TEAM, "request", &new_r, later, serde_json::to_value(&evil).unwrap());
+    seed(
+        &g,
+        TEAM,
+        "request",
+        &new_r,
+        later,
+        serde_json::to_value(&evil).unwrap(),
+    );
     a.run(&server, &g).await;
     a.with(|s| {
         let t = s.project(&new_p).unwrap();
         assert_eq!(t.project.name, "Payments");
-        assert_eq!(s.bindings.project_spaces[&new_p], PERSONAL, "binding unchanged");
-        assert!(t.requests.iter().any(|r| r.id == new_r && r.method == "POST"));
+        assert_eq!(
+            s.bindings.project_spaces[&new_p], PERSONAL,
+            "binding unchanged"
+        );
+        assert!(
+            t.requests
+                .iter()
+                .any(|r| r.id == new_r && r.method == "POST")
+        );
         // The resurrected old id is just a team project of its own.
-        assert_eq!(s.bindings.project_spaces.get(&old_p).map(String::as_str), Some(TEAM));
+        assert_eq!(
+            s.bindings.project_spaces.get(&old_p).map(String::as_str),
+            Some(TEAM)
+        );
         assert!(s.space_sync(&Scope::Space(TEAM.into())).foreign >= 1);
     });
 }
@@ -1911,7 +1928,8 @@ async fn m2_a_malicious_editor_repush_of_old_ids_leaves_the_personal_copy_untouc
 /// 04 §12 M2b asked for "the team gets the resurrection"; 06 §10 M2 (never
 /// push orphans) wins: the newer offline edit survives here, held and
 /// frozen, and is offered as a personal copy (04 §12 "M2b client as built").
-async fn m2_a_newer_offline_edit_under_a_moved_out_project_is_held_frozen_and_saved_as_a_personal_copy() {
+async fn m2_a_newer_offline_edit_under_a_moved_out_project_is_held_frozen_and_saved_as_a_personal_copy()
+ {
     let (server, g) = go().await;
     let (a, _) = personal_device(&server, &g).await;
     bind_team(&a, &server, Role::Admin);
@@ -2036,10 +2054,7 @@ async fn m2_a_move_resumes_after_a_crash_with_the_same_ids() {
     bind_team(&a, &server, Role::Editor);
     team_exists(&g, "editor");
     // The push lands but its response is lost: the move fails, nothing moved.
-    g.0.lock()
-        .unwrap()
-        .lose_push_response
-        .insert(TEAM.into());
+    g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
     let err = transfer::move_project(
         &a.store,
         Some(session(&server, &g)),
@@ -2049,7 +2064,10 @@ async fn m2_a_move_resumes_after_a_crash_with_the_same_ids() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(err, transfer::TransferError::Sync(SyncError::Server(_))), "{err:?}");
+    assert!(
+        matches!(err, transfer::TransferError::Sync(SyncError::Server(_))),
+        "{err:?}"
+    );
     let plan = a.with(|s| {
         assert!(s.project(&pid).is_ok(), "nothing was moved");
         assert_eq!(s.bindings.project_spaces[&pid], PERSONAL);
@@ -2074,7 +2092,10 @@ async fn m2_a_move_resumes_after_a_crash_with_the_same_ids() {
     )
     .await
     .unwrap();
-    assert_eq!(done.project_id, plan.id_map[&pid], "same ids after the retry");
+    assert_eq!(
+        done.project_id, plan.id_map[&pid],
+        "same ids after the retry"
+    );
     assert_eq!(done.move_id, plan.move_id);
     assert_eq!(
         g.0.lock().unwrap().spaces[TEAM].live("project"),
@@ -2102,22 +2123,30 @@ async fn m2_a_failed_move_changes_nothing_and_cancel_tombstones_what_landed() {
     a.run(&server, &g).await;
     bind_team(&a, &server, Role::Editor);
     team_exists(&g, "editor");
-    g.0.lock()
-        .unwrap()
-        .lose_push_response
-        .insert(TEAM.into());
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap_err();
+    g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap_err();
     let mut plan = a.with(|s| s.pending_moves().pop().unwrap());
     // Pretend the first batch was acknowledged, then cancel.
-    plan.applied.insert(sync_key(EntityType::Project, &plan.id_map[&pid]), 1);
+    plan.applied
+        .insert(sync_key(EntityType::Project, &plan.id_map[&pid]), 1);
     a.with(|s| s.record_move_progress(&plan).unwrap());
     g.0.lock().unwrap().lose_push_response.clear();
     transfer::cancel_move(&a.store, Some(session(&server, &g)), &plan.move_id)
         .await
         .unwrap();
-    assert!(server_ent(&g, TEAM, "project", &plan.id_map[&pid]).unwrap().deleted);
+    assert!(
+        server_ent(&g, TEAM, "project", &plan.id_map[&pid])
+            .unwrap()
+            .deleted
+    );
     a.with(|s| {
         assert!(s.pending_moves().is_empty());
         assert_eq!(s.bindings.project_spaces[&pid], PERSONAL);
@@ -2132,9 +2161,17 @@ async fn m2_only_admins_move_out_and_viewers_cant_move_in() {
     team_exists(&g, "editor");
     let (tp, _, _) = team_project(&a, &server, &g).await;
     let e = a.with(|s| s.move_check(&tp, Some(PERSONAL)).unwrap_err());
-    assert!(e.to_string().contains("Only admins can move a project out of Acme"), "{e}");
+    assert!(
+        e.to_string()
+            .contains("Only admins can move a project out of Acme"),
+        "{e}"
+    );
     let e = a.with(|s| s.delete_project(&tp).unwrap_err());
-    assert!(e.to_string().contains("Only admins can delete team projects"), "{e}");
+    assert!(
+        e.to_string()
+            .contains("Only admins can delete team projects"),
+        "{e}"
+    );
     a.with(|s| {
         s.binding_mut(TEAM).unwrap().role = Some(Role::Viewer);
         assert!(matches!(
@@ -2167,10 +2204,21 @@ async fn m2_the_viewer_guard_blocks_mutators_and_makes_no_conflict_copies() {
             s.save_request(&r).unwrap_err(),
             reqharbor_core::storage::StoreError::ReadOnlyRole(_)
         ));
-        assert!(s.move_node(reqharbor_core::storage::NodeKind::Request, &tr, Some(&tc), None, 0).is_err());
+        assert!(
+            s.move_node(
+                reqharbor_core::storage::NodeKind::Request,
+                &tr,
+                Some(&tc),
+                None,
+                0
+            )
+            .is_err()
+        );
         assert!(s.delete_project(&tp).is_err());
         // Copying out is allowed: Duplicate to personal.
-        let copy = s.duplicate_to_space(&tp, Some(PERSONAL), Some("Payments copy")).unwrap();
+        let copy = s
+            .duplicate_to_space(&tp, Some(PERSONAL), Some("Payments copy"))
+            .unwrap();
         assert_eq!(s.bindings.project_spaces[&copy.project.id], PERSONAL);
         // Make the request look locally changed (e.g. written by an older build).
         let k = sync_key(EntityType::Request, &tr);
@@ -2182,7 +2230,14 @@ async fn m2_the_viewer_guard_blocks_mutators_and_makes_no_conflict_copies() {
     let mut theirs = a.with(|s| s.request(&tr).unwrap().clone());
     theirs.url = "https://api/orders/v3".into();
     theirs.updated_at = now_ms() + 1_000;
-    seed(&g, TEAM, "request", &tr, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    seed(
+        &g,
+        TEAM,
+        "request",
+        &tr,
+        theirs.updated_at,
+        serde_json::to_value(&theirs).unwrap(),
+    );
     let pushes_before = pushed_ids(&g, TEAM).len();
     let run = v.run(&server, &g).await;
     assert!(run.report.conflicts.is_empty());
@@ -2190,9 +2245,16 @@ async fn m2_the_viewer_guard_blocks_mutators_and_makes_no_conflict_copies() {
         assert_eq!(s.request(&tr).unwrap().url, "https://api/orders/v3");
         let t = s.project(&tp).unwrap();
         assert!(!t.requests.iter().any(|r| r.name.contains("(conflict)")));
-        assert_eq!(sync::collect_push_in(s, &Scope::Space(TEAM.into())).len(), 0);
+        assert_eq!(
+            sync::collect_push_in(s, &Scope::Space(TEAM.into())).len(),
+            0
+        );
     });
-    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before, "a viewer pushes nothing");
+    assert_eq!(
+        pushed_ids(&g, TEAM).len(),
+        pushes_before,
+        "a viewer pushes nothing"
+    );
 }
 
 #[tokio::test]
@@ -2211,9 +2273,19 @@ async fn m2_a_role_downgrade_freezes_dirty_keys() {
     let mut theirs = a.with(|s| s.request(&tr).unwrap().clone());
     theirs.url = "https://theirs".into();
     theirs.updated_at = now_ms() + 1_000;
-    seed(&g, TEAM, "request", &tr, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    seed(
+        &g,
+        TEAM,
+        "request",
+        &tr,
+        theirs.updated_at,
+        serde_json::to_value(&theirs).unwrap(),
+    );
     team_exists(&g, "viewer");
-    g.0.lock().unwrap().roles.insert(TEAM.into(), "viewer".into());
+    g.0.lock()
+        .unwrap()
+        .roles
+        .insert(TEAM.into(), "viewer".into());
     let pushes_before = pushed_ids(&g, TEAM).len();
     let run = a.run(&server, &g).await;
     assert!(run.error().is_none(), "{:?}", run.error());
@@ -2229,7 +2301,11 @@ async fn m2_a_role_downgrade_freezes_dirty_keys() {
             issue.message,
             "Your role in Acme changed to Viewer. You have 1 unsynced change."
         );
-        assert_eq!(s.request(&tr).unwrap().url, "https://mine", "frozen: not overwritten");
+        assert_eq!(
+            s.request(&tr).unwrap().url,
+            "https://mine",
+            "frozen: not overwritten"
+        );
         let st = space_sync::space_statuses(s);
         assert_eq!(st.iter().find(|x| x.space_id == TEAM).unwrap().frozen, 1);
     });
@@ -2258,9 +2334,15 @@ async fn m2_a_viewer_push_refused_as_a_whole_freezes_and_shows_the_banner() {
         s.save_request(&r).unwrap();
     });
     // The server already enforces viewer; /v1/me/spaces still says editor.
-    g.0.lock().unwrap().roles.insert(TEAM.into(), "viewer".into());
+    g.0.lock()
+        .unwrap()
+        .roles
+        .insert(TEAM.into(), "viewer".into());
     let run = a.run(&server, &g).await;
-    assert!(run.error().is_none(), "a refused push is the banner, not an error");
+    assert!(
+        run.error().is_none(),
+        "a refused push is the banner, not an error"
+    );
     a.with(|s| {
         assert_eq!(s.binding(TEAM).unwrap().role, Some(Role::Viewer));
         let ss = s.space_sync(&Scope::Space(TEAM.into()));
@@ -2286,13 +2368,22 @@ async fn m2_a_project_delete_refused_with_forbidden_role_is_discarded_back() {
     a.with(|s| s.delete_project(&tp).unwrap());
     // Demoted to editor before the push: the project tombstone is refused.
     team_exists(&g, "editor");
-    g.0.lock().unwrap().roles.insert(TEAM.into(), "editor".into());
+    g.0.lock()
+        .unwrap()
+        .roles
+        .insert(TEAM.into(), "editor".into());
     a.run(&server, &g).await;
     let pk = sync_key(EntityType::Project, &tp);
     a.with(|s| {
         let ss = s.space_sync(&Scope::Space(TEAM.into()));
         assert_eq!(ss.frozen, vec![pk.clone()]);
-        assert!(ss.issue.as_ref().unwrap().message.contains("Only admins can delete projects in Acme"));
+        assert!(
+            ss.issue
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("Only admins can delete projects in Acme")
+        );
         assert!(
             s.space_state(&Scope::Space(TEAM.into()))
                 .tombstones
@@ -2312,7 +2403,11 @@ async fn m2_a_project_delete_refused_with_forbidden_role_is_discarded_back() {
         let t = s.project(&tp).expect("Discard brings the project back");
         assert_eq!(s.bindings.project_spaces[&tp], TEAM);
         assert!(t.requests.iter().any(|r| r.id == tr), "with its content");
-        assert!(s.space_state(&Scope::Space(TEAM.into())).tombstones.is_empty());
+        assert!(
+            s.space_state(&Scope::Space(TEAM.into()))
+                .tombstones
+                .is_empty()
+        );
     });
     assert!(!server_ent(&g, TEAM, "request", &tr).unwrap().deleted);
 }
@@ -2337,12 +2432,22 @@ async fn m2_team_pushes_leave_device_local_paths_here() {
     let mut theirs: Request = serde_json::from_value(pushed).unwrap();
     theirs.name = "Upload v2".into();
     theirs.updated_at = now_ms() + 1_000;
-    seed(&g, TEAM, "request", &rid, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    seed(
+        &g,
+        TEAM,
+        "request",
+        &rid,
+        theirs.updated_at,
+        serde_json::to_value(&theirs).unwrap(),
+    );
     a.run(&server, &g).await;
     a.with(|s| {
         let r = s.request(&rid).unwrap();
         assert_eq!(r.name, "Upload v2");
-        assert_eq!(r.body.binary_path.as_deref(), Some("/Users/priya/secret.bin"));
+        assert_eq!(
+            r.body.binary_path.as_deref(),
+            Some("/Users/priya/secret.bin")
+        );
     });
 }
 
@@ -2358,19 +2463,38 @@ async fn m2_copy_to_project_and_duplicate_use_new_ids_and_leave_the_source() {
         (t.collections[0].id.clone(), t.requests[0].id.clone())
     });
     a.with(|s| {
-        let (t, copy) = s.copy_to_project("collection", &tc, &pid, None, None).unwrap();
+        let (t, copy) = s
+            .copy_to_project("collection", &tc, &pid, None, None)
+            .unwrap();
         assert_ne!(copy, tc);
         let col = t.collections.iter().find(|c| c.id == copy).unwrap();
         assert_eq!(col.name, "Orders");
-        assert!(t.requests.iter().any(|r| r.collection_id == copy && r.id != tr));
+        assert!(
+            t.requests
+                .iter()
+                .any(|r| r.collection_id == copy && r.id != tr)
+        );
         let (t, copy) = s
             .copy_to_project("request", &rid, &tp, Some(&tc), None)
             .unwrap();
-        assert!(t.requests.iter().any(|r| r.id == copy && r.collection_id == tc));
+        assert!(
+            t.requests
+                .iter()
+                .any(|r| r.id == copy && r.collection_id == tc)
+        );
         // Without a target collection, one named after the source's is made.
         let (t, _) = s.copy_to_project("request", &tr, &pid, None, None).unwrap();
-        assert_eq!(t.collections.iter().filter(|c| c.name == "Orders").count(), 2);
-        assert!(s.project(&pid).unwrap().collections.iter().any(|c| c.id == cid));
+        assert_eq!(
+            t.collections.iter().filter(|c| c.name == "Orders").count(),
+            2
+        );
+        assert!(
+            s.project(&pid)
+                .unwrap()
+                .collections
+                .iter()
+                .any(|c| c.id == cid)
+        );
         let p = s.copy_preview("request", &rid, &tp).unwrap();
         assert_eq!(p.target_kind, "team");
     });
@@ -2393,9 +2517,15 @@ async fn qa1_deferred_deletes_still_hold_a_newer_edit_and_push_no_orphan() {
     let b = second_device(&server, &g).await;
     bind_team(&b, &server, Role::Admin);
     b.run(&server, &g).await;
-    transfer::move_project(&a.store, Some(session(&server, &g)), &old_p, Some(PERSONAL), &no_progress)
-        .await
-        .unwrap();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &old_p,
+        Some(PERSONAL),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     a.run(&server, &g).await;
     std::thread::sleep(std::time::Duration::from_millis(5));
     b.with(|s| {
@@ -2404,11 +2534,18 @@ async fn qa1_deferred_deletes_still_hold_a_newer_edit_and_push_no_orphan() {
         s.save_request(&r).unwrap();
     });
     // Personal is briefly down: B7 defers the team's deletes.
-    g.0.lock().unwrap().fail.insert(PERSONAL.into(), (503, "starting".into()));
+    g.0.lock()
+        .unwrap()
+        .fail
+        .insert(PERSONAL.into(), (503, "starting".into()));
     let pushes_before = pushed_ids(&g, TEAM).len();
     b.run(&server, &g).await;
     g.0.lock().unwrap().fail.clear();
-    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before, "nothing pushed to the team");
+    assert_eq!(
+        pushed_ids(&g, TEAM).len(),
+        pushes_before,
+        "nothing pushed to the team"
+    );
     assert!(server_ent(&g, TEAM, "request", &old_r).unwrap().deleted);
     let rk = sync_key(EntityType::Request, &old_r);
     b.with(|s| {
@@ -2448,18 +2585,29 @@ async fn qa1_nothing_under_a_deferred_tombstone_is_pushed() {
     let later = now_ms() + 1_000;
     tombstone(&g, TEAM, "request", &tr, later);
     tombstone(&g, TEAM, "project", &tp, later);
-    g.0.lock().unwrap().fail.insert(PERSONAL.into(), (503, "starting".into()));
+    g.0.lock()
+        .unwrap()
+        .fail
+        .insert(PERSONAL.into(), (503, "starting".into()));
     let pushes_before = pushed_ids(&g, TEAM).len();
     a.run(&server, &g).await;
     assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before);
     a.with(|s| {
         let ss = s.space_sync(&Scope::Space(TEAM.into()));
-        assert!(ss.deferred_deletes.contains(&sync_key(EntityType::Project, &tp)));
+        assert!(
+            ss.deferred_deletes
+                .contains(&sync_key(EntityType::Project, &tp))
+        );
         assert!(sync::collect_push_in(s, &Scope::Space(TEAM.into())).is_empty());
     });
     g.0.lock().unwrap().fail.clear();
     a.run(&server, &g).await;
-    a.with(|s| assert!(s.project(&tp).is_err(), "the older edit loses to the delete"));
+    a.with(|s| {
+        assert!(
+            s.project(&tp).is_err(),
+            "the older edit loses to the delete"
+        )
+    });
     assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before);
 }
 
@@ -2475,9 +2623,15 @@ async fn qa1_a_sync_between_a_failed_move_and_its_resume_makes_no_duplicates() {
     bind_team(&a, &server, Role::Editor);
     team_exists(&g, "editor");
     g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap_err();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap_err();
     g.0.lock().unwrap().lose_push_response.clear();
     let projects_before = a.with(|s| s.project_list().len());
     a.run(&server, &g).await;
@@ -2485,21 +2639,44 @@ async fn qa1_a_sync_between_a_failed_move_and_its_resume_makes_no_duplicates() {
     let copy_pid = plan.id_map[&pid].clone();
     let copy_env = plan.id_map[&env_id].clone();
     a.with(|s| {
-        assert_eq!(s.project_list().len(), projects_before, "no partial copy pulled");
+        assert_eq!(
+            s.project_list().len(),
+            projects_before,
+            "no partial copy pulled"
+        );
         assert!(s.project(&copy_pid).is_err());
         assert_eq!(s.pending_move_list()[0].project_name, "Work");
     });
-    let done = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap();
+    let done = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     assert_eq!(done.project_id, copy_pid);
     a.run(&server, &g).await;
     a.with(|s| {
-        assert_eq!(s.environments.iter().filter(|e| e.id == copy_env).count(), 1);
-        assert_eq!(s.project_list().iter().filter(|p| p.name == "Work").count(), 1);
+        assert_eq!(
+            s.environments.iter().filter(|e| e.id == copy_env).count(),
+            1
+        );
+        assert_eq!(
+            s.project_list().iter().filter(|p| p.name == "Work").count(),
+            1
+        );
     });
     let reopened = a.reopen();
-    assert_eq!(reopened.environments.iter().filter(|e| e.id == copy_env).count(), 1);
+    assert_eq!(
+        reopened
+            .environments
+            .iter()
+            .filter(|e| e.id == copy_env)
+            .count(),
+        1
+    );
 }
 
 /// QA major: a move to another target first undoes the older plan.
@@ -2511,9 +2688,15 @@ async fn qa1_a_move_to_another_target_cancels_the_older_plan() {
     bind_team(&a, &server, Role::Editor);
     team_exists(&g, "editor");
     g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap_err();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap_err();
     g.0.lock().unwrap().lose_push_response.clear();
     let mut plan = a.with(|s| s.pending_moves().pop().unwrap());
     // The project landed; pretend its acknowledgement was recorded.
@@ -2521,10 +2704,21 @@ async fn qa1_a_move_to_another_target_cancels_the_older_plan() {
     plan.applied.insert(copy_key, 1);
     a.with(|s| s.record_move_progress(&plan).unwrap());
     // Now to this device only instead.
-    let moved = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, None, &no_progress)
-        .await
-        .unwrap();
-    assert!(server_ent(&g, TEAM, "project", &plan.id_map[&pid]).unwrap().deleted, "the older plan was undone");
+    let moved = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        None,
+        &no_progress,
+    )
+    .await
+    .unwrap();
+    assert!(
+        server_ent(&g, TEAM, "project", &plan.id_map[&pid])
+            .unwrap()
+            .deleted,
+        "the older plan was undone"
+    );
     a.with(|s| {
         assert!(s.pending_moves().is_empty());
         assert!(!s.bindings.project_spaces.contains_key(&moved.project_id));
@@ -2540,7 +2734,12 @@ async fn qa1_a_crash_between_saving_the_copy_and_removing_the_source_loses_nothi
     a.with(|s| {
         let env = s.create_environment(Some(&pid), "Dev").unwrap();
         let mut e = env.clone();
-        e.variables = vec![serde_json::from_value(json!({"key": "token", "value": "s3cret", "enabled": true, "secret": true})).unwrap()];
+        e.variables = vec![
+            serde_json::from_value(
+                json!({"key": "token", "value": "s3cret", "enabled": true, "secret": true}),
+            )
+            .unwrap(),
+        ];
         s.update_environment(&e).unwrap();
     });
     a.run(&server, &g).await;
@@ -2548,9 +2747,15 @@ async fn qa1_a_crash_between_saving_the_copy_and_removing_the_source_loses_nothi
     team_exists(&g, "editor");
     // Push the copy, then "crash" right after step one of the local step.
     g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap_err();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap_err();
     g.0.lock().unwrap().lose_push_response.clear();
     let plan = a.with(|s| s.pending_moves().pop().unwrap());
     let copy = a.with(|s| s.finish_move_copy(&plan).unwrap());
@@ -2561,21 +2766,37 @@ async fn qa1_a_crash_between_saving_the_copy_and_removing_the_source_loses_nothi
         reopened
             .environments
             .iter()
-            .any(|e| e.project_id.as_deref() == Some(copy.as_str()) && e.variables[0].value == "s3cret"),
+            .any(|e| e.project_id.as_deref() == Some(copy.as_str())
+                && e.variables[0].value == "s3cret"),
         "with its secret value"
     );
     *a.store.lock().unwrap() = reopened;
     a.with(|s| {
         s.set_account(Some(ident(&server)));
     });
-    let done = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap();
+    let done = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     assert_eq!(done.project_id, copy);
     a.with(|s| {
         assert!(s.project(&pid).is_err());
-        assert_eq!(s.project_list().iter().filter(|p| p.name == "Work").count(), 1);
-        assert_eq!(s.environments.iter().filter(|e| e.project_id.as_deref() == Some(copy.as_str())).count(), 1);
+        assert_eq!(
+            s.project_list().iter().filter(|p| p.name == "Work").count(),
+            1
+        );
+        assert_eq!(
+            s.environments
+                .iter()
+                .filter(|e| e.project_id.as_deref() == Some(copy.as_str()))
+                .count(),
+            1
+        );
         assert!(s.pending_moves().is_empty());
     });
     // Idempotent: finishing the same plan again only drops it.
@@ -2583,7 +2804,10 @@ async fn qa1_a_crash_between_saving_the_copy_and_removing_the_source_loses_nothi
         s.record_move_progress(&plan).unwrap();
         assert_eq!(s.finish_move(&plan).unwrap(), copy);
         assert!(s.pending_moves().is_empty());
-        assert_eq!(s.project_list().iter().filter(|p| p.name == "Work").count(), 1);
+        assert_eq!(
+            s.project_list().iter().filter(|p| p.name == "Work").count(),
+            1
+        );
     });
 }
 
@@ -2598,23 +2822,39 @@ async fn qa1_an_entity_deleted_before_the_resume_is_removed_from_the_target() {
     team_exists(&g, "editor");
     let rid = a.with(|s| s.project(&pid).unwrap().requests[0].id.clone());
     g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap_err();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap_err();
     g.0.lock().unwrap().lose_push_response.clear();
     let mut plan = a.with(|s| s.pending_moves().pop().unwrap());
     let copy_r = plan.id_map[&rid].clone();
     // Record what landed (as a lost answer would have).
     let landed: Vec<(String, i64)> = {
         let st = g.0.lock().unwrap();
-        st.spaces[TEAM].entities.iter().map(|((t, id), e)| (format!("{t}:{id}"), e.updated_at)).collect()
+        st.spaces[TEAM]
+            .entities
+            .iter()
+            .map(|((t, id), e)| (format!("{t}:{id}"), e.updated_at))
+            .collect()
     };
     plan.applied.extend(landed);
     a.with(|s| s.record_move_progress(&plan).unwrap());
     a.with(|s| s.delete_request(&rid).unwrap());
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     assert!(server_ent(&g, TEAM, "request", &copy_r).unwrap().deleted);
     a.run(&server, &g).await;
     a.with(|s| assert!(s.request(&copy_r).is_none(), "not pulled back"));
@@ -2674,23 +2914,41 @@ async fn qa1_saving_a_held_collection_copies_only_that_collection() {
         assert_eq!(t.collections[0].name, "Orders");
         assert_eq!(t.requests[0].url, "https://mine");
         assert_eq!(s.bindings.project_spaces[&copies[0]], PERSONAL);
-        assert!(s.project(&tp).unwrap().collections.iter().any(|c| c.id == other));
+        assert!(
+            s.project(&tp)
+                .unwrap()
+                .collections
+                .iter()
+                .any(|c| c.id == other)
+        );
     });
 }
 
 // ───────────────────────────── M2 QA round 2 regressions ─────────────────────────────
 
 /// A failed move whose batches were all acknowledged: the plan holds them.
-async fn acknowledged_failed_move(server: &MockServer, g: &Go, a: &Device, pid: &str) -> transfer::MovePlan {
+async fn acknowledged_failed_move(
+    server: &MockServer,
+    g: &Go,
+    a: &Device,
+    pid: &str,
+) -> transfer::MovePlan {
     g.0.lock().unwrap().lose_push_response.insert(TEAM.into());
-    transfer::move_project(&a.store, Some(session(server, g)), pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap_err();
+    transfer::move_project(
+        &a.store,
+        Some(session(server, g)),
+        pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap_err();
     g.0.lock().unwrap().lose_push_response.clear();
     let mut plan = a.with(|s| s.pending_moves().pop().unwrap());
     let changes = a.with(|s| s.move_changes(&mut plan.clone()).unwrap());
     for c in &changes {
-        plan.applied.insert(sync_key(c.entity_type, &c.id), c.updated_at);
+        plan.applied
+            .insert(sync_key(c.entity_type, &c.id), c.updated_at);
     }
     a.with(|s| s.record_move_progress(&plan).unwrap());
     plan
@@ -2708,19 +2966,45 @@ async fn qa2_a_teammate_edit_of_an_acknowledged_pending_copy_applies_after_the_m
     let plan = acknowledged_failed_move(&server, &g, &a, &pid).await;
     let rid = a.with(|s| s.project(&pid).unwrap().requests[0].id.clone());
     let new_r = plan.id_map[&rid].clone();
-    let mut theirs: Request =
-        serde_json::from_value(server_ent(&g, TEAM, "request", &new_r).unwrap().data.unwrap()).unwrap();
+    let mut theirs: Request = serde_json::from_value(
+        server_ent(&g, TEAM, "request", &new_r)
+            .unwrap()
+            .data
+            .unwrap(),
+    )
+    .unwrap();
     theirs.url = "https://teammate".into();
     theirs.updated_at = now_ms() + 1_000;
-    seed(&g, TEAM, "request", &new_r, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    seed(
+        &g,
+        TEAM,
+        "request",
+        &new_r,
+        theirs.updated_at,
+        serde_json::to_value(&theirs).unwrap(),
+    );
     a.run(&server, &g).await; // skipped: the copy isn't here yet
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     a.run(&server, &g).await;
-    assert_eq!(a.with(|s| s.request(&new_r).map(|r| r.url.clone())).as_deref(), Some("https://teammate"));
+    assert_eq!(
+        a.with(|s| s.request(&new_r).map(|r| r.url.clone()))
+            .as_deref(),
+        Some("https://teammate")
+    );
     // And a later local edit doesn't overwrite it blindly: it builds on it.
-    let srv = server_ent(&g, TEAM, "request", &new_r).unwrap().data.unwrap()["url"].clone();
+    let srv = server_ent(&g, TEAM, "request", &new_r)
+        .unwrap()
+        .data
+        .unwrap()["url"]
+        .clone();
     assert_eq!(srv, "https://teammate");
 }
 
@@ -2737,15 +3021,24 @@ async fn qa2_a_teammate_delete_in_a_pending_copy_applies_after_the_move() {
     let new_r = plan.id_map[&rid].clone();
     tombstone(&g, TEAM, "request", &new_r, now_ms() + 1_000);
     a.run(&server, &g).await;
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     a.run(&server, &g).await;
     a.with(|s| {
         assert!(s.request(&new_r).is_none(), "the teammate's delete applied");
         assert!(s.project(&plan.id_map[&pid]).is_ok());
     });
-    assert!(server_ent(&g, TEAM, "request", &new_r).unwrap().deleted, "not resurrected");
+    assert!(
+        server_ent(&g, TEAM, "request", &new_r).unwrap().deleted,
+        "not resurrected"
+    );
 }
 
 /// QA3 minor: a crash after the source's removal but before the cursor
@@ -2760,11 +3053,23 @@ async fn qa3_a_crash_after_removing_the_source_still_rewinds_the_target() {
     let plan = acknowledged_failed_move(&server, &g, &a, &pid).await;
     let rid = a.with(|s| s.project(&pid).unwrap().requests[0].id.clone());
     let new_r = plan.id_map[&rid].clone();
-    let mut theirs: Request =
-        serde_json::from_value(server_ent(&g, TEAM, "request", &new_r).unwrap().data.unwrap()).unwrap();
+    let mut theirs: Request = serde_json::from_value(
+        server_ent(&g, TEAM, "request", &new_r)
+            .unwrap()
+            .data
+            .unwrap(),
+    )
+    .unwrap();
     theirs.url = "https://teammate".into();
     theirs.updated_at = now_ms() + 1_000;
-    seed(&g, TEAM, "request", &new_r, theirs.updated_at, serde_json::to_value(&theirs).unwrap());
+    seed(
+        &g,
+        TEAM,
+        "request",
+        &new_r,
+        theirs.updated_at,
+        serde_json::to_value(&theirs).unwrap(),
+    );
     a.run(&server, &g).await; // skipped: the copy isn't here yet
     // The interrupted finish: copy saved, source removed, plan still there,
     // cursor never rewound.
@@ -2774,12 +3079,22 @@ async fn qa3_a_crash_after_removing_the_source_still_rewinds_the_target() {
         assert!(s.move_source_gone(&plan));
         assert_eq!(s.pending_move_list().len(), 1);
     });
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     a.with(|s| assert!(s.pending_move_list().is_empty()));
     a.run(&server, &g).await;
-    assert_eq!(a.with(|s| s.request(&new_r).map(|r| r.url.clone())).as_deref(), Some("https://teammate"));
+    assert_eq!(
+        a.with(|s| s.request(&new_r).map(|r| r.url.clone()))
+            .as_deref(),
+        Some("https://teammate")
+    );
 }
 
 /// QA2 minor 2: finishing a move whose copy was already saved keeps the
@@ -2801,17 +3116,33 @@ async fn qa2_finishing_keeps_edits_made_to_an_already_saved_copy() {
         s.save_request(&r).unwrap();
     });
     let pushes_before = pushed_ids(&g, TEAM).len();
-    let done = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap();
+    let done = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     assert_eq!(done.project_id, copy);
-    assert_eq!(pushed_ids(&g, TEAM).len(), pushes_before, "the source isn't pushed over the copy");
+    assert_eq!(
+        pushed_ids(&g, TEAM).len(),
+        pushes_before,
+        "the source isn't pushed over the copy"
+    );
     a.with(|s| {
         assert!(s.project(&pid).is_err());
         assert_eq!(s.request(&new_r).unwrap().url, "https://edited-copy");
     });
     a.run(&server, &g).await;
-    assert_eq!(server_ent(&g, TEAM, "request", &new_r).unwrap().data.unwrap()["url"], "https://edited-copy");
+    assert_eq!(
+        server_ent(&g, TEAM, "request", &new_r)
+            .unwrap()
+            .data
+            .unwrap()["url"],
+        "https://edited-copy"
+    );
 }
 
 /// QA2 minor 3: a move whose copy is already saved can be finished, not
@@ -2834,16 +3165,34 @@ async fn qa2_a_move_with_a_saved_copy_must_be_finished_first() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Finish it instead"), "{err}");
-    let err = transfer::move_project(&a.store, Some(session(&server, &g)), &pid, None, &no_progress)
-        .await
-        .unwrap_err();
-    assert_eq!(err.to_string(), "Finish the move to Acme first: its copy is already saved here.");
+    let err = transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        None,
+        &no_progress,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Finish the move to Acme first: its copy is already saved here."
+    );
     a.with(|s| {
-        assert!(s.project(&pid).is_ok() && s.project(&plan.id_map[&pid]).is_ok(), "nothing changed");
+        assert!(
+            s.project(&pid).is_ok() && s.project(&plan.id_map[&pid]).is_ok(),
+            "nothing changed"
+        );
         assert_eq!(s.pending_moves().len(), 1);
     });
-    transfer::move_project(&a.store, Some(session(&server, &g)), &pid, Some(TEAM), &no_progress)
-        .await
-        .unwrap();
+    transfer::move_project(
+        &a.store,
+        Some(session(&server, &g)),
+        &pid,
+        Some(TEAM),
+        &no_progress,
+    )
+    .await
+    .unwrap();
     a.with(|s| assert!(s.pending_moves().is_empty()));
 }

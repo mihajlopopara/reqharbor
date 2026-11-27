@@ -723,6 +723,7 @@ impl Body {
             graphql: Some(GraphqlBody {
                 query: query.into(),
                 variables: variables.into(),
+                operation_name: None,
                 extra: Extra::new(),
             }),
             ..Body::default()
@@ -749,8 +750,23 @@ pub struct GraphqlBody {
     /// Variables as JSON text, exactly as edited. Empty means "no variables".
     #[serde(default)]
     pub variables: String,
+    /// The operation to run when the document defines several (AC-GQL-9).
+    /// Sent as `operationName`; omitted when unset. Older builds keep it in
+    /// `extra` (AC-FWD-1) and send without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_name: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+impl GraphqlBody {
+    /// The operation name to send: set and not blank.
+    pub fn operation(&self) -> Option<&str> {
+        self.operation_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 open_string_enum! {
@@ -1161,6 +1177,40 @@ impl Default for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ac_gql_1_operation_name_serde_and_forward_compat() {
+        // Absent: None, and not written back (older files stay byte-identical).
+        let g: GraphqlBody = serde_json::from_str(r#"{"query":"{a}","variables":""}"#).unwrap();
+        assert_eq!(g.operation_name, None);
+        assert_eq!(
+            serde_json::to_string(&g).unwrap(),
+            r#"{"query":"{a}","variables":""}"#
+        );
+        // Present: kept next to keys from a newer build.
+        let text = r#"{"query":"query A { a } query B { b }","variables":"","operationName":"B","fxPersisted":{"sha":"x"}}"#;
+        let g: GraphqlBody = serde_json::from_str(text).unwrap();
+        assert_eq!(g.operation_name.as_deref(), Some("B"));
+        assert_eq!(g.operation(), Some("B"));
+        assert!(g.extra.contains_key("fxPersisted"));
+        assert!(!g.extra.contains_key("operationName"));
+        assert_eq!(serde_json::to_string(&g).unwrap(), text);
+        // A whole request round-trips it, and the body stays known/editable.
+        let r: Request = serde_json::from_value(serde_json::json!({
+            "id": "r", "collectionId": "c", "name": "n", "method": "POST", "url": "u",
+            "body": {"type": "graphql", "graphql": {"query": "{a}", "variables": "", "operationName": "A"}}
+        }))
+        .unwrap();
+        assert!(r.is_editable());
+        let back = serde_json::to_value(&r).unwrap();
+        assert_eq!(back["body"]["graphql"]["operationName"], "A");
+        // Blank names are not an operation.
+        let blank = GraphqlBody {
+            operation_name: Some(" ".into()),
+            ..GraphqlBody::default()
+        };
+        assert_eq!(blank.operation(), None);
+    }
 
     #[test]
     fn ac_req_1_method_validation() {

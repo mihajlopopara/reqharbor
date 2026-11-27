@@ -79,6 +79,15 @@ Backend: `src-tauri/src/commands.rs` (thin wrappers) over `crates/core` (`reqhar
 | New error codes `ws_not_connected`, `ws_invalid_message`; `validation` details gain `notHttp` (`send_request` / `export_curl` got a `ws` request), `notWebSocket`, `invalidWsUrl`, `invalidSocketIoAuth`, `undefinedSocketIoAuthVariable`. | §1 |
 | `Backend.channel(handler)` in `ui/src/lib/api` creates the channel (Tauri `Channel`, or the mock's). | §3.13 |
 
+### GraphQL schemas and operations (PRODUCT §5.14)
+
+| Change | Where |
+|---|---|
+| `GraphqlBody` gains `operationName?: string` (omitted when unset; blank = unset). Sent as `"operationName"` in the JSON body (`{"query","operationName","variables"}`) and in cURL export; cURL import restores it. `kind: "graphql"` stays reserved and read-only. | §2, §3.5, §3.7 |
+| New commands `graphql_fetch_schema`, `graphql_cached_schema`, `graphql_load_schema_file`, `graphql_store_schema`, `graphql_clear_schema` and types `GraphqlSchema`, `GraphqlCacheLookup`. | §3.15 |
+| New error codes `graphql_network`, `graphql_introspection_disabled`, `graphql_introspection_failed`, `graphql_schema_invalid`, `graphql_schema_too_large` (`details`: `GraphqlErrorDetails`). | §1 |
+| New local directory `graphql-schemas/` in the app data dir (never synced). | §4 |
+
 ## 1. Calling convention
 
 ```ts
@@ -138,6 +147,11 @@ try { await call("save_request", { request }); } catch (e) { const err = e as Co
 | `not_a_member`, `team_not_found`, `member_not_found`, `invite_not_found` | the team, member or invite is gone (or never was) |
 | `ws_not_connected` | `ws_send` on a connection that isn't open (unknown id, still connecting, or closed) |
 | `ws_invalid_message` | `ws_send` refused the message: invalid JSON or base64, no or reserved Socket.IO event name, binary in Socket.IO mode (`message` says which) |
+| `graphql_network` | `graphql_fetch_schema` couldn't reach the server; `details` = `{ kind: ErrorKind }` (`cancelled` after `cancel_request`: show nothing) |
+| `graphql_introspection_disabled` | the server refuses introspection (an `errors[].message` mentioning introspection, `__schema` or `__type`); `message` = "Introspection is disabled on this server", `details` = `{ serverMessage }` — offer Load from file… (AC-GQL-3) |
+| `graphql_introspection_failed` | any other answer without `data.__schema`; `message` says why (first GraphQL error, "The server answered 404 Not Found", "The response isn't JSON…"), `details` = `{ status }` |
+| `graphql_schema_invalid` | `graphql_load_schema_file`: not UTF-8, invalid JSON, JSON without `__schema`, or no type definitions; `message` = "This file isn't a GraphQL schema: <reason>" |
+| `graphql_schema_too_large` | a schema over 10 MB; `details` = `{ sizeBytes }` |
 | `internal` | unexpected |
 
 ## 2. Data model
@@ -156,6 +170,7 @@ Exactly PRODUCT.md §3, serialized as in `types.ts`. Notes that matter to the UI
 * **Timeout**: `settings.timeoutMs: 0` disables the timeout (imported from `curl -m 0`).
 * **Unknown keys (AC-FWD-1)**: objects may carry keys that are not in `types.ts`, written by a newer ReqHarbor (on another device, via sync or a share). The backend preserves them everywhere; the UI must not drop them — copy objects with spread / `structuredClone` instead of rebuilding them. As a safety net `save_request` re-adds keys the stored request has and the update lacks, at every nesting level (list rows are matched by `key`).
 * **Newer containers (AC-FWD-4)**: a `Project`, `Collection`, `Folder` or `Environment` may carry `minClientVersion`; newer than `Bootstrap.appVersion` (or not a string) = read-only here, see `read_only_newer` in §1. The tree shows the "Requires a newer ReqHarbor" badge on such a collection or folder, offers no Rename / Duplicate / Move / Settings for it, and never starts a rename or drag of it.
+* **GraphQL (AC-GQL-1, AC-GQL-9)**: GraphQL is a body type of an HTTP request, never a `kind`. `body.graphql.operationName` is kept only while the query defines two or more named operations (the UI's Operation picker writes it, first named operation by default) and is omitted otherwise; core sends it only when set and not blank. Before `send_request` / `export_curl` the UI normalises the request with `withOperation` (`ui/src/lib/util/graphql.ts`): no or a stale name with ≥ 2 named operations → the first named one; fewer than two → none. Older builds keep it as an unknown key.
 * **Request kind (AC-FWD-2..4, AC-WS-1)**: `kind` is absent (= `"http"`) for HTTP requests and `"ws"` for WebSocket / Socket.IO requests (§3.13). A request is **read-only** when `kind` is anything but `"http"` or `"ws"`, when a saved WebSocket message's `kind` is not `text`/`json`/`binary` or `ws.socketIo.version` is not 4, when `body.type` is not one of the eight known types, when `auth.type` is not one of the five known schemes or `auth.apiKey.in` is not `header`/`query`, when a form field's `kind` is not `text`/`file`, or when `minClientVersion` is newer than `Bootstrap.appVersion` (an unparseable version counts as newer). The stored copy decides: the UI treats an open request as read-only when either the editor copy or the saved one is. When a sync pull turns the open request read-only, the editor switches to the saved, view-only copy; unsaved edits (of it or of a stashed draft) are offered once as "Save my edits as a copy" (a new, editable request via `create_request`). Read-only requests: the tree shows a "Requires a newer ReqHarbor" badge; the pane is view-only, Save and Send are disabled ("This request needs a newer version of ReqHarbor"); the only tree actions are Open and Delete. The backend refuses edits and sends with `read_only_newer` and sync never pushes a locally modified version of one (a remote version always replaces it).
 
 ## 3. Commands
@@ -225,7 +240,7 @@ Dirty state (AC-REQ-11): the UI compares the edited request with the last saved 
 | `cancel_request` | `executionId` | `boolean` |
 | `get_response_body` | `responseId, limit?` | `ArrayBuffer` (raw bytes over IPC) |
 | `save_response_body` | `responseId, path` | `null` |
-| `format_body` | `kind: "json"\|"xml", text` | `string` (JSON: 2-space, numbers/escapes preserved) |
+| `format_body` | `kind: "json"\|"xml", text` | `string` (JSON: 2-space, numbers/escapes preserved). GraphQL queries are prettified in the UI (graphql-js `print`, AC-GQL-7); variables use `kind: "json"`. |
 | `url_to_params` | `url, params` | `KeyValue[]` |
 | `params_to_url` | `url, params` | `string` |
 
@@ -465,9 +480,43 @@ Behaviour: plain WebSocket answers server pings automatically (shown as an `in` 
 
 Mock (browser mode): `ui/src/lib/api/mock/ws.ts` echoes text and binary (and greets with `{"type":"welcome",…}`), `close:<code>` makes it close with that code; Socket.IO echoes each event and acknowledges when asked. Host `refused.test` or port 1 → connect error, `*.invalid` → DNS error, a path containing `/forbidden` → 403.
 
+### 3.15 GraphQL schemas (AC-GQL-2..5)
+
+Every command takes the request **as edited** plus `projectId?`, resolved exactly like `send_request` (project env → Global, `{{$…}}`, collection auth for Inherit) and refused like it (`validation`: `emptyUrl`, `invalidMethod`, `notHttp`, `inheritedAuthNeedsNewerVersion`; `read_only_newer`). The **schema URL** (the cache key) is the URL the introspection request would go to: resolved, params and API-key query applied, scheme defaulted, fragment dropped, `{{$dynamic}}` variables left literal, and every secret value masked as `{{name}}` by the history redactor (`Redactor::from_scope`, also when a plain variable pulls a secret in).
+
+The UI never caches what it can't use: it fetches / loads with `store: false`, builds the schema with graphql-js, and only then calls `graphql_store_schema`. A failed build keeps the schema already shown and cached.
+
+| command | args | result |
+|---|---|---|
+| `graphql_fetch_schema` | `request, projectId?, executionId?, store? = true` | `GraphqlSchema` — POSTs the standard introspection query (`operationName: "IntrospectionQuery"`, `variables: {}`, `Content-Type: application/json`, a user `Content-Type` header dropped) with the request's URL, params, headers, auth and settings (timeout, redirects, Verify TLS); caches the result unless `store: false`; no history entry. `cancel_request(executionId)` cancels it (`graphql_network`, kind `cancelled`). An answer over 40 MB is refused unparsed (`graphql_schema_too_large`). |
+| `graphql_cached_schema` | `request, projectId?, known?: {url, fetchedAt}` | `GraphqlCacheLookup { url, unchanged, schema: GraphqlSchema \| null }` — the cache only, never sends. `unchanged: true` (and `schema: null`) when the cached schema is the `known` one, so the shown schema isn't re-sent over IPC. Call it when a GraphQL body is shown and whenever an input of the schema URL changes: URL, params, auth (and the collection's for Inherit), the active and Global environments' values (debounced). |
+| `graphql_load_schema_file` | `request, projectId?, path?, text?, fileName?, store? = true` | `GraphqlSchema` (`source: "file"`) — SDL, or introspection JSON (`{"data":{"__schema":…}}` / `{"__schema":…}`, detected by a leading `{` or a `.json` name); `text` (browser mode) wins over reading `path`. Only regular files are opened (a FIFO or device is `graphql_schema_invalid`), read up to 10 MB + 1 byte. Cached for the request's schema URL unless `store: false`. |
+| `graphql_store_schema` | `request, projectId?, schema: GraphqlSchema` | `GraphqlSchema` — caches a schema the UI built successfully under `schema.url` (the redacted URL core computed at fetch / load time). If the request's schema URL is different now (the environment or a host variable changed meanwhile) nothing is cached and the schema is returned as is. Empty text → `graphql_schema_invalid`, over 10 MB → `graphql_schema_too_large`. |
+| `graphql_clear_schema` | `request, projectId?` | `boolean` — true when a cached schema was removed |
+
+```ts
+type GraphqlSchema = {
+  url: string;              // schema URL (cache key)
+  fetchedAt: number;        // epoch ms
+  source: "introspection" | "file";
+  fileName?: string;
+  format: "introspection" | "sdl";
+  schema: string;           // `{"__schema":…}` JSON text, or SDL text
+  sizeBytes: number;
+};
+```
+
+Reading the answer (core `graphql::read_introspection`): a JSON body with `data.__schema` (or `__schema`) whose `types` is a list is the schema, whatever the status; else an `errors[].message` mentioning introspection / `__schema` / `__type` → `graphql_introspection_disabled`; else the first error message, the status line for non-2xx, or "no schema" → `graphql_introspection_failed`. The UI builds the schema with graphql-js (`buildClientSchema` / `buildSchema`) in a lazy chunk; one that doesn't build is reported ("The server's schema can't be used: …" for a fetch, "This file isn't a GraphQL schema: …" for a file) and never stored.
+
+Cache (core `graphql::SchemaCache`): `<data dir>/graphql-schemas/<sha256(url)[..16 bytes] hex>.json` = `{schemaVersion: 1, ...GraphqlSchema}`; written atomically; one schema ≤ 10 MB; at most 50 MB / 200 files, oldest (mtime) removed first after each write; an unreadable file is dropped on read; temp files of interrupted writes (`.<name>.tmp-*`) older than an hour are removed on the next write. Never synced, shared, exported or backed up by sync.
+
+The UI also reports GraphQL `errors` of a response (AC-GQL-11) from the body it already fetched; no backend support is involved.
+
+Mock (browser mode): any `POST …/graphql` URL is a fake endpoint (`ui/src/lib/api/mock/graphql.ts`, executed with graphql-js: `me`, `user(id)`, `users(role, first)`, `search(term)`, `failing` (always errors), `createUser(input)`, types `User`, `Post`, `Node`, `Role`, `SearchResult`, `CreateUserInput`, `DateTime`); a request error (parse / validation, no `data`) answers 400 with `errors`, field errors 200 with `data` and `errors`; hosts containing `nointrospection` refuse introspection like Apollo Server (400); the header `X-Mock-Schema: broken` makes introspection answer a schema graphql-js can't build (a field of an undefined type); `*.invalid` / `refused.*` hosts fail like sends. `graphql_load_schema_file` with a `path` serves the fake schema (`.json` → introspection, else SDL; a path containing `invalid` → not a schema).
+
 ## 4. Storage (for reference)
 
-App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping, incl. `unknownChanges`), `history.jsonl`, `account.json` (signed in, or bindings kept after sign-out; no tokens), `sync-spaces.json` + `sync-spaces.backup.json` (account mode), `secrets.json` (only when the 0600 file store is used). Unknown keys in these files are preserved on rewrite (AC-FWD-1). Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
+App data dir (`bootstrap().dataDir`; macOS `~/Library/Application Support/dev.reqharbor.desktop`): `workspace.json`, `projects/<projectId>.json`, `environments.json`, `settings.json`, `sync-state.json` (tombstones + sync bookkeeping, incl. `unknownChanges`), `history.jsonl`, `account.json` (signed in, or bindings kept after sign-out; no tokens), `sync-spaces.json` + `sync-spaces.backup.json` (account mode), `secrets.json` (only when the 0600 file store is used), `graphql-schemas/*.json` (GraphQL schema cache, §3.15; local only, size-capped). Unknown keys in these files (the schema cache excepted) are preserved on rewrite (AC-FWD-1). Atomic writes (temp + fsync + rename); corrupt files are renamed `*.corrupt-<ts>.json` and reported in `bootstrap().corruptFiles`.
 
 ## 5. Not provided by the backend (UI responsibility)
 

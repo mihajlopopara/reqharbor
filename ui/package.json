@@ -23,13 +23,16 @@
     "@codemirror/lang-json": "6.0.2",
     "@codemirror/lang-xml": "6.1.0",
     "@codemirror/language": "6.13.1",
+    "@codemirror/lint": "6.9.7",
     "@codemirror/search": "6.7.3",
     "@codemirror/state": "6.7.6",
     "@codemirror/view": "6.44.0",
     "@lezer/highlight": "1.2.5",
     "@tauri-apps/api": "2.12.5",
     "@tauri-apps/plugin-clipboard-manager": "2.5.0",
-    "@tauri-apps/plugin-dialog": "2.8.4"
+    "@tauri-apps/plugin-dialog": "2.8.4",
+    "cm6-graphql": "1.0.0",
+    "graphql": "16.14.2"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.10.2",

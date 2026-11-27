@@ -399,7 +399,8 @@ export function exportCurl(r: Request, _keepVariables: boolean, inheritedAuth: A
       } catch {
         vars = {};
       }
-      bodyFlags.push(`--data-raw ${sq(JSON.stringify({ query: b.graphql?.query ?? "", variables: vars }))}`);
+      const op = b.graphql?.operationName?.trim();
+      bodyFlags.push(`--data-raw ${sq(JSON.stringify({ query: b.graphql?.query ?? "", ...(op ? { operationName: op } : {}), variables: vars }))}`);
       break;
     }
     case "formEncoded":

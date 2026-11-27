@@ -165,9 +165,16 @@ mod tests {
         emit(frame());
         assert!(!cancel.is_cancelled(), "a delivered frame changes nothing");
         emit(frame());
-        assert!(cancel.is_cancelled(), "the first failure cancels the session");
+        assert!(
+            cancel.is_cancelled(),
+            "the first failure cancels the session"
+        );
         emit(frame());
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "no more sends after a failure");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "no more sends after a failure"
+        );
     }
 
     #[tokio::test]

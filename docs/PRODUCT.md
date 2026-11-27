@@ -1,6 +1,6 @@
 # ReqHarbor — Product Spec (MVP)
 
-Status: approved for MVP build · Owner: Product · Last updated: 2026-11-25
+Status: approved for MVP build · Owner: Product · Last updated: 2026-11-27
 
 ## 1. Vision & positioning
 
@@ -26,7 +26,7 @@ ReqHarbor is a native-feeling desktop HTTP client for developers who want Postma
 
 ### 2.2 Later (not in MVP)
 
-Multiple open request tabs; scripting (pre-request/tests); OAuth 1/2, AWS SigV4, Digest, NTLM; GraphQL schema introspection/autocomplete; SSE, gRPC (WebSocket and Socket.IO shipped, §5.12); collection runner; Postman/Insomnia/Thunder import; HAR import; code generation beyond cURL; OS keychain for tokens; real-time collaboration and multi-user permissions; deep link `reqharbor://` to import shares; proxy and client-certificate settings; Windows `cmd` (`^`) and PowerShell cURL dialects.
+Multiple open request tabs; scripting (pre-request/tests); OAuth 1/2, AWS SigV4, Digest, NTLM; SSE, gRPC (WebSocket and Socket.IO shipped, §5.12; GraphQL schema introspection, autocomplete and the schema explorer shipped, §5.14); collection runner; Postman/Insomnia/Thunder import; HAR import; code generation beyond cURL; OS keychain for tokens; real-time collaboration and multi-user permissions; deep link `reqharbor://` to import shares; proxy and client-certificate settings; Windows `cmd` (`^`) and PowerShell cURL dialects.
 
 ## 3. Data model
 
@@ -50,7 +50,7 @@ Auth        { type: "none"|"inherit"|"basic"|"bearer"|"apikey",
               username?, password?, token?, apiKey?: { key, value, in: "header"|"query" } }
 Body        { type: "none"|"json"|"xml"|"text"|"form"|"formEncoded"|"graphql"|"binary",
               text?, form?: FormField[], formEncoded?: KeyValue[],
-              graphql?: { query, variables }, binaryPath? }
+              graphql?: { query, variables, operationName? }, binaryPath? }
 FormField   { key, value, kind: "text"|"file", enabled }
 Environment { id, workspaceId, projectId|null (null = Global), name,
               variables: { key, value, enabled, secret: bool }[] }
@@ -70,7 +70,7 @@ Storage layout (app data dir, atomic write = temp file + rename):
 ## 4. UI layout (Thunder Client parity)
 
 Left sidebar: top tabs **Activity / Collections / Env**, a filter input, and an active-environment dropdown. Activity lists history rows: colored METHOD badge, URL (resolved, ellipsized), relative time ("2m", "3h", "Yesterday"). Badge colors: GET green, POST amber, PUT blue, PATCH purple, DELETE red, QUERY teal, HEAD/OPTIONS/custom gray.
-Middle: method dropdown + URL bar + **Send** button; tabs **Query / Headers / Auth / Body / Tests / Pre Run** (counts shown when non-zero, e.g. "Headers 3"); Body sub-tabs **JSON / XML / Text / Form / Form-encode / GraphQL / Binary** with CodeMirror 6 and a **Format** button.
+Middle: method dropdown + URL bar + **Send** button; tabs **Query / Headers / Auth / Body / Tests / Pre Run** (counts shown when non-zero, e.g. "Headers 3"); Body sub-tabs **JSON / XML / Text / Form / Form-encode / GraphQL / Binary** with CodeMirror 6 and a **Format** button. The GraphQL body adds a schema bar, schema-aware Query and Variables editors, an Operation picker and a Docs explorer (§5.14).
 Right: Status · Size · Time strip; tabs **Response / Headers / Cookies**. Empty state shows the shortcut cheat sheet (Send Request ⌘Enter, Import cURL ⌘U, Change Environment ⌘E, New Request ⌘N).
 Panes are resizable; layout persists. All shortcuts use Ctrl instead of ⌘ on Windows/Linux.
 
@@ -229,6 +229,30 @@ Teams exist only when the signed-in account's server advertises `features.teams`
 - AC-TSYNC-8: Binary body paths and form file values never upload to a team; each device keeps its own.
 - AC-TSHARE-1: Settings › Shares groups links by space with a Created by column ("You", "Sam Lee", "Former member"); editors update and revoke their own links, admins anyone's; viewers can't create or change share links. Team shares keep their options on the server, so Update reproduces them.
 
+### 5.14 GraphQL (GQL)
+*As an API developer I want my GraphQL client to know the server's schema: completion, docs and checks while I write a query, and the right operation sent.*
+
+**Decisions (recorded 2026-11-27):**
+- **GraphQL stays a body type of an HTTP request** (`body.type: "graphql"`, AC-REQ-5). `Request.kind: "graphql"` stays reserved and read-only (AC-FWD-3). Why: every shipped build already reads, edits, sends, syncs and shares GraphQL bodies; activating the kind would make each such request read-only on older devices and team members' older builds (they treat any kind but `http`/`ws` as newer), would need a `minClientVersion` stamp, and would gain nothing GraphQL-over-HTTP needs. The only model change is one optional key, `body.graphql.operationName`: older builds keep it as an unknown key (AC-FWD-1, flatten `extra` in core, spread in the UI) on disk, in sync and in shares made with credentials, drop it from shares made without credentials (they strip every key they don't know, AC-SHARE-2), and send without it; this build then sends the first named operation again (AC-GQL-9). No new synced entity, no sync-wire or forward-compat risk. The kind stays available for a future dedicated editor (e.g. subscriptions).
+- **Schemas are local tooling data**: fetched with the request's own settings, cached on this device only (app data dir, size-capped), never synced, shared, exported or written to history.
+- **Editor**: CodeMirror 6 with `cm6-graphql` (grammar) and `graphql-language-service` + `graphql-js` (completion, hover, diagnostics, prettify), loaded lazily with the GraphQL body (PRODUCT §7: language modes lazy-loaded).
+- **Introspection is always `POST` JSON** (the GraphQL-over-HTTP default every server accepts), whatever the request's method.
+- **A schema is cached only after it builds**: fetched and loaded schemas are checked with graphql-js first, so one the editor can't use never replaces a good cached one.
+- **Known limit**: building a very large schema (several MB) briefly blocks the UI thread; a Web Worker would need the language service there too (tracked as a TODO in `ui/src/lib/stores/graphql.svelte.ts`).
+
+- AC-GQL-1: The GraphQL body keeps `{ query, variables }` and gains optional `operationName` (omitted when unset). Duplicates, conflict copies, imports, sync and shares keep it; a request whose body is GraphQL is never read-only because of it.
+- AC-GQL-2: **Fetch schema** (schema bar, also **Refresh** and the bar's `⋯` menu) sends the standard introspection query (operation `IntrospectionQuery`) as a `POST` with a JSON body to the request's URL, with its Query params, Headers (an explicit `Content-Type` is replaced by `application/json`), Auth (Inherit included), settings (timeout, redirects, Verify TLS) and variables resolved like a send (AC-ENV-1..8, `{{$…}}` included). It is cancellable, isn't recorded in History, and blocks with the send's inline reasons (empty URL, invalid method, inherited auth from a newer build).
+- AC-GQL-3: A server that refuses introspection (an `errors[].message` mentioning introspection, `__schema` or `__type`, at any status) shows the warning "Introspection is disabled on this server." with the server's message and **Load from file…**. Any other failure shows a danger hint with **Retry**: network errors as "Couldn't reach the server: <message>" (AC-REQ-9 kinds), else "Couldn't fetch the schema: <reason>" (the first GraphQL error, "The server answered 404 Not Found", or "The response has no schema (data.__schema): is this a GraphQL endpoint?"). An answer core accepts but graphql-js can't build (e.g. a field of an undefined type) shows "The server's schema can't be used: <reason>". A failed fetch keeps the schema already shown and cached.
+- AC-GQL-4: Schemas are cached on disk in the app data dir (`graphql-schemas/`), keyed by the resolved URL (fragment dropped, `{{$dynamic}}` variables kept literal so `?n={{$uuid}}` stays one entry, every secret value masked as `{{name}}` like history, also when a plain variable pulls one in, AC-ENV-7) and shared by every request to that URL; switching environment can switch schemas. One schema is at most 10 MB ("The schema is larger than 10 MB"); the cache keeps at most 50 MB and 200 schemas, oldest fetched first out. Opening a GraphQL request, or changing its URL, params, auth or environment, loads the cached schema without any network call. The schema bar shows "Schema · 42 types · fetched 2m ago" (a file: "· from schema.graphql · loaded 2m ago"; full URL and size in the tooltip); its `⋯` menu offers Refresh / Fetch schema, Load from file… and **Forget schema**. A schema that fails graphql-js validation still drives completion and docs; the bar says "Schema has problems: queries aren't validated".
+- AC-GQL-5: **Load from file…** accepts SDL (`.graphql`, `.graphqls`, `.gql`, `.sdl`) or an introspection result (`{"data":{"__schema":…}}` or `{"__schema":…}`, usually `.json`) and caches it for the request's URL like a fetched schema. Only regular files are read (at most 10 MB). A file that isn't a schema (not UTF-8, invalid JSON, JSON without `__schema`, no type definitions, or SDL that doesn't build) is refused with "This file isn't a GraphQL schema: <reason>"; nothing from it is kept and the previous schema stays shown and cached.
+- AC-GQL-6: The Query editor highlights GraphQL (keywords, fields, arguments, types, variables, directives, strings, comments) and underlines syntax errors without a schema. With a schema it adds: autocomplete as you type and on Ctrl+Space (fields with their type, arguments, input fields, enum values, types after `on`, variables, directives, fragments; deprecated items last; description shown beside the list; Enter accepts, Esc closes); hover docs on fields, arguments, types and enum values (signature + description, deprecation); validation against the schema (unknown fields, wrong argument types, missing required arguments, unused or undefined variables…) as inline diagnostics with the message on hover; Cmd/Ctrl-click on a name opens it in the explorer. `{{variables}}` keep their decorations and completion (AC-ENV-9) and are never reported as GraphQL errors.
+- AC-GQL-7: Format ⌘⇧F reprints the query in canonical GraphQL style (2-space indent; comments aren't kept: then an info hint says "Comments were removed. ⌘Z to undo.") and pretty-prints the variables JSON (`{}` when empty); the Format link on the Query head does only the query, the one on Variables only the JSON. A syntax error shows "Invalid GraphQL at line L, col C: <message>" and moves the cursor there; the text is untouched (like AC-REQ-6).
+- AC-GQL-8: The Variables editor (JSON) offers the selected operation's variables as completion at key positions (name, type and default; required ones first; already used ones left out; inserts `"name": `, wrapped in `{ }` in an empty editor) and checks them: invalid JSON as AC-REQ-5 (blocks Send); a top-level value that isn't an object, a variable the operation doesn't declare (warning, at the key), a missing required variable (error, at `{`), and with a schema a value that doesn't fit its type ("Int cannot represent non-integer value: \"x\"", at the value). Values containing `{{…}}` aren't type-checked (they resolve at send time). Only invalid JSON blocks sending; the server decides on the rest.
+- AC-GQL-9: When the document defines two or more named operations, the Query head shows an **Operation** picker ("GetUser · query"), saved as `operationName` and sent as `"operationName"` in the JSON body (`{"query", "operationName", "variables"}`). With fewer than two named operations there is no picker and no `operationName` is kept or sent. What is sent and exported is always what the picker shows: a request stored, synced or imported without `operationName` (or with a stale one, say after an older build edited the query) sends the first named operation, without the request becoming dirty on open; a stale name with one operation is not sent. The Variables head names the operation and AC-GQL-8 follows it.
+- AC-GQL-10: **Docs** (schema bar) opens the schema explorer beside the editors, or below them when the request pane is narrower than 640px. It lists the root types (query, mutation, subscription) and all types with their kind; a search box matches type, field, argument and enum value names case-insensitively (exact, then prefix, then substring; types before fields before arguments; 50 results). A type page shows its kind, description, interfaces, fields with arguments, defaults, types (each a link) and descriptions, deprecated items struck through with the reason, enum values, input fields and union members or implementations; Back and Esc return. **Insert** (+) on a field of an object or interface type inserts it at the query caret: `name`, `name(arg: )` with its required arguments, `name {  }` for an object result, with the cursor where typing continues.
+- AC-GQL-11: When the request's body is GraphQL and the response is a JSON object with a non-empty `errors` array, the status strip shows a danger chip "1 GraphQL error" / "N GraphQL errors" after Time, whatever the status code (200 included); clicking it lists each message with its path and location (first 20). The response viewer itself is unchanged; history entries opened later show the chip too.
+- AC-GQL-12: cURL export writes `operationName` into the `--data-raw` JSON when it is set; cURL import of `{"query": …, "operationName": "X", "variables": {…}}` restores a GraphQL body with that operation (a `null` or empty `operationName`, or any other key, keeps it a JSON body, so round-trips stay lossless, AC-CEXP-6).
+
 ## 6. Keyboard shortcuts
 
 | Action | macOS | Win/Linux |
@@ -240,7 +264,8 @@ Teams exist only when the signed-in account's server advertises `features.teams`
 | Save request | ⌘S | Ctrl+S |
 | Focus URL bar | ⌘L | Ctrl+L |
 | Copy as cURL | ⌘⇧C | Ctrl+Shift+C |
-| Format body | ⌘⇧F | Ctrl+Shift+F |
+| Format body (GraphQL: prettify query and variables) | ⌘⇧F | Ctrl+Shift+F |
+| Open autocomplete in an editor (variables, GraphQL) | Ctrl+Space | Ctrl+Space |
 | Focus sidebar filter | ⌘⇧E | Ctrl+Shift+E |
 | Switch sidebar tab Activity / Collections / Env | ⌘1 / ⌘2 / ⌘3 | Ctrl+1/2/3 |
 | Find in editor/response | ⌘F | Ctrl+F |
@@ -300,4 +325,4 @@ D1 schema: `workspaces(id PK, name, token_hash UNIQUE, rev INT, created_at)`, `e
 
 ## 9. Out of scope (MVP)
 
-Scripting and test assertions; OAuth and other advanced auth flows; GraphQL beyond sending a body; WebSocket/SSE/gRPC; team accounts, roles, and real-time collaboration; editable or commentable shared views; importers other than cURL and OpenAPI; mock servers, monitors, and API docs publishing; plugin system; mobile or web versions of the app; telemetry.
+Scripting and test assertions; OAuth and other advanced auth flows; GraphQL subscriptions, persisted queries, multipart file uploads and a dedicated GraphQL request kind (schemas, the editor and operations are in scope, §5.14); SSE/gRPC; team accounts, roles, and real-time collaboration; editable or commentable shared views; importers other than cURL and OpenAPI; mock servers, monitors, and API docs publishing; plugin system; mobile or web versions of the app; telemetry.

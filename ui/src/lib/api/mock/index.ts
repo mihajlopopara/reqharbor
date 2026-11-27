@@ -21,6 +21,7 @@ import type {
   Environment,
   Events,
   Folder,
+  GraphqlSchema,
   HistoryEntry,
   HistorySummary,
   KeyValue,
@@ -119,7 +120,7 @@ export const REQUEST_SHAPE: KeyShape = {
     settings: { known: ["followRedirects", "timeoutMs", "verifyTls"] },
     body: {
       known: ["type", "text", "form", "formEncoded", "graphql", "binaryPath"],
-      objects: { graphql: { known: ["query", "variables"] } },
+      objects: { graphql: { known: ["query", "variables", "operationName"] } },
       lists: { form: FORM_FIELD_SHAPE, formEncoded: KV_SHAPE },
     },
   },
@@ -324,6 +325,8 @@ export class MockServer {
   responses = new Map<string, Uint8Array>();
   responseOrder: string[] = [];
   inflight = new Map<string, AbortController>();
+  /** GraphQL schema cache by resolved URL (core `graphql::SchemaCache`, AC-GQL-4). */
+  graphqlSchemas = new Map<string, GraphqlSchema>();
   listeners = new Map<string, Set<(p: unknown) => void>>();
   shares = new Map<string, ShareRecord>();
   sync: SyncStatus = {
@@ -689,12 +692,12 @@ export class MockServer {
     if (body.text !== undefined) body.text = resolve(body.text);
     if (body.formEncoded) body.formEncoded = kv(body.formEncoded);
     if (body.form) body.form = body.form.filter((f) => f.enabled).map((f) => ({ ...f, key: resolve(f.key), value: resolve(f.value) }));
-    if (body.graphql) body.graphql = { query: resolve(body.graphql.query), variables: resolve(body.graphql.variables) };
+    if (body.graphql) body.graphql = { ...body.graphql, query: resolve(body.graphql.query), variables: resolve(body.graphql.variables) };
     if (body.binaryPath) body.binaryPath = resolve(body.binaryPath);
     return { url, headers, auth, body, unresolved };
   }
 
-  private prepare(r: Request, projectId: string | null | undefined): { prepared: PreparedRequest; displayUrl: string; unresolved: string[] } {
+  private prepare(r: Request, projectId: string | null | undefined, dynamicOverride?: (name: string) => string | undefined): { prepared: PreparedRequest; displayUrl: string; unresolved: string[] } {
     if (!METHOD_RE.test(r.method)) fail("validation", `Invalid method "${r.method}"`, { kind: "invalidMethod", message: "Use A–Z, 0–9, _ or -, starting with a letter" });
     if (!r.url.trim()) fail("validation", "Enter a URL", { kind: "emptyUrl" });
     if (r.auth.type === "inherit" && !isKnownAuth(this.inheritedAuth(r))) {
@@ -708,7 +711,7 @@ export class MockServer {
       }
     }
     // One memo: the URL sent and the URL kept in history agree on {{$…}} values.
-    const dynamic = dynamicMemo();
+    const dynamic = dynamicOverride ?? dynamicMemo();
     const res = this.resolveRequest(r, projectId, false, dynamic);
     const display = this.resolveRequest(r, projectId, true, dynamic);
     const headers: [string, string][] = res.headers.map((h) => [h.key, h.value]);
@@ -739,7 +742,11 @@ export class MockServer {
         ct = "text/plain";
         break;
       case "graphql":
-        bodyText = JSON.stringify({ query: b.graphql?.query ?? "", variables: b.graphql?.variables.trim() ? JSON.parse(b.graphql.variables) : {} });
+        bodyText = JSON.stringify({
+          query: b.graphql?.query ?? "",
+          ...(b.graphql?.operationName?.trim() ? { operationName: b.graphql.operationName.trim() } : {}),
+          variables: b.graphql?.variables.trim() ? JSON.parse(b.graphql.variables) : {},
+        });
         ct = "application/json";
         break;
       case "formEncoded":
@@ -782,6 +789,38 @@ export class MockServer {
       displayUrl,
       unresolved: [...res.unresolved],
     };
+  }
+
+  /** Canned answer, or the fake GraphQL endpoint for `…/graphql` URLs (AC-GQL-*). */
+  private async fakeExchange(prepared: PreparedRequest): Promise<FakeResponse> {
+    let path = "";
+    try {
+      path = new URL(prepared.url).pathname;
+    } catch {
+      /* cannedResponse reports it */
+    }
+    if (prepared.method === "POST" && /\/graphql\/?$/.test(path)) {
+      cannedResponse({ ...prepared, url: prepared.url.replace(/\/graphql\/?(?=$|[?#])/, "/health") }); // network failures (dns, refused, tls) first
+      const g = await import("./graphql");
+      return g.graphqlResponse(prepared);
+    }
+    return cannedResponse(prepared);
+  }
+
+  private graphqlContext(request: Request, projectId: string | null | undefined) {
+    if (isReadOnlyNewer(request, MOCK_APP_VERSION) || this.requests.some((r) => r.id === request.id && isReadOnlyNewer(r, MOCK_APP_VERSION))) {
+      fail("read_only_newer", "This request needs a newer version of ReqHarbor");
+    }
+    if (request.kind === "ws") fail("validation", "This is a WebSocket request: connect to it instead", { kind: "notHttp" });
+    return projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
+  }
+
+  private async graphqlSchemaUrl(request: Request, projectId: string | null | undefined): Promise<{ url: string; pid: string | null | undefined; g: typeof import("./graphql") }> {
+    const g = await import("./graphql");
+    const pid = this.graphqlContext(request, projectId);
+    // Like core `schema_url`: `{{$dynamic}}` stays literal, secrets masked.
+    const { displayUrl } = this.prepare(g.introspectionRequest(request), pid, (name) => `{{${name}}}`);
+    return { url: g.schemaKey(displayUrl), pid, g };
   }
 
   private meta(responseId: string, f: FakeResponse, fromHistory = false, truncated = false): ResponseMeta {
@@ -1746,7 +1785,7 @@ export class MockServer {
         if (wait) await this.delay(wait, ctrl.signal);
         if (isLocal) res = await realFetch(prepared, ctrl.signal);
         else {
-          res = cannedResponse(prepared);
+          res = await this.fakeExchange(prepared);
           await this.delay(res.latencyMs, ctrl.signal);
         }
         if (wait) res.latencyMs = performance.now() - started;
@@ -1843,6 +1882,61 @@ export class MockServer {
       }
       if (new TextEncoder().encode(reason ?? "").length > 123) fail("invalid", "The close reason can be at most 123 bytes");
       return this.ws.close(connectionId, code ?? null, reason ?? "");
+    },
+    graphql_fetch_schema: async ({ request, projectId, executionId, store }) => {
+      const { url, pid, g } = await this.graphqlSchemaUrl(request, projectId);
+      const { prepared } = this.prepare(g.introspectionRequest(request), pid);
+      const ctrl = new AbortController();
+      const id = executionId ?? ulid();
+      this.inflight.set(id, ctrl);
+      let res: FakeResponse;
+      try {
+        res = await this.fakeExchange(prepared);
+        await this.delay(res.latencyMs, ctrl.signal);
+      } catch (e) {
+        if (e instanceof SendFailure) throw new MockError("graphql_network", e.message, { kind: e.kind });
+        if ((e as Error).name === "AbortError") throw new MockError("graphql_network", "Request cancelled", { kind: "cancelled" });
+        throw e;
+      } finally {
+        this.inflight.delete(id);
+      }
+      const read = g.readIntrospection(res.status, res.statusText, new TextDecoder().decode(res.body));
+      if (!read.ok) throw new MockError(read.code, read.message, read.details);
+      const schema: GraphqlSchema = { url, fetchedAt: this.now(), source: "introspection", format: "introspection", schema: read.schema, sizeBytes: read.schema.length };
+      if (store ?? true) this.graphqlSchemas.set(schema.url, schema);
+      return clone(schema);
+    },
+    graphql_cached_schema: async ({ request, projectId, known }) => {
+      const { url } = await this.graphqlSchemaUrl(request, projectId);
+      const s = this.graphqlSchemas.get(url);
+      const unchanged = !!s && !!known && known.url === s.url && known.fetchedAt === s.fetchedAt;
+      return { url, unchanged, schema: s && !unchanged ? clone(s) : null };
+    },
+    graphql_store_schema: async ({ request, projectId, schema }) => {
+      const { url } = await this.graphqlSchemaUrl(request, projectId);
+      if (!schema.schema.trim()) throw new MockError("graphql_schema_invalid", "This file isn't a GraphQL schema: it is empty");
+      // Core: cached under the URL of the fetch / load, and only while it is still the request's.
+      const s: GraphqlSchema = { ...clone(schema), sizeBytes: schema.schema.length };
+      if (s.url === url) this.graphqlSchemas.set(url, s);
+      return clone(s);
+    },
+    graphql_load_schema_file: async ({ request, projectId, path, text, fileName, store }) => {
+      const { url, g } = await this.graphqlSchemaUrl(request, projectId);
+      const content = text ?? (path ? g.mockSchemaFile(path) : null);
+      if (content === null) throw new MockError("graphql_schema_invalid", "This file isn't a GraphQL schema: no file given");
+      let schema: GraphqlSchema;
+      try {
+        schema = g.schemaFromText(content, fileName ?? path?.split(/[\\/]/).pop() ?? null, url, this.now());
+      } catch (e) {
+        const err = e as { code: "graphql_schema_invalid"; message: string };
+        throw new MockError(err.code, err.message);
+      }
+      if (store ?? true) this.graphqlSchemas.set(url, schema);
+      return clone(schema);
+    },
+    graphql_clear_schema: async ({ request, projectId }) => {
+      const { url } = await this.graphqlSchemaUrl(request, projectId);
+      return this.graphqlSchemas.delete(url);
     },
     cancel_request: ({ executionId }) => {
       const c = this.inflight.get(executionId);

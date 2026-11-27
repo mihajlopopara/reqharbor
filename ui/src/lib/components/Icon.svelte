@@ -3,6 +3,9 @@
   const PATHS: Record<string, string> = {
     "chev-d": '<path d="M4 6l4 4 4-4"/>',
     "chev-r": '<path d="M6 4l4 4-4 4"/>',
+    "chev-l": '<path d="M10 4L6 8l4 4"/>',
+    // GraphQL schema explorer ("Docs", AC-GQL-10).
+    book: '<path d="M8 4.5C6.8 3.6 5 3.2 2.5 3.5v9c2.5-.3 4.3.1 5.5 1 1.2-.9 3-1.3 5.5-1v-9c-2.5-.3-4.3.1-5.5 1zM8 4.5v9"/>',
     // Message log directions (AC-WS-5): received, sent, system note.
     "dir-in": '<path d="M12 4L4.5 11.5M4.5 6v5.5H10"/>',
     "dir-out": '<path d="M4 12l7.5-7.5M6 4.5h5.5V10"/>',

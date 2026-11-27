@@ -109,9 +109,24 @@ describe("app store", () => {
     expect(await app.formatBody()).toBeNull();
     expect(app.request.body.text).toBe('{\n  "a": 1\n}');
     app.request.body.text = '{\n  "a": }';
-    expect(await app.formatBody()).toEqual({ line: 2, column: expect.any(Number) });
+    expect(await app.formatBody()).toEqual({ line: 2, column: expect.any(Number), target: "body" });
     expect(app.formatError?.message).toMatch(/^Invalid JSON at line 2, col \d+$/);
     expect(app.request.body.text).toBe('{\n  "a": }');
+  });
+
+  it("formats GraphQL query and variables, pointing at the editor with the error (AC-GQL-7)", async () => {
+    app.newRequest();
+    app.request.body = { type: "graphql", graphql: { query: "{me{name}}", variables: '{"a":1}' } };
+    expect(await app.formatBody()).toBeNull();
+    expect(app.request.body.graphql!.query).toBe("{\n  me {\n    name\n  }\n}");
+    expect(app.request.body.graphql!.variables).toBe('{\n  "a": 1\n}');
+    app.request.body.graphql!.query = "{ me(";
+    expect(await app.formatBody("query")).toMatchObject({ line: 1, target: "query" });
+    expect(app.formatError?.message).toMatch(/^Invalid GraphQL at line 1, col \d+/);
+    expect(app.request.body.graphql!.query).toBe("{ me(");
+    app.request.body.graphql!.variables = "{oops";
+    expect(await app.formatBody("variables")).toMatchObject({ target: "variables" });
+    expect(app.request.body.graphql!.query).toBe("{ me(");
   });
 
   it("opens history entries without re-sending (AC-HIST-4)", async () => {

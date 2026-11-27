@@ -419,6 +419,10 @@ pub fn prepare_in(
             };
             let mut obj = serde_json::Map::new();
             obj.insert("query".into(), serde_json::Value::String(query));
+            // AC-GQL-9: only when the document has several operations.
+            if let Some(op) = gql.operation() {
+                obj.insert("operationName".into(), serde_json::Value::String(op.into()));
+            }
             obj.insert("variables".into(), variables);
             let bytes = serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default();
             Some(PreparedBody::Bytes(bytes))
@@ -631,6 +635,7 @@ mod tests {
             graphql: Some(GraphqlBody {
                 query: "q".into(),
                 variables: "{oops".into(),
+                operation_name: None,
                 extra: Default::default(),
             }),
             ..Body::default()
@@ -639,6 +644,24 @@ mod tests {
             prepare(&r, &VarScope::empty(), None),
             Err(PrepareError::InvalidGraphqlVariables(_))
         ));
+    }
+
+    #[test]
+    fn ac_gql_9_operation_name_is_sent_only_when_set() {
+        let mut r = req("POST", "https://x.dev/graphql");
+        let mut body = Body::graphql("query A { a } query B { b }", "");
+        body.graphql.as_mut().unwrap().operation_name = Some("B".into());
+        r.body = body;
+        assert_eq!(
+            String::from_utf8(body_bytes(&p(&r))).unwrap(),
+            r#"{"query":"query A { a } query B { b }","operationName":"B","variables":{}}"#
+        );
+        // Blank counts as unset.
+        r.body.graphql.as_mut().unwrap().operation_name = Some("  ".into());
+        assert_eq!(
+            String::from_utf8(body_bytes(&p(&r))).unwrap(),
+            r#"{"query":"query A { a } query B { b }","variables":{}}"#
+        );
     }
 
     #[test]
