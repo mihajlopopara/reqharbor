@@ -441,7 +441,18 @@ fn ac_fwd_4_min_client_version() {
     assert!(with(CLIENT_VERSION).is_editable());
     assert!(with("0.0.1").is_editable());
     assert!(!with("99.0.0").is_editable());
-    assert!(!with("0.1.999").is_editable());
+    // One patch above this build is already too new.
+    let mut parts: Vec<u64> = CLIENT_VERSION
+        .split('.')
+        .map(|p| p.parse().unwrap())
+        .collect();
+    parts[2] += 1;
+    let next_patch = parts
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    assert!(!with(&next_patch).is_editable());
     assert!(
         !with("not-a-version").is_editable(),
         "unparseable counts as newer"

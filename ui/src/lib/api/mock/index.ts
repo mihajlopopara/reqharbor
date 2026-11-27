@@ -88,7 +88,7 @@ const HISTORY_BODY_MAX = 1024 * 1024;
 const SYNC_ENTITY_MAX = 512 * 1024;
 const enc = new TextEncoder();
 /** Mirrors Bootstrap.appVersion of the real app (workspace version). */
-export const MOCK_APP_VERSION = "0.1.0";
+export const MOCK_APP_VERSION = "0.2.0";
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
 
@@ -806,7 +806,7 @@ export class MockServer {
     }
     if (ct && !has("content-type")) headers.push(["Content-Type", ct]);
     if (!has("accept")) headers.push(["Accept", "*/*"]);
-    if (!has("user-agent")) headers.push(["User-Agent", "ReqHarbor/0.1.0"]);
+    if (!has("user-agent")) headers.push(["User-Agent", "ReqHarbor/0.2.0"]);
     if (!has("accept-encoding")) headers.push(["Accept-Encoding", "gzip, deflate, br"]);
     let displayUrl = display.url;
     if (display.auth.type === "apikey" && display.auth.apiKey?.in === "query" && display.auth.apiKey.key) {

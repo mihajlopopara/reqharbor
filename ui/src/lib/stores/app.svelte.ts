@@ -153,7 +153,7 @@ class AppStore {
   fatal = $state<string | null>(null);
   platform = $state("macos");
   /** This build's version (Bootstrap.appVersion), for `minClientVersion` checks. */
-  appVersion = $state("0.1.0");
+  appVersion = $state("0.2.0");
   workspaceName = $state("My Workspace");
   settings = $state<Settings>({
     theme: "system",
