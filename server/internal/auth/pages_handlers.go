@@ -549,7 +549,7 @@ func (s *Service) passwordSignup(w http.ResponseWriter, r *http.Request) {
 	err = s.Store.Write(r.Context(), func(tx store.WriteTx) error {
 		created, err := accounts.Create(tx, accounts.CreateParams{
 			Email: email, Name: name, EmailTrusted: false, PHC: phc, GrantHash: grant,
-			SignupMode: s.Config.Signup, AdminEmail: s.Config.AdminEmail, MaxUsers: s.Config.MaxUsers, Now: s.Clock.Now(),
+			SignupMode: s.Config.Signup, AdminEmail: s.Config.AdminEmail, MaxUsers: s.Config.MaxUsers, OpenSignupFull: s.openSignupFull(), Now: s.Clock.Now(),
 		})
 		if err != nil {
 			return err

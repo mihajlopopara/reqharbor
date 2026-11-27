@@ -137,6 +137,14 @@ and when all traffic arrives from one peer.
   fresh server the setup code, or a GitHub email equal to `REQHARBOR_ADMIN_EMAIL`, which then
   becomes the admin). An email that already has an account is refused, never merged: one sign-in
   method per account.
+- **Personal spaces.** Every account gets one personal space at signup, where the app syncs that
+  account's projects (see [API](#api)). `REQHARBOR_QUOTA_PERSONAL_BYTES` (default 100 MiB, `0`
+  for no limit) caps each one. With `REQHARBOR_SIGNUP=open`, the personal spaces of accounts that
+  signed up without a code also share `REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES` (default 5 GiB, `0` for
+  no cap): once it is reached, their growing writes return 507 and open signup shows "This server
+  isn't accepting new accounts" until they free space; invited, setup and CLI accounts are not
+  counted. `REQHARBOR_MIN_CLIENT_VERSION` (for example `0.3.0`) refuses older apps on account sync
+  and sign-in with 426; token sync is never gated.
 - **Other commands:** `user list`, `user set-admin --email E --on|--off`, `user disable|enable
   --email E`, `user sessions revoke --email E`, `user set-password --email E --password-stdin`,
   `invite list`, `invite revoke ID`. In the image: `docker compose exec reqharbor /reqharbor-server
@@ -166,6 +174,13 @@ this release:
 | `REQHARBOR_LOG_LEVEL`, `REQHARBOR_LOG_FORMAT` | `info`, `json` | Logging |
 | `REQHARBOR_GITHUB_CLIENT_ID`, `REQHARBOR_GITHUB_CLIENT_SECRET` | empty | Both set: GitHub sign-in (the secret also as `…_SECRET_FILE`) |
 | `REQHARBOR_ADMIN_EMAIL` | empty | A GitHub (trusted) email that becomes admin when its account is created while no admin exists |
+| `REQHARBOR_SIGNUP` | `invite` | `open`, `invite` or `closed` |
+| `REQHARBOR_MAX_USERS` | `500` | Total accounts; `0` means no cap |
+| `REQHARBOR_QUOTA_PERSONAL_BYTES` | `104857600` | Per personal space; `0` means unlimited |
+| `REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES` | `5368709120` | Personal spaces of open-signup accounts together; `0` means no cap |
+| `REQHARBOR_MIN_CLIENT_VERSION` | empty | 426 `client_too_old` on `/v1/spaces/*` and `/v1/auth/token` for older apps |
+| `REQHARBOR_RATE_SYNC_PER_MIN` | `240` | `/v1/spaces/*/sync` requests per session |
+| `REQHARBOR_RATE_SHARE_CREATE_PER_HOUR` | `30` | Share creates per space or workspace |
 
 The full table, including the account settings that 0.2 uses, is §6 of
 `docs/plans/accounts/06-go-server.md`.
@@ -192,6 +207,143 @@ The full table, including the account settings that 0.2 uses, is §6 of
 - **Privacy:** the server stores what clients sync, with secret environment values blanked, and the
   share snapshots users publish, with secret variables removed. Client IPs are not logged unless
   `REQHARBOR_LOG_CLIENT_IP=true`.
+
+## API
+
+This section is the wire reference for the account routes that 0.2 adds (06-go-server.md §4 is
+the design). Every error is `{"error":{"code","message"}}`; every response is JSON with
+`Cache-Control: no-store` unless stated. The legacy token routes (`/v1/workspaces`, `/v1/sync`,
+`/v1/shares*`, …) are unchanged from the Worker; see `docs/API_CONTRACT.md`.
+
+### Authentication
+
+`Authorization: Bearer rha_…` (the access token from `POST /v1/auth/token`, valid for 1 hour). A
+legacy `rh_` token is never accepted here, and an `rha_` token is never accepted on legacy routes
+(401 `unauthorized` there). Every 401 carries
+`WWW-Authenticate: Bearer realm="reqharbor", error="invalid_token"`.
+
+| Status | Code | When |
+|---|---|---|
+| 401 | `auth_required` | No or malformed token, unknown or revoked session, disabled account |
+| 401 | `session_expired` | The access token expired: refresh it |
+| 404 | `space_not_found` | Unknown space id, or the id of a legacy token workspace |
+| 403 | `not_a_member` | The account is not a member of the space |
+| 426 | `client_too_old` | `/v1/spaces/*` only, when `REQHARBOR_MIN_CLIENT_VERSION` is set and `X-ReqHarbor-Version` is missing or lower; checked before auth |
+| 429 | `rate_limited` | With `Retry-After`; `/v1/spaces/{id}/sync` allows `REQHARBOR_RATE_SYNC_PER_MIN` per session |
+| 507 | `server_full` | A growing write while the storage breaker is open, or an open-signup account's write once `REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES` is reached |
+
+Order on `/v1/spaces/*`: route (404), method (405), version gate (426), token (401), space (404,
+then 403), then the body (415, 413, 400).
+
+### `GET /v1/me`
+
+```json
+{"user":{"id":"01J…","email":"ada@example.com","name":"Ada","avatarUrl":null,"isAdmin":false},
+ "method":"password","sessionId":"01J…"}
+```
+
+`method` is `password`, or the provider id of the account's sign-in (`github`; `google` and
+`oidc` in M3; `dev` in test builds).
+
+### `GET /v1/me/sessions`, `DELETE /v1/me/sessions/{id}`
+
+```json
+{"sessions":[{"id":"01J…","deviceName":"MacBook Pro (macOS)","createdAt":1795435200000,
+              "lastUsedDay":1795392000000,"current":true}]}
+```
+
+Live sessions only (not revoked, refresh token not expired), newest first. `createdAt` is Unix ms;
+`lastUsedDay` is Unix ms at 00:00 UTC of the day the session was last used. `current` marks the
+calling session. `DELETE` revokes one of the caller's sessions and answers `204` with no body;
+that device gets 401 `auth_required` on its next call and 400 `invalid_grant` on refresh. Another
+account's session id, an unknown id and an already revoked session are all 404 `not_found`.
+Revoking the current session is allowed (it is logout).
+
+### `GET /v1/me/spaces`
+
+```json
+{"spaces":[{"spaceId":"01J…","kind":"personal","teamId":null,"teamName":null,"role":"owner",
+            "bytesUsed":1234,"quotaBytes":104857600}],
+ "departed":[]}
+```
+
+The authoritative list of the account's spaces; in 0.2 it holds exactly the personal space, and the
+shape is final. `quotaBytes` is `null` when unlimited. `bytesUsed` counts entity data plus active
+share snapshots. `departed` stays empty until teams (M2), when its entries are
+`{spaceId, teamId, teamName, reason, at}`.
+
+### `GET /v1/spaces/{id}`
+
+```json
+{"spaceId":"01J…","kind":"personal","name":"Personal","createdAt":1795435200000,"entityCount":3,
+ "bytesUsed":1234,"quotaBytes":104857600,"role":"owner"}
+```
+
+### `GET /v1/spaces/{id}/sync?since=&limit=`
+
+The legacy pull: `since` and `limit` as for `/v1/sync`. Each change additionally carries
+`updatedBy` when its version has an author, with the author's current name (`null` once the account
+no longer exists):
+
+```json
+{"changes":[{"type":"request","id":"r1","updatedAt":1795435200000,"deleted":false,"deviceId":"01DEV",
+             "data":{…},"rev":7,"updatedBy":{"userId":"01J…","name":"Ada"}}],
+ "cursor":7,"hasMore":false,"syncEpoch":"01J…"}
+```
+
+### `POST /v1/spaces/{id}/sync`
+
+The legacy push body `{"changes":[…]}`, validated in the same order with the same 400s (500
+changes, `id`, `updatedAt`, `deleted`, `deviceId`, `data`, `duplicate_change`), LWW (contract C3)
+and revs in push order. Differences from `/v1/sync`:
+
+- A `type` outside `["project","collection","folder","request","environment"]` (the list
+  `/v1/server` publishes as `sync.types`) is the per-change result
+  `{"type":"protoFile","id":"p1","status":"rejected","reason":"unsupported_type"}` instead of a
+  whole-request 400, provided the change is otherwise well formed (a non-string `type` is still a
+  400 `unsupported_type`). It takes no rev and is not counted against the quota.
+- A change whose `updatedAt` is more than 5 minutes (300000 ms) ahead of the server's clock is
+  `{"status":"rejected","reason":"clock_skew"}`, tombstones included; exactly +5 min is accepted.
+- Precedence when several apply: `unsupported_type`, then `clock_skew`, then `invalid_json_value`
+  and `entity_too_large`.
+- Applied changes record the caller as the author (`updatedBy`); a `stale` change keeps the stored
+  author.
+- The response adds `serverTime` (the server's clock, Unix ms):
+
+```json
+{"results":[{"type":"request","id":"r1","status":"applied","rev":8},
+            {"type":"protoFile","id":"p1","status":"rejected","reason":"unsupported_type"},
+            {"type":"request","id":"r2","status":"rejected","reason":"clock_skew"}],
+ "cursor":8,"serverTime":1795435201234}
+```
+
+Quota: 413 `quota_exceeded` when the push grows the space past `REQHARBOR_QUOTA_PERSONAL_BYTES`;
+deletes and shrinking pushes always pass, also while 507 applies.
+
+### `GET`/`POST /v1/spaces/{id}/shares`, `PUT`/`DELETE /v1/spaces/{id}/shares/{shareId}`
+
+The legacy share routes scoped to the space, plus `createdBy` and `options`:
+
+- **Create** body: `{"kind","entityId","snapshot","options"?}` with `options`
+  `{"includeCredentials":bool,"environmentId":string|null}`, absent or `null` for none. A missing
+  `includeCredentials` is `false`; unknown option keys are dropped; a wrong type is 400
+  `validation_failed`. 30 creates per hour per space (`REQHARBOR_RATE_SHARE_CREATE_PER_HOUR`),
+  charged only after the body validated. Response `201`:
+
+  ```json
+  {"shareId":"…","url":"https://rh.example.com/s/…","createdAt":1795435200000,"updatedAt":1795435200000,
+   "createdBy":{"userId":"01J…","name":"Ada"},"options":{"includeCredentials":false,"environmentId":null}}
+  ```
+- **List**: `{"shares":[{"shareId","url","kind","entityId","name","createdAt","updatedAt","createdBy","options"}]}`,
+  active shares newest first. `createdBy.name` is `null` when that account no longer exists
+  ("Former member"); `options` is `null` when none were stored.
+- **Update** (`PUT`) body `{"snapshot","options"?}`: `options` absent or `null` keeps the stored
+  options, an object replaces them. Checked in order: share id format (route 404), auth, space,
+  share of this space (404 "Share not found"), revoked (410), then the body. Response as for
+  create, `200`.
+- **Revoke** (`DELETE`) never reads a body: `{"shareId","revokedAt"}`, idempotent.
+
+The public `/s/{id}` and `/s/{id}.json` pages serve space shares exactly like legacy ones.
 
 ## Development
 

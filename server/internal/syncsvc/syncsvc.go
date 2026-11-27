@@ -33,7 +33,12 @@ const (
 	ReasonEntityTooLarge   = "entity_too_large"
 	ReasonInvalidJSONValue = "invalid_json_value"
 	ReasonUnsupportedType  = "unsupported_type"
+	ReasonClockSkew        = "clock_skew"
 )
+
+// MaxClockAheadMillis is how far a change's updatedAt may be ahead of the server's clock in an
+// account space before it is rejected with clock_skew (AC-TSYNC-5, 04 §6.2): 5 minutes.
+const MaxClockAheadMillis = 5 * 60 * 1000
 
 var (
 	idRe       = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
@@ -67,6 +72,9 @@ type ParseOptions struct {
 	// UnknownTypePerChange turns an unknown type into a per-change unsupported_type rejection
 	// (space sync) instead of a whole-request 400 (legacy sync, byte-compatible).
 	UnknownTypePerChange bool
+	// MaxUpdatedAt, when positive, rejects a change whose updatedAt is greater with a per-change
+	// clock_skew (account spaces: server time + MaxClockAheadMillis).
+	MaxUpdatedAt int64
 }
 
 // ParsePush validates a push body in the Worker's order. The first invalid change ends the
@@ -144,12 +152,20 @@ func validateChange(raw *jsonx.Value, i int, opts ParseOptions) (Change, error) 
 		if data != nil && !data.IsNull() {
 			return Change{}, httpx.BadRequest(at + ".data must be null for a tombstone")
 		}
-		return c, nil
-	}
-	if !data.IsObject() {
+	} else if !data.IsObject() {
 		return Change{}, httpx.BadRequest(at + ".data must be an object unless deleted is true")
 	}
+	// Every 400 check above applies to every change; only then the per-change rejections, in
+	// this order: unsupported_type, clock_skew, then the data checks (invalid_json_value,
+	// entity_too_large).
 	if c.Rejected != "" {
+		return c, nil
+	}
+	if opts.MaxUpdatedAt > 0 && c.UpdatedAt > opts.MaxUpdatedAt {
+		c.Rejected = ReasonClockSkew
+		return c, nil
+	}
+	if c.Deleted {
 		return c, nil
 	}
 	if c.Type == "environment" {
@@ -210,10 +226,19 @@ type Result struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// PushResponse is the push response body.
+// PushResponse is the push response body. ServerTime is set on account spaces only, so legacy
+// responses stay byte-identical.
 type PushResponse struct {
-	Results []Result `json:"results"`
-	Cursor  int64    `json:"cursor"`
+	Results    []Result `json:"results"`
+	Cursor     int64    `json:"cursor"`
+	ServerTime *int64   `json:"serverTime,omitempty"`
+}
+
+// Actor is the signed-in user pushing to an account space. Legacy pushes have none.
+type Actor struct {
+	UserID string
+	// Now is the server time (Unix ms) reported as serverTime.
+	Now int64
 }
 
 // Limits are the per-push storage rules.
@@ -231,9 +256,17 @@ func QuotaExceeded(quota, used, delta int64) *httpx.APIError {
 		fmt.Sprintf("Workspace storage quota of %d bytes exceeded (%d used, this write adds %d)", quota, used, delta))
 }
 
-// Push applies validated changes to workspace wsID in one write transaction.
-func Push(ctx context.Context, st store.Store, wsID string, changes []Change, lim Limits) (*PushResponse, error) {
+// Push applies validated changes to workspace wsID in one write transaction. With an actor (an
+// account space) every applied change records actor.UserID as updated_by, and the response
+// carries serverTime; a stale change keeps the stored author.
+func Push(ctx context.Context, st store.Store, wsID string, changes []Change, lim Limits, actor *Actor) (*PushResponse, error) {
 	resp := &PushResponse{Results: make([]Result, len(changes))}
+	updatedBy := ""
+	if actor != nil {
+		updatedBy = actor.UserID
+		now := actor.Now
+		resp.ServerTime = &now
+	}
 	err := st.Write(ctx, func(tx store.WriteTx) error {
 		if err := tx.LockWorkspace(wsID); err != nil {
 			return err
@@ -288,7 +321,7 @@ func Push(ctx context.Context, st store.Store, wsID string, changes []Change, li
 			if m == nil || Wins(c.UpdatedAt, c.DeviceID, m.UpdatedAt, m.DeviceID) {
 				if err := tx.UpsertEntity(wsID, store.Entity{
 					Type: c.Type, ID: c.ID, Rev: rev, UpdatedAt: c.UpdatedAt, Deleted: c.Deleted,
-					DeviceID: c.DeviceID, Data: c.Data, Size: c.Size,
+					DeviceID: c.DeviceID, Data: c.Data, Size: c.Size, UpdatedBy: updatedBy,
 				}); err != nil {
 					return err
 				}
@@ -325,6 +358,16 @@ type PulledChange struct {
 	DeviceID  string    `json:"deviceId"`
 	Data      rawOrNull `json:"data"`
 	Rev       int64     `json:"rev"`
+	// UpdatedBy is set on account-space pulls when the version has an author; legacy pulls never
+	// carry it.
+	UpdatedBy *UpdatedBy `json:"updatedBy,omitempty"`
+}
+
+// UpdatedBy names the author of a pulled version. Name is the user's current name, or null when
+// the account no longer exists.
+type UpdatedBy struct {
+	UserID string  `json:"userId"`
+	Name   *string `json:"name"`
 }
 
 // rawOrNull embeds stored JSON verbatim, or null.
@@ -379,8 +422,9 @@ func intParam(raw, name string, def, min int64) (int64, error) {
 	return n, nil
 }
 
-// Pull reads one page and the head in one read transaction.
-func Pull(ctx context.Context, st store.Store, wsID string, since int64, limit int, epoch string) (*PullPage, error) {
+// Pull reads one page and the head in one read transaction. withActors adds updatedBy (account
+// spaces).
+func Pull(ctx context.Context, st store.Store, wsID string, since int64, limit int, epoch string, withActors bool) (*PullPage, error) {
 	page := &PullPage{Changes: []PulledChange{}, SyncEpoch: epoch}
 	err := st.Read(ctx, func(tx store.ReadTx) error {
 		rows, err := tx.EntitiesSince(wsID, since, limit+1)
@@ -400,9 +444,13 @@ func Pull(ctx context.Context, st store.Store, wsID string, since int64, limit i
 			if !e.Deleted && e.Data != nil {
 				data = e.Data
 			}
-			page.Changes = append(page.Changes, PulledChange{
+			pc := PulledChange{
 				Type: e.Type, ID: e.ID, UpdatedAt: e.UpdatedAt, Deleted: e.Deleted, DeviceID: e.DeviceID, Data: data, Rev: e.Rev,
-			})
+			}
+			if withActors && e.UpdatedBy != "" {
+				pc.UpdatedBy = &UpdatedBy{UserID: e.UpdatedBy, Name: e.UpdatedByName}
+			}
+			page.Changes = append(page.Changes, pc)
 		}
 		if len(rows) > 0 {
 			page.Cursor = rows[len(rows)-1].Rev

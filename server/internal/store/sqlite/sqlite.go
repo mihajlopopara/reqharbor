@@ -110,8 +110,10 @@ func (t *rtx) LiveEntityCount(id string) (int64, error) {
 }
 
 func (t *rtx) EntitiesSince(workspaceID string, since int64, limit int) ([]store.Entity, error) {
-	rows, err := t.tx.QueryContext(t.ctx, `SELECT type, id, rev, updated_at, deleted, device_id, data, size FROM entities
-	     WHERE workspace_id = ? AND rev > ? ORDER BY rev ASC LIMIT ?`, workspaceID, since, limit)
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT e.type, e.id, e.rev, e.updated_at, e.deleted, e.device_id, e.data, e.size,
+	       e.updated_by, u.name
+	     FROM entities e LEFT JOIN users u ON e.updated_by <> '' AND u.id = e.updated_by
+	     WHERE e.workspace_id = ? AND e.rev > ? ORDER BY e.rev ASC LIMIT ?`, workspaceID, since, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -120,11 +122,12 @@ func (t *rtx) EntitiesSince(workspaceID string, since int64, limit int) ([]store
 	for rows.Next() {
 		var e store.Entity
 		var deleted int64
-		var data sql.NullString
-		if err := rows.Scan(&e.Type, &e.ID, &e.Rev, &e.UpdatedAt, &deleted, &e.DeviceID, &data, &e.Size); err != nil {
+		var data, byName sql.NullString
+		if err := rows.Scan(&e.Type, &e.ID, &e.Rev, &e.UpdatedAt, &deleted, &e.DeviceID, &data, &e.Size, &e.UpdatedBy, &byName); err != nil {
 			return nil, err
 		}
 		e.Deleted = deleted == 1
+		e.UpdatedByName = nullStr(&byName)
 		if data.Valid {
 			e.Data = []byte(data.String)
 		}
@@ -135,13 +138,17 @@ func (t *rtx) EntitiesSince(workspaceID string, since int64, limit int) ([]store
 
 func (t *rtx) Share(id string) (*store.Share, error) {
 	var s store.Share
-	var snap sql.NullString
+	var snap, createdBy, options sql.NullString
 	var revoked sql.NullInt64
-	err := t.row(`SELECT id, workspace_id, kind, entity_id, snapshot, size, created_at, updated_at, revoked_at
+	err := t.row(`SELECT id, workspace_id, kind, entity_id, snapshot, size, created_at, updated_at, revoked_at, created_by, options
 	              FROM shares WHERE id = ?`, id).
-		Scan(&s.ID, &s.WorkspaceID, &s.Kind, &s.EntityID, &snap, &s.Size, &s.CreatedAt, &s.UpdatedAt, &revoked)
+		Scan(&s.ID, &s.WorkspaceID, &s.Kind, &s.EntityID, &snap, &s.Size, &s.CreatedAt, &s.UpdatedAt, &revoked, &createdBy, &options)
 	if err != nil {
 		return nil, notFound(err)
+	}
+	s.CreatedBy = nullStr(&createdBy)
+	if options.Valid {
+		s.Options = []byte(options.String)
 	}
 	if snap.Valid {
 		s.Snapshot = []byte(snap.String)
@@ -154,9 +161,11 @@ func (t *rtx) Share(id string) (*store.Share, error) {
 }
 
 func (t *rtx) ActiveShares(workspaceID string) ([]store.ShareListItem, error) {
-	rows, err := t.tx.QueryContext(t.ctx, `SELECT id, kind, entity_id, created_at, updated_at,
-	        COALESCE(json_extract(snapshot, '$.collection.name'), json_extract(snapshot, '$.request.name')) AS name
-	     FROM shares WHERE workspace_id = ? AND revoked_at IS NULL ORDER BY created_at DESC, id`, workspaceID)
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT s.id, s.kind, s.entity_id, s.created_at, s.updated_at,
+	        COALESCE(json_extract(s.snapshot, '$.collection.name'), json_extract(s.snapshot, '$.request.name')) AS name,
+	        s.created_by, u.name, s.options
+	     FROM shares s LEFT JOIN users u ON u.id = s.created_by
+	     WHERE s.workspace_id = ? AND s.revoked_at IS NULL ORDER BY s.created_at DESC, s.id`, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -165,8 +174,13 @@ func (t *rtx) ActiveShares(workspaceID string) ([]store.ShareListItem, error) {
 	for rows.Next() {
 		var it store.ShareListItem
 		var name any
-		if err := rows.Scan(&it.ID, &it.Kind, &it.EntityID, &it.CreatedAt, &it.UpdatedAt, &name); err != nil {
+		var createdBy, byName, options sql.NullString
+		if err := rows.Scan(&it.ID, &it.Kind, &it.EntityID, &it.CreatedAt, &it.UpdatedAt, &name, &createdBy, &byName, &options); err != nil {
 			return nil, err
+		}
+		it.CreatedBy, it.CreatedByName = nullStr(&createdBy), nullStr(&byName)
+		if options.Valid {
+			it.Options = []byte(options.String)
 		}
 		// The Worker returns the name only when typeof name === "string". json_extract gives TEXT
 		// for a JSON string and also for an object or array (its JSON text, as D1 does, so such
@@ -229,12 +243,12 @@ func (t *wtx) UpsertEntity(workspaceID string, e store.Entity) error {
 	if e.Deleted {
 		deleted = 1
 	}
-	_, err := t.exec(`INSERT INTO entities (workspace_id, type, id, rev, updated_at, deleted, device_id, data, size)
-	     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	_, err := t.exec(`INSERT INTO entities (workspace_id, type, id, rev, updated_at, deleted, device_id, data, size, updated_by)
+	     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	     ON CONFLICT (workspace_id, type, id) DO UPDATE SET
 	       rev = excluded.rev, updated_at = excluded.updated_at, deleted = excluded.deleted,
-	       device_id = excluded.device_id, data = excluded.data, size = excluded.size`,
-		workspaceID, e.Type, e.ID, e.Rev, e.UpdatedAt, deleted, e.DeviceID, data, e.Size)
+	       device_id = excluded.device_id, data = excluded.data, size = excluded.size, updated_by = excluded.updated_by`,
+		workspaceID, e.Type, e.ID, e.Rev, e.UpdatedAt, deleted, e.DeviceID, data, e.Size, e.UpdatedBy)
 	return err
 }
 
@@ -250,15 +264,24 @@ func (t *wtx) BumpEntityRev(workspaceID, typ, id string, rev int64) error {
 }
 
 func (t *wtx) InsertShare(s store.Share) error {
-	_, err := t.exec(`INSERT INTO shares (id, workspace_id, kind, entity_id, snapshot, size, created_at, updated_at, revoked_at)
-	     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
-		s.ID, s.WorkspaceID, s.Kind, s.EntityID, string(s.Snapshot), s.Size, s.CreatedAt, s.UpdatedAt)
+	var options any
+	if s.Options != nil {
+		options = string(s.Options)
+	}
+	_, err := t.exec(`INSERT INTO shares (id, workspace_id, kind, entity_id, snapshot, size, created_at, updated_at, revoked_at, created_by, options)
+	     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+		s.ID, s.WorkspaceID, s.Kind, s.EntityID, string(s.Snapshot), s.Size, s.CreatedAt, s.UpdatedAt, s.CreatedBy, options)
 	return err
 }
 
-func (t *wtx) UpdateShareSnapshot(id, workspaceID string, snapshot []byte, size, updatedAt int64) (bool, error) {
-	res, err := t.exec("UPDATE shares SET snapshot = ?, size = ?, updated_at = ? WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL",
-		string(snapshot), size, updatedAt, id, workspaceID)
+func (t *wtx) UpdateShareSnapshot(id, workspaceID string, snapshot, options []byte, size, updatedAt int64) (bool, error) {
+	var opts any
+	if options != nil {
+		opts = string(options)
+	}
+	res, err := t.exec(`UPDATE shares SET snapshot = ?, size = ?, updated_at = ?, options = COALESCE(?, options)
+	     WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL`,
+		string(snapshot), size, updatedAt, opts, id, workspaceID)
 	if err != nil {
 		return false, err
 	}

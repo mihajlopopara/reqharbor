@@ -196,6 +196,14 @@ func TestDev_SignupRulesAndReturningIdentity(t *testing.T) {
 	if h.Count(t, "users", "email = 'moved@example.test'") != 0 {
 		t.Fatal("an untrusted email changed users.email")
 	}
+	// S6: /v1/me names the provider as the sign-in method, and the account has its personal space.
+	me := h.Call(t, "/v1/me", tu.Req{Token: again.Access})
+	if me.StatusCode != 200 || me.JSON(t)["method"] != "dev" || me.JSON(t)["sessionId"] != again.SessionID {
+		t.Fatalf("/v1/me: %d %s", me.StatusCode, me.Body)
+	}
+	if h.PersonalSpace(t, again.Access) == "" {
+		t.Fatal("no personal space")
+	}
 }
 
 func TestDev_EmailInUseWithAnUntrustedEmailNamesNothing(t *testing.T) {

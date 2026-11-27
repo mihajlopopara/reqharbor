@@ -365,7 +365,7 @@ func (s *Service) finishProvider(w http.ResponseWriter, r *http.Request, ar *sto
 		created, err := accounts.Create(tx, accounts.CreateParams{
 			Email: prof.Email, Name: prof.Name, AvatarURL: avatar, EmailTrusted: prof.EmailTrusted,
 			Identity:  &store.Identity{Provider: prof.Provider, Issuer: prof.Issuer, Subject: prof.Subject, Email: prof.Email},
-			GrantHash: grant, SignupMode: s.Config.Signup, AdminEmail: s.Config.AdminEmail, MaxUsers: s.Config.MaxUsers, Now: now,
+			GrantHash: grant, SignupMode: s.Config.Signup, AdminEmail: s.Config.AdminEmail, MaxUsers: s.Config.MaxUsers, OpenSignupFull: s.openSignupFull(), Now: now,
 		})
 		if err != nil {
 			return err

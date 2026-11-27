@@ -103,7 +103,10 @@ type CreateParams struct {
 
 	AdminEmail string // REQHARBOR_ADMIN_EMAIL, normalised
 	MaxUsers   int64  // 0 means no cap
-	Now        time.Time
+	// OpenSignupFull refuses an open signup (no code) with ErrUserLimit: the personal spaces of
+	// open-signup accounts reached REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES (§5.6, §6).
+	OpenSignupFull bool
+	Now            time.Time
 }
 
 // Created is the result of Create.
@@ -194,6 +197,9 @@ func Create(tx store.WriteTx, p CreateParams) (*Created, error) {
 			switch p.SignupMode {
 			case "open":
 				via = ViaOpen
+				if p.OpenSignupFull {
+					return nil, ErrUserLimit
+				}
 			case "invite":
 				return nil, ErrInviteRequired
 			default:

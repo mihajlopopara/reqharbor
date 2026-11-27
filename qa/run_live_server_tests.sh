@@ -13,7 +13,8 @@
 #      accounts case: it signs up the first account with the setup code that `serve` logs, which this
 #      script reads from the log and passes as REQHARBOR_LIVE_SIGNUP_CODE; and the S5 dev-provider
 #      case, which signs up through the dev form with an invite made here with `invite create` and
-#      passed as REQHARBOR_LIVE_INVITE_CODE)
+#      passed as REQHARBOR_LIVE_INVITE_CODE; and the S6 personal-spaces case, which signs two more
+#      accounts up with the same invite, so it has 5 uses)
 #   4. cargo test --test qa_auth_live -- --ignored  (the client's sign-in, M1-client C1; §7.5 step 6)
 #      with REQHARBOR_LIVE_SIGNUP_CODE set to a multi-use invite made with `invite create`. It needs
 #      the S6 routes (GET /v1/me, sessions, personal spaces; §9, §10 S6), so by default

@@ -221,7 +221,7 @@ func (d *Deps) pull(w http.ResponseWriter, r *http.Request, ws *store.Workspace)
 	if err != nil {
 		return err
 	}
-	page, err := syncsvc.Pull(r.Context(), d.Store, ws.ID, since, limit, d.Epoch())
+	page, err := syncsvc.Pull(r.Context(), d.Store, ws.ID, since, limit, d.Epoch(), false)
 	if err != nil {
 		return err
 	}
@@ -237,7 +237,7 @@ func (d *Deps) push(w http.ResponseWriter, r *http.Request, ws *store.Workspace)
 	if err != nil {
 		return err
 	}
-	resp, err := syncsvc.Push(r.Context(), d.Store, ws.ID, changes, d.limits())
+	resp, err := syncsvc.Push(r.Context(), d.Store, ws.ID, changes, d.limits(), nil)
 	if err != nil {
 		return err
 	}
@@ -291,7 +291,7 @@ func (d *Deps) updateShare(w http.ResponseWriter, r *http.Request, ws *store.Wor
 	if err != nil {
 		return err
 	}
-	updated, err := d.Shares.Update(r.Context(), d.scope(ws), sh, body)
+	updated, err := d.Shares.Update(r.Context(), d.scope(ws), sh, body, nil)
 	if err != nil {
 		return err
 	}

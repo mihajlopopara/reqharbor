@@ -596,3 +596,204 @@ async fn live_provider_dev_sign_in_is_unlisted_untrusted_and_follows_signup_rule
         .await;
     loopback_code(status, &headers, &body, "st-dev-2");
 }
+
+/// Signs a new account up through the devauth build's dev form with an invite; returns the token
+/// response.
+async fn dev_sign_up(c: &reqwest::Client, invite: &str, email: &str, state: &str) -> Value {
+    let mut b = Browser::new();
+    let (ar, _) = b.authorize(state).await;
+    let (status, headers, body) = b
+        .post(
+            "/auth/dev",
+            form(&[("ar", &ar), ("email", email), ("name", "Space QA"), ("code", invite)]),
+        )
+        .await;
+    let auth_code = loopback_code(status, &headers, &body, state);
+    let (status, t) = token(
+        c,
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", "reqharbor-desktop"),
+            ("code", auth_code.as_str()),
+            ("code_verifier", PKCE_VERIFIER),
+            ("redirect_uri", REDIRECT),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{t}");
+    t
+}
+
+async fn get_json(c: &reqwest::Client, path: &str, access: &str) -> (u16, Value) {
+    let res = c
+        .get(format!("{}{path}", server_url()))
+        .bearer_auth(access)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap_or(Value::Null))
+}
+
+async fn post_json(c: &reqwest::Client, path: &str, access: &str, body: &Value) -> (u16, Value) {
+    let res = c
+        .post(format!("{}{path}", server_url()))
+        .bearer_auth(access)
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap_or(Value::Null))
+}
+
+/// S6 personal spaces (06-go-server.md §4, §10 S6), with raw HTTP: /v1/me, /v1/me/sessions,
+/// /v1/me/spaces, a push mixing a request with a future `protoFile` and a skewed change, a pull
+/// with `updatedBy` and `syncEpoch` that the real client parses, space shares with `createdBy` and
+/// `options`, and the token schemes kept apart. Runs after the S4 and S5 cases (name order), so
+/// the first account exists and the S5 invite has uses left.
+#[tokio::test]
+#[ignore]
+async fn live_space_personal_sync_me_and_shares() {
+    let invite = std::env::var("REQHARBOR_LIVE_INVITE_CODE")
+        .expect("REQHARBOR_LIVE_INVITE_CODE: an invite from `invite create` (qa/run_live_server_tests.sh sets it)");
+    let c = http();
+    let email = format!("space-{}@example.test", random_ip().replace('.', "-"));
+    let t = dev_sign_up(&c, &invite, &email, "st-space").await;
+    let access = t["access_token"].as_str().unwrap().to_string();
+    let user_id = t["user"]["id"].as_str().unwrap().to_string();
+
+    // /v1/me: the user, the method and this session.
+    let (status, me) = get_json(&c, "/v1/me", &access).await;
+    assert_eq!(status, 200, "{me}");
+    assert_eq!(me["user"]["email"], json!(email));
+    assert_eq!(me["method"], json!("dev"));
+    assert_eq!(me["sessionId"], t["session_id"]);
+
+    // /v1/me/sessions: exactly this device, marked current.
+    let (status, sessions) = get_json(&c, "/v1/me/sessions", &access).await;
+    assert_eq!(status, 200, "{sessions}");
+    let list = sessions["sessions"].as_array().unwrap();
+    assert_eq!(list.len(), 1, "{sessions}");
+    assert_eq!(list[0]["current"], json!(true));
+    assert_eq!(list[0]["deviceName"], json!("QA live (Linux)"));
+
+    // /v1/me/spaces: the personal space, with the final M1 shape.
+    let (status, spaces) = get_json(&c, "/v1/me/spaces", &access).await;
+    assert_eq!(status, 200, "{spaces}");
+    assert_eq!(spaces["departed"], json!([]));
+    let personal = &spaces["spaces"][0];
+    assert_eq!(personal["kind"], json!("personal"));
+    assert_eq!(personal["role"], json!("owner"));
+    assert_eq!(personal["teamId"], Value::Null);
+    let space = personal["spaceId"].as_str().unwrap().to_string();
+    let sync = format!("/v1/spaces/{space}/sync");
+
+    // A push mixing a request, a future type and a change 10 minutes ahead.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let push = json!({"changes": [
+        {"type": "request", "id": "r1", "updatedAt": now, "deleted": false, "deviceId": "01QA",
+         "data": {"id": "r1", "name": "Live request"}},
+        {"type": "protoFile", "id": "p1", "updatedAt": now, "deleted": false, "data": {"id": "p1"}},
+        {"type": "request", "id": "r2", "updatedAt": now + 600_000, "deleted": false,
+         "data": {"id": "r2", "name": "From the future"}},
+    ]});
+    let (status, resp) = post_json(&c, &sync, &access, &push).await;
+    assert_eq!(status, 200, "{resp}");
+    assert_eq!(
+        resp["results"],
+        json!([
+            {"type": "request", "id": "r1", "status": "applied", "rev": 1},
+            {"type": "protoFile", "id": "p1", "status": "rejected", "reason": "unsupported_type"},
+            {"type": "request", "id": "r2", "status": "rejected", "reason": "clock_skew"},
+        ])
+    );
+    assert_eq!(resp["cursor"], json!(1));
+    let server_time = resp["serverTime"].as_u64().expect("serverTime");
+    assert!(server_time.abs_diff(now) < 120_000, "{resp}");
+
+    // The same push on legacy token sync is a whole-request 400.
+    let legacy = raw_workspace(&c).await;
+    let (status, err) = post_json(&c, "/v1/sync", &legacy, &push).await;
+    assert_eq!(
+        (status, err["error"]["code"].clone()),
+        (400, json!("unsupported_type"))
+    );
+
+    // Pull: updatedBy and syncEpoch, and the page parses as the real client's PullPage.
+    let res = c
+        .get(format!("{}{sync}?since=0", server_url()))
+        .bearer_auth(&access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let text = res.text().await.unwrap();
+    let page: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        page["changes"][0]["updatedBy"],
+        json!({"userId": user_id, "name": "Space QA"})
+    );
+    assert_eq!(page["changes"][0]["deviceId"], json!("01QA"));
+    let parsed: reqharbor_core::sync::PullPage = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed.changes.len(), 1);
+    assert_eq!(parsed.cursor, 1);
+    assert!(parsed.sync_epoch.as_deref().is_some_and(|e| !e.is_empty()));
+
+    // Shares in the space carry createdBy and the stored options.
+    let snapshot = json!({"schemaVersion": 1, "request": {"id": "r1", "name": "Live request", "method": "GET",
+        "url": "https://example.com", "params": [], "headers": [], "auth": {"type": "none"},
+        "body": {"type": "none"}}, "environment": null});
+    let (status, created) = post_json(
+        &c,
+        &format!("/v1/spaces/{space}/shares"),
+        &access,
+        &json!({"kind": "request", "entityId": "r1", "snapshot": snapshot,
+                "options": {"includeCredentials": false, "environmentId": null}}),
+    )
+    .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["createdBy"]["userId"], json!(user_id));
+    assert_eq!(
+        created["options"],
+        json!({"includeCredentials": false, "environmentId": null})
+    );
+    let (status, listed) = get_json(&c, &format!("/v1/spaces/{space}/shares"), &access).await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(listed["shares"][0]["shareId"], created["shareId"]);
+    assert_eq!(listed["shares"][0]["createdBy"]["name"], json!("Space QA"));
+
+    // The token schemes never cross: rh_ on a space, rha_ on legacy.
+    let (status, err) = get_json(&c, &sync, &legacy).await;
+    assert_eq!(
+        (status, err["error"]["code"].clone()),
+        (401, json!("auth_required"))
+    );
+    let (status, err) = get_json(&c, "/v1/sync", &access).await;
+    assert_eq!(
+        (status, err["error"]["code"].clone()),
+        (401, json!("unauthorized"))
+    );
+    // Another account's space is 403; an unknown one 404.
+    let other = dev_sign_up(
+        &c,
+        &invite,
+        &format!("other-{}@example.test", random_ip().replace('.', "-")),
+        "st-space-2",
+    )
+    .await;
+    let (status, err) = get_json(&c, &sync, other["access_token"].as_str().unwrap()).await;
+    assert_eq!(
+        (status, err["error"]["code"].clone()),
+        (403, json!("not_a_member"))
+    );
+    let (status, err) = get_json(&c, "/v1/spaces/01UNKNOWN0000000000000000X/sync", &access).await;
+    assert_eq!(
+        (status, err["error"]["code"].clone()),
+        (404, json!("space_not_found"))
+    );
+}

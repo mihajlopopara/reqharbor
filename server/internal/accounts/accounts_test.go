@@ -242,3 +242,29 @@ func TestSetupCodeAndInviteHelpers(t *testing.T) {
 		t.Fatalf("setup code with users: %v", err)
 	}
 }
+
+// TestCreate_OpenSignupFullRefusesOnlyOpenSignups: REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES reached
+// refuses a code-less open signup with server_user_limit, never an invited or CLI account.
+func TestCreate_OpenSignupFullRefusesOnlyOpenSignups(t *testing.T) {
+	h := tu.New(t)
+	if _, err := create(t, h, accounts.CreateParams{Email: "admin@example.test", SignupMode: "open", GrantHash: accounts.CodeHash(h.App.SetupCode()), OpenSignupFull: true}); err != nil {
+		t.Fatalf("setup while full: %v", err)
+	}
+	if _, err := create(t, h, accounts.CreateParams{Email: "open@example.test", SignupMode: "open", OpenSignupFull: true}); !errors.Is(err, accounts.ErrUserLimit) {
+		t.Fatalf("open signup while full: %v", err)
+	}
+	if n := h.Count(t, "users", "email = ?", "open@example.test"); n != 0 {
+		t.Fatalf("refused open signup created %d rows", n)
+	}
+	inv := h.Invite(t, "", 1)
+	c, err := create(t, h, accounts.CreateParams{Email: "inv@example.test", SignupMode: "open", GrantHash: accounts.CodeHash(inv), OpenSignupFull: true})
+	if err != nil || c.User.SignupVia != accounts.ViaInvite {
+		t.Fatalf("invite while full: %+v %v", c, err)
+	}
+	if c, err := create(t, h, accounts.CreateParams{Email: "cli@example.test", CLI: true, OpenSignupFull: true}); err != nil || c.User.SignupVia != accounts.ViaCLI {
+		t.Fatalf("CLI while full: %+v %v", c, err)
+	}
+	if c, err := create(t, h, accounts.CreateParams{Email: "open@example.test", SignupMode: "open"}); err != nil || c.User.SignupVia != accounts.ViaOpen {
+		t.Fatalf("open signup when not full: %+v %v", c, err)
+	}
+}

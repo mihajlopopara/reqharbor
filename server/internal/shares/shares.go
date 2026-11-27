@@ -5,6 +5,7 @@ package shares
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -116,10 +117,50 @@ type Created struct {
 	UpdatedAt int64  `json:"updatedAt"`
 }
 
-// Prepared is a validated share create body.
+// Prepared is a validated share create body. CreatedBy and Options are set for account spaces
+// only (ParseOptions); legacy shares have neither.
 type Prepared struct {
 	Kind, EntityID string
 	Snapshot       []byte
+	CreatedBy      *string
+	Options        []byte
+}
+
+// ParseOptions validates the `options` member of an account-space share create or update body
+// (AC-TSHARE-3, 0004 shares.options) and returns its canonical JSON
+// {"includeCredentials":bool,"environmentId":string|null}, or nil when the member is absent or
+// null (a create then stores no options and an update keeps the stored ones). A missing
+// includeCredentials is false; unknown keys are dropped.
+func ParseOptions(body *jsonx.Value) ([]byte, error) {
+	raw := body.Get("options")
+	if raw == nil || raw.IsNull() {
+		return nil, nil
+	}
+	if !raw.IsObject() {
+		return nil, httpx.BadRequest("`options` must be an object or null")
+	}
+	include := false
+	if v := raw.Get("includeCredentials"); v != nil && !v.IsNull() {
+		if v.Kind != jsonx.Bool {
+			return nil, httpx.BadRequest("`options.includeCredentials` must be a boolean")
+		}
+		include = v.B
+	}
+	var envID *string
+	if v := raw.Get("environmentId"); v != nil && !v.IsNull() {
+		id, ok := v.Str()
+		if !ok || !entityIDRe.MatchString(id) {
+			return nil, httpx.BadRequest("`options.environmentId` must be a 1-128 character id or null")
+		}
+		envID = &id
+	}
+	return httpx.Marshal(ShareOptions{IncludeCredentials: include, EnvironmentID: envID})
+}
+
+// ShareOptions is the stored shape of shares.options.
+type ShareOptions struct {
+	IncludeCredentials bool    `json:"includeCredentials"`
+	EnvironmentID      *string `json:"environmentId"`
 }
 
 // Prepare validates a create body in the Worker's order: kind, entityId, then the snapshot.
@@ -151,6 +192,7 @@ func (s *Service) Insert(ctx context.Context, sc Scope, p *Prepared) (*Created, 
 		return tx.InsertShare(store.Share{
 			ID: id, WorkspaceID: sc.WorkspaceID, Kind: p.Kind, EntityID: p.EntityID,
 			Snapshot: p.Snapshot, Size: size, CreatedAt: now, UpdatedAt: now,
+			CreatedBy: p.CreatedBy, Options: p.Options,
 		})
 	})
 	if err != nil {
@@ -213,6 +255,73 @@ func (s *Service) List(ctx context.Context, wsID string) ([]ListItem, error) {
 	return out, err
 }
 
+// Author names who created a share in an account space. Name is the user's current name, or null
+// when the account no longer exists (shown as "Former member").
+type Author struct {
+	UserID string  `json:"userId"`
+	Name   *string `json:"name"`
+}
+
+// SpaceListItem is one entry of GET /v1/spaces/{id}/shares: the legacy shape plus createdBy and
+// options.
+type SpaceListItem struct {
+	ListItem
+	CreatedBy *Author         `json:"createdBy"`
+	Options   json.RawMessage `json:"options"`
+}
+
+// RawOrNull returns stored JSON for embedding, or JSON null.
+func RawOrNull(b []byte) json.RawMessage {
+	if b == nil {
+		return json.RawMessage("null")
+	}
+	return json.RawMessage(b)
+}
+
+// ListSpace returns the active shares of an account space, newest first, with their authors and
+// options.
+func (s *Service) ListSpace(ctx context.Context, wsID string) ([]SpaceListItem, error) {
+	out := []SpaceListItem{}
+	err := s.Store.Read(ctx, func(tx store.ReadTx) error {
+		rows, err := tx.ActiveShares(wsID)
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			it := SpaceListItem{
+				ListItem: ListItem{ShareID: r.ID, URL: s.URL(r.ID), Kind: r.Kind, EntityID: r.EntityID, Name: r.Name, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt},
+				Options:  RawOrNull(r.Options),
+			}
+			if r.CreatedBy != nil {
+				it.CreatedBy = &Author{UserID: *r.CreatedBy, Name: r.CreatedByName}
+			}
+			out = append(out, it)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// AuthorOf loads the author of a share created by userID (nil for a legacy share).
+func (s *Service) AuthorOf(ctx context.Context, userID *string) (*Author, error) {
+	if userID == nil {
+		return nil, nil
+	}
+	a := &Author{UserID: *userID}
+	err := s.Store.Read(ctx, func(tx store.ReadTx) error {
+		u, err := tx.UserByID(*userID)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		a.Name = &u.Name
+		return nil
+	})
+	return a, err
+}
+
 // Owned loads a share of this workspace. Malformed ids, unknown ids and other workspaces'
 // shares are indistinguishable 404s.
 func (s *Service) Owned(ctx context.Context, wsID, id string) (*store.Share, error) {
@@ -244,8 +353,9 @@ func (s *Service) CheckUpdatable(ctx context.Context, wsID, id string) (*store.S
 	return sh, nil
 }
 
-// Update replaces the snapshot behind the same URL. sh comes from CheckUpdatable.
-func (s *Service) Update(ctx context.Context, sc Scope, sh *store.Share, body *jsonx.Value) (*Created, error) {
+// Update replaces the snapshot behind the same URL. sh comes from CheckUpdatable. options, when
+// not nil, replaces the stored options (account spaces); nil keeps them.
+func (s *Service) Update(ctx context.Context, sc Scope, sh *store.Share, body *jsonx.Value, options []byte) (*Created, error) {
 	snap, err := PrepareSnapshot(sh.Kind, body.Get("snapshot"))
 	if err != nil {
 		return nil, err
@@ -269,7 +379,7 @@ func (s *Service) Update(ctx context.Context, sc Scope, sh *store.Share, body *j
 		if cur.UpdatedAt > now {
 			now = cur.UpdatedAt
 		}
-		ok, err := tx.UpdateShareSnapshot(sh.ID, sc.WorkspaceID, snap, size, now)
+		ok, err := tx.UpdateShareSnapshot(sh.ID, sc.WorkspaceID, snap, options, size, now)
 		if err != nil {
 			return err
 		}

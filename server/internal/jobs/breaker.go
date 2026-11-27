@@ -26,6 +26,8 @@ type BreakerLimits struct {
 	MaxDBBytes       int64
 	MinFreeDiskBytes int64
 	LegacyTotalBytes int64
+	// OpenSignupTotalBytes caps the personal spaces of open-signup accounts together.
+	OpenSignupTotalBytes int64
 }
 
 // Breaker reports whether growing writes must be refused with 507 server_full. Its state comes
@@ -40,9 +42,11 @@ type Breaker struct {
 	dbFull     atomic.Bool
 	diskLow    atomic.Bool
 	legacyFull atomic.Bool
+	openFull   atomic.Bool
 	dbBytes    atomic.Int64
 	freeBytes  atomic.Int64
 	legacy     atomic.Int64
+	openBytes  atomic.Int64
 }
 
 // NewBreaker returns a breaker; sizes may be nil (no DB or disk checks).
@@ -69,6 +73,10 @@ func (b *Breaker) Open() bool { return b.dbFull.Load() || b.diskLow.Load() }
 
 // LegacyFull reports whether the legacy-workspace total-storage cap is reached.
 func (b *Breaker) LegacyFull() bool { return b.legacyFull.Load() }
+
+// OpenSignupFull reports whether REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES is reached: growing writes to
+// open-signup personal spaces return 507 and open signup shows server_user_limit.
+func (b *Breaker) OpenSignupFull() bool { return b.openFull.Load() }
 
 // Sample re-reads the sizes and updates the state.
 func (b *Breaker) Sample(ctx context.Context) error {
@@ -113,6 +121,22 @@ func (b *Breaker) Sample(ctx context.Context) error {
 	} else {
 		b.legacyFull.Store(false)
 	}
+	if b.st != nil && lim.OpenSignupTotalBytes > 0 {
+		var total int64
+		err := b.st.Read(ctx, func(tx store.ReadTx) error {
+			var err error
+			total, err = tx.OpenSignupTotalBytes()
+			return err
+		})
+		if err == nil {
+			b.openBytes.Store(total)
+			b.openFull.Store(total >= lim.OpenSignupTotalBytes)
+		} else {
+			keep(err)
+		}
+	} else {
+		b.openFull.Store(false)
+	}
 	return firstErr
 }
 
@@ -120,7 +144,7 @@ func (b *Breaker) Sample(ctx context.Context) error {
 func (b *Breaker) Run(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
-	wasOpen, wasLegacy := b.Open(), b.LegacyFull()
+	wasOpen, wasLegacy, wasOpenSignup := b.Open(), b.LegacyFull(), b.OpenSignupFull()
 	for {
 		select {
 		case <-ctx.Done():
@@ -144,6 +168,12 @@ func (b *Breaker) Run(ctx context.Context, interval time.Duration) {
 				b.logger.Warn("REQHARBOR_LEGACY_TOTAL_BYTES reached: legacy creates and growing legacy writes return 507", "legacy_bytes", b.legacy.Load())
 			}
 			wasLegacy = lf
+		}
+		if of := b.OpenSignupFull(); of != wasOpenSignup {
+			if of {
+				b.logger.Warn("REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES reached: open signup is paused and growing writes of open-signup accounts return 507", "open_signup_bytes", b.openBytes.Load())
+			}
+			wasOpenSignup = of
 		}
 	}
 }

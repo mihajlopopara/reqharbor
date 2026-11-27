@@ -23,6 +23,7 @@ import (
 	"github.com/mihajlopopara/reqharbor/server/internal/legacy"
 	"github.com/mihajlopopara/reqharbor/server/internal/ratelimit"
 	"github.com/mihajlopopara/reqharbor/server/internal/shares"
+	"github.com/mihajlopopara/reqharbor/server/internal/spaces"
 	"github.com/mihajlopopara/reqharbor/server/internal/store"
 )
 
@@ -70,6 +71,7 @@ type App struct {
 	Resolver      *clientip.Resolver
 	CreateLimiter *ratelimit.Limiter
 	ShareLimiter  *ratelimit.Limiter
+	SyncLimiter   *ratelimit.Limiter // /v1/spaces/*/sync per session
 	Auth          *auth.Service
 	Hasher        *auth.Hasher
 	Throttle      *throttle.Throttle
@@ -100,22 +102,25 @@ func New(d Deps) *App {
 			sizes = d.DB
 		}
 		a.Breaker = jobs.NewBreaker(jobs.BreakerLimits{
-			MaxDBBytes:       d.Config.MaxDBBytes,
-			MinFreeDiskBytes: d.Config.MinFreeDiskBytes,
-			LegacyTotalBytes: d.Config.LegacyTotalBytes,
+			MaxDBBytes:           d.Config.MaxDBBytes,
+			MinFreeDiskBytes:     d.Config.MinFreeDiskBytes,
+			LegacyTotalBytes:     d.Config.LegacyTotalBytes,
+			OpenSignupTotalBytes: d.Config.OpenSignupTotalBytes,
 		}, sizes, d.Store, d.Logger)
 	}
 	a.Resolver = clientip.New(d.Config.TrustedProxies, d.Config.ClientIPHeader, d.Logger, d.Config.LogClientIP)
 	a.CreateLimiter = ratelimit.New(d.Clock, d.Config.RateLegacyCreatePerHour, time.Hour)
 	a.ShareLimiter = ratelimit.New(d.Clock, d.Config.RateShareCreatePerHour, time.Hour)
+	a.SyncLimiter = ratelimit.New(d.Clock, d.Config.RateSyncPerMin, time.Minute)
 
 	shareSvc := &shares.Service{Store: d.Store, Clock: d.Clock, PublicURL: d.Config.PublicURL}
 	a.Hasher = auth.NewHasher(d.Config.Argon2MemoryKiB)
 	a.Throttle = throttle.New(nil, d.Clock) // the key is read from server_state in Init
 	a.Auth = auth.New(auth.Deps{
 		Store: d.Store, Clock: d.Clock, Config: d.Config, Logger: d.Logger, ClientIP: a.Resolver,
-		Hasher: a.Hasher, Throttle: a.Throttle, Growth: a.accountGrowth, UserCreated: a.discovery.SetupDone,
-		HTTPClient: d.HTTPClient,
+		Hasher: a.Hasher, Throttle: a.Throttle, Growth: a.accountGrowth, OpenSignupFull: a.Breaker.OpenSignupFull,
+		UserCreated: a.discovery.SetupDone,
+		HTTPClient:  d.HTTPClient,
 	})
 	a.discovery.UsersExist = a.usersExist
 	mux := http.NewServeMux()
@@ -134,6 +139,17 @@ func New(d Deps) *App {
 		Epoch:         a.SyncEpoch,
 	})
 	a.Auth.Register(mux)
+	spaces.Register(mux, &spaces.Deps{
+		Store:        d.Store,
+		Clock:        d.Clock,
+		Config:       d.Config,
+		Auth:         a.Auth,
+		Breaker:      a.Breaker,
+		Shares:       shareSvc,
+		SyncLimiter:  a.SyncLimiter,
+		ShareLimiter: a.ShareLimiter,
+		Epoch:        a.SyncEpoch,
+	})
 	mux.Handle("/s/{file}", shareSvc.PublicHandler())
 	mux.Handle("/", httpx.NotFoundHandler)
 
@@ -177,7 +193,7 @@ func (a *App) InstanceID() string { return a.instanceID }
 // Sweepers returns the in-memory limiters and the throttle's account-wide state for the
 // sweeper job.
 func (a *App) Sweepers() []jobs.Sweeper {
-	out := []jobs.Sweeper{a.CreateLimiter, a.ShareLimiter, a.Throttle}
+	out := []jobs.Sweeper{a.CreateLimiter, a.ShareLimiter, a.SyncLimiter, a.Throttle}
 	for _, l := range a.Auth.Limiters() {
 		out = append(out, l)
 	}

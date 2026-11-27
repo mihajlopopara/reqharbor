@@ -1,6 +1,7 @@
 package syncsvc
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -174,4 +175,53 @@ func FuzzPushValidation(f *testing.F) {
 			}
 		}
 	})
+}
+
+// TestParsePush_ClockSkew: with MaxUpdatedAt (account spaces) a change more than 5 minutes ahead
+// is a per-change clock_skew, tombstones included; exactly +5 min passes; every 400 check still
+// applies to such a change; unsupported_type wins over clock_skew, which wins over the data checks.
+func TestParsePush_ClockSkew(t *testing.T) {
+	const now = int64(1_800_000_000_000)
+	maxAt := now + MaxClockAheadMillis
+	big := `"` + strings.Repeat("x", EntityDataBytes) + `"`
+	cases := []struct {
+		name   string
+		change string
+		reason string
+		code   string // a whole-request 400 instead
+	}{
+		{"at the limit", `{"type":"request","id":"r","updatedAt":%d,"deleted":false,"data":{}}`, "", ""},
+		{"one ms over", `{"type":"request","id":"r","updatedAt":%d,"deleted":false,"data":{}}`, ReasonClockSkew, ""},
+		{"tombstone over", `{"type":"request","id":"r","updatedAt":%d,"deleted":true}`, ReasonClockSkew, ""},
+		{"too large and skewed", `{"type":"request","id":"r","updatedAt":%d,"deleted":false,"data":{"b":` + big + `}}`, ReasonClockSkew, ""},
+		{"unknown type and skewed", `{"type":"protoFile","id":"r","updatedAt":%d,"deleted":false,"data":{}}`, ReasonUnsupportedType, ""},
+		{"skewed with bad data", `{"type":"request","id":"r","updatedAt":%d,"deleted":false,"data":[]}`, "", "validation_failed"},
+		{"skewed tombstone with data", `{"type":"request","id":"r","updatedAt":%d,"deleted":true,"data":{}}`, "", "validation_failed"},
+	}
+	for i, c := range cases {
+		at := maxAt + 1
+		if i == 0 {
+			at = maxAt
+		}
+		body := `{"changes":[` + strings.Replace(c.change, "%d", strconv.FormatInt(at, 10), 1) + `]}`
+		cs, err := parse(t, body, ParseOptions{UnknownTypePerChange: true, MaxUpdatedAt: maxAt})
+		if c.code != "" {
+			if e, ok := httpx.AsAPIError(err); !ok || e.Code != c.code || e.Status != 400 {
+				t.Errorf("%s: want 400 %s, got %v", c.name, c.code, err)
+			}
+			continue
+		}
+		if err != nil || len(cs) != 1 || cs[0].Rejected != c.reason {
+			t.Errorf("%s: %+v %v", c.name, cs, err)
+			continue
+		}
+		if c.reason != "" && (cs[0].Size != 0 || cs[0].Data != nil) {
+			t.Errorf("%s: a rejected change carries data", c.name)
+		}
+	}
+	// Legacy (no MaxUpdatedAt) never rejects for skew.
+	cs, err := parse(t, `{"changes":[{"type":"request","id":"r","updatedAt":9007199254740991,"deleted":false,"data":{}}]}`, ParseOptions{})
+	if err != nil || cs[0].Rejected != "" {
+		t.Fatalf("legacy skew: %+v %v", cs, err)
+	}
 }

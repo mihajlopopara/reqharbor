@@ -37,6 +37,10 @@ type Entity struct {
 	DeviceID  string
 	Data      []byte // nil for tombstones
 	Size      int64
+	// UpdatedBy is the user id of the author of this version ("" for legacy workspaces). On
+	// reads, UpdatedByName is that user's current name, or nil when the user no longer exists.
+	UpdatedBy     string
+	UpdatedByName *string
 }
 
 // EntityMeta is what LWW needs about the stored copy.
@@ -57,6 +61,10 @@ type Share struct {
 	CreatedAt   int64
 	UpdatedAt   int64
 	RevokedAt   *int64
+	// CreatedBy is the creating user's id in an account space (nil for legacy shares); Options
+	// is the stored share-options JSON (nil when none).
+	CreatedBy *string
+	Options   []byte
 }
 
 // ShareListItem is an active share as listed by GET /v1/shares.
@@ -67,6 +75,37 @@ type ShareListItem struct {
 	Name      *string // the root entity's name when it is a string
 	CreatedAt int64
 	UpdatedAt int64
+	// CreatedBy and Options as on Share; CreatedByName is the creator's current name, nil when
+	// the user no longer exists ("Former member").
+	CreatedBy     *string
+	CreatedByName *string
+	Options       []byte
+}
+
+// SpaceAccess is what space authorisation needs about a workspace and one user (§4).
+type SpaceAccess struct {
+	Workspace Workspace
+	// TeamID is nil for a legacy workspace, which /v1/spaces never addresses.
+	TeamID   *string
+	TeamName string
+	Personal bool
+	// OwnerUserID is the team's billing owner; OwnerSignupVia is that user's users.signup_via
+	// (the REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES class of a personal space).
+	OwnerUserID    string
+	OwnerSignupVia string
+	// Role is the user's membership role, nil when the user is not a member.
+	Role *string
+}
+
+// SpaceRow is one space a user is a member of (GET /v1/me/spaces).
+type SpaceRow struct {
+	WorkspaceID string
+	Name        string
+	CreatedAt   int64
+	TeamID      string
+	TeamName    string
+	Personal    bool
+	Role        string
 }
 
 // ReadTx are the queries available in any transaction.
@@ -85,6 +124,13 @@ type ReadTx interface {
 	ServerState(key string) (string, error)
 	// LegacyTotalBytes sums WorkspaceUsage over every legacy workspace (team_id IS NULL).
 	LegacyTotalBytes() (int64, error)
+	// OpenSignupTotalBytes sums WorkspaceUsage over the personal spaces of accounts created
+	// through open signup (users.signup_via = 'open').
+	OpenSignupTotalBytes() (int64, error)
+	// SpaceAccess loads workspace id with userID's membership; ErrNotFound for an unknown id.
+	SpaceAccess(workspaceID, userID string) (*SpaceAccess, error)
+	// UserSpaces lists the spaces userID is a member of, the personal space first.
+	UserSpaces(userID string) ([]SpaceRow, error)
 }
 
 // WriteTx adds the writes.
@@ -101,8 +147,9 @@ type WriteTx interface {
 	UpsertEntity(workspaceID string, e Entity) error
 	BumpEntityRev(workspaceID, typ, id string, rev int64) error
 	InsertShare(s Share) error
-	// UpdateShareSnapshot replaces an active share's snapshot; false when it is revoked or missing.
-	UpdateShareSnapshot(id, workspaceID string, snapshot []byte, size, updatedAt int64) (bool, error)
+	// UpdateShareSnapshot replaces an active share's snapshot, and its options when options is
+	// not nil; false when it is revoked or missing.
+	UpdateShareSnapshot(id, workspaceID string, snapshot, options []byte, size, updatedAt int64) (bool, error)
 	// RevokeShare revokes an active share and drops its snapshot.
 	RevokeShare(id string, revokedAt int64) error
 	SetServerState(key, value string) error

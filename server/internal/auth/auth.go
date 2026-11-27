@@ -57,6 +57,9 @@ type Deps struct {
 	Throttle *throttle.Throttle
 	// Growth is the breaker check for account creation (a growing write); nil allows it.
 	Growth func() error
+	// OpenSignupFull reports whether REQHARBOR_OPEN_SIGNUP_TOTAL_BYTES is reached; open signup
+	// then shows server_user_limit. nil means never.
+	OpenSignupFull func() bool
 	// UserCreated is called after an account was created through the pages (discovery rebuilds
 	// setupRequired).
 	UserCreated func()
@@ -118,6 +121,8 @@ func New(d Deps) *Service {
 	s.FailedExchange = ratelimit.New(c, 30, time.Hour)
 	return s
 }
+
+func (s *Service) openSignupFull() bool { return s.OpenSignupFull != nil && s.OpenSignupFull() }
 
 // Limiters returns every limiter, for the sweeper job.
 func (s *Service) Limiters() []*ratelimit.Limiter {

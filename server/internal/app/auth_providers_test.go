@@ -178,6 +178,9 @@ func TestGitHub_PrimaryVerifiedEmailSelection(t *testing.T) {
 			if tk.User.Email != tc.want || !row.Trusted || row.Via != accounts.ViaOpen || row.Name != u.Login {
 				t.Fatalf("%+v %+v", tk.User, row)
 			}
+			if me := h.Call(t, "/v1/me", tu.Req{Token: tk.Access}); me.JSON(t)["method"] != "github" {
+				t.Fatalf("/v1/me method: %s", me.Body)
+			}
 		})
 	}
 }
