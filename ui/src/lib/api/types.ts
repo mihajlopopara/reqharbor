@@ -75,19 +75,20 @@ export interface Folder {
 }
 
 /**
- * What a request talks (AC-FWD-2). "http" and "ws" (WebSocket; Socket.IO when `ws.socketIo` is set,
- * AC-WS-1) are editable in this build; any other value (including ones this build doesn't know)
- * makes the request read-only.
+ * What a request talks (AC-FWD-2). "http", "ws" (WebSocket; Socket.IO when `ws.socketIo` is set,
+ * AC-WS-1) and "grpc" (AC-GRPC-1) are editable in this build; any other value (including ones this
+ * build doesn't know) makes the request read-only.
  */
 export type RequestKind = "http" | "graphql" | "grpc" | "ws" | (string & {});
 
 export interface Request {
   id: string;
-  /** Omitted (= "http") for HTTP requests; "ws" for WebSocket / Socket.IO requests. */
+  /** Omitted (= "http") for HTTP requests; "ws" for WebSocket / Socket.IO requests; "grpc" for gRPC requests. */
   kind?: RequestKind;
   /**
    * Oldest ReqHarbor allowed to edit this request (AC-FWD-4); newer than `Bootstrap.appVersion` = read-only.
-   * WebSocket requests are stamped with "0.1.0", the first version with WebSocket support (AC-WS-1).
+   * WebSocket requests are stamped with WS_MIN_CLIENT_VERSION "0.1.0" (AC-WS-1), gRPC requests with
+   * GRPC_MIN_CLIENT_VERSION "0.1.0" (AC-GRPC-1): fixed values, never the running version, never lowered.
    */
   minClientVersion?: string;
   /** Owning collection; "" (empty string) for an unsaved scratch request. */
@@ -108,6 +109,12 @@ export interface Request {
    * `body` is unused. Kept when the kind is switched back to HTTP.
    */
   ws?: WsConfig;
+  /**
+   * gRPC settings (kind "grpc", AC-GRPC-*). `headers` are the call's metadata, `auth` applies as metadata,
+   * `settings.timeoutMs` is the unary deadline and `settings.verifyTls` applies; `params` and `body` are
+   * unused. Kept when the kind is switched back to HTTP.
+   */
+  grpc?: GrpcConfig;
   sortOrder: number;
   createdAt: number;
   updatedAt: number;
@@ -150,6 +157,125 @@ export interface SocketIoConfig {
   version: number;
   /** Optional JSON object sent as the CONNECT auth payload (variables resolve). */
   auth?: string;
+}
+
+/** Where a gRPC request's services come from. Any other string makes the request read-only (AC-FWD-3). */
+export type GrpcProtoSource = "reflection" | "files" | (string & {});
+
+export interface GrpcConfig {
+  /** Full service name, e.g. "demo.Greeter"; "" until a method is picked. */
+  service: string;
+  /** Method name, e.g. "SayHello"; "" until one is picked. */
+  method: string;
+  /** The request message as JSON text (proto3 JSON mapping). Variables resolve when sent; "" counts as {}. */
+  message: string;
+  /** Default "reflection". */
+  protoSource: GrpcProtoSource;
+  /**
+   * Absolute paths of .proto files (protoSource "files"). Device-local: emptied in team pushes (pulls keep this
+   * device's list) and in shares (AC-GRPC-4, AC-GRPC-12). Variables resolve.
+   */
+  protoFiles: string[];
+  /** Folders searched for imports (before each file's own folder and the bundled well-known types). Device-local. */
+  importPaths: string[];
+  /** Saved messages, in user order (AC-GRPC-6). */
+  messages: GrpcSavedMessage[];
+}
+
+export interface GrpcSavedMessage {
+  name: string;
+  /** JSON text. */
+  body: string;
+}
+
+export type GrpcCallKind = "unary" | "serverStreaming" | "clientStreaming" | "bidiStreaming";
+
+/** Services and the message shapes of their methods (AC-GRPC-3..6). */
+export interface GrpcDescriptor {
+  /**
+   * The resolved origin it belongs to, secrets masked, e.g. "grpcs://api.example.com:443": the cache key of a
+   * reflection result.
+   */
+  url: string;
+  /** When it was fetched (reflection) or compiled (files), epoch ms. */
+  fetchedAt: number;
+  source: "reflection" | "files";
+  /** source "files": the .proto files compiled (resolved paths); [] for reflection. */
+  files: string[];
+  /** Sorted by name; reflection services (`grpc.reflection.*`) left out. */
+  services: GrpcServiceInfo[];
+  /** Every message type the methods use, transitively, by full name (e.g. "demo.HelloRequest"). */
+  messages: Record<string, GrpcMessageInfo>;
+  /** Every enum those messages use, by full name. */
+  enums: Record<string, GrpcEnumInfo>;
+  /** Size of the encoded descriptor set. */
+  sizeBytes: number;
+}
+
+export interface GrpcServiceInfo {
+  /** Full name, e.g. "demo.Greeter". */
+  name: string;
+  methods: GrpcMethodInfo[];
+}
+
+export interface GrpcMethodInfo {
+  name: string;
+  callKind: GrpcCallKind;
+  /** Full message names. */
+  inputType: string;
+  outputType: string;
+}
+
+export type GrpcScalarKind =
+  | "double" | "float" | "int32" | "int64" | "uint32" | "uint64" | "sint32" | "sint64"
+  | "fixed32" | "fixed64" | "sfixed32" | "sfixed64" | "bool" | "string" | "bytes";
+
+export interface GrpcMessageInfo {
+  /** In declaration order. */
+  fields: GrpcFieldInfo[];
+}
+
+export interface GrpcFieldInfo {
+  /** Name in the .proto file. */
+  name: string;
+  /** lowerCamelCase JSON name (what completion offers; the proto name is accepted too). */
+  jsonName: string;
+  number: number;
+  /** For a map field: the value's kind. */
+  kind: GrpcScalarKind | "message" | "enum";
+  /** Full message or enum name when `kind` is "message" / "enum" (map fields: of the value). */
+  typeName?: string;
+  /** Repeated (never true for maps). */
+  repeated: boolean;
+  /** Set for `map<K, V>` fields: the key's kind. */
+  mapKey?: GrpcScalarKind;
+  /** The oneof it belongs to (synthetic oneofs of proto3 `optional` are left out). */
+  oneof?: string;
+}
+
+export interface GrpcEnumInfo {
+  /** Value names in declaration order. */
+  values: string[];
+}
+
+/** A gRPC status (AC-GRPC-7). */
+export interface GrpcStatus {
+  /** 0 = OK … 16 = UNAUTHENTICATED. */
+  code: number;
+  /** "OK", "NOT_FOUND", … ("CODE_17" for a code this build doesn't know). */
+  name: string;
+  message: string;
+  /** Decoded `grpc-status-details-bin` (google.rpc.Status details); [] when absent. */
+  details: GrpcStatusDetail[];
+}
+
+export interface GrpcStatusDetail {
+  /** e.g. "type.googleapis.com/google.rpc.BadRequest" */
+  typeUrl: string;
+  /** Pretty JSON when the type is known (google.rpc error details or the service's own types), else null. */
+  json: string | null;
+  /** The raw value, base64. */
+  base64: string;
 }
 
 export interface KeyValue {
@@ -331,6 +457,27 @@ export interface HistoryEntry {
   error?: SendError;
   /** WebSocket / Socket.IO session (method "WS" / "SIO"); `response` is absent. */
   ws?: WsSessionSummary;
+  /** gRPC call or stream (method "GRPC", AC-GRPC-10); `response` is absent. */
+  grpc?: GrpcCallSummary;
+}
+
+/** One gRPC call or stream in history (AC-GRPC-10). */
+export interface GrpcCallSummary {
+  service: string;
+  method: string;
+  callKind: GrpcCallKind;
+  durationMs: number;
+  /** Messages sent / received. */
+  sent: number;
+  received: number;
+  /** Absent when the call never got a status (connect error: see `HistoryEntry.error`). */
+  status?: GrpcStatus;
+  /** Unary: the response message as pretty JSON (at most 1 MB; `responseTruncated`). Not in HistorySummary. */
+  response?: string;
+  responseTruncated?: boolean;
+  /** Unary: response headers and trailers (names lowercase). Not in HistorySummary. */
+  headers?: [string, string][];
+  trailers?: [string, string][];
 }
 
 export interface WsSessionSummary {
@@ -369,7 +516,7 @@ export interface CommandError {
   code: CommandErrorCode;
   message: string;
   /** Present for code "validation" (PrepareErrorDetails), "format_error" (FormatErrorDetails) and the graphql_* codes (GraphqlErrorDetails). */
-  details?: PrepareErrorDetails | FormatErrorDetails | GraphqlErrorDetails;
+  details?: PrepareErrorDetails | FormatErrorDetails | GraphqlErrorDetails | GrpcErrorDetails;
 }
 
 /** `details` of the graphql_* error codes (AC-GQL-3, AC-GQL-5). */
@@ -381,6 +528,15 @@ export type GraphqlErrorDetails =
   /** graphql_introspection_failed */
   | { status: number | null }
   /** graphql_schema_too_large */
+  | { sizeBytes: number };
+
+/** `details` of the grpc_* error codes. */
+export type GrpcErrorDetails =
+  /** grpc_network */
+  | { kind: ErrorKind }
+  /** grpc_reflection_failed: the status the reflection service answered */
+  | { code: number; name: string }
+  /** grpc_descriptor_too_large */
   | { sizeBytes: number };
 
 export type CommandErrorCode =
@@ -482,6 +638,21 @@ export type CommandErrorCode =
   | "graphql_schema_invalid"
   /** Over 10 MB; `details` = `{ sizeBytes }`. */
   | "graphql_schema_too_large"
+  // ── gRPC (AC-GRPC-*) ──
+  /** grpc_fetch_descriptor: network failure; `details` = `{ kind: ErrorKind }` (`cancelled` after cancel_request: show nothing). */
+  | "grpc_network"
+  /** The server has no reflection service (v1 and v1alpha answer UNIMPLEMENTED): offer "Use .proto files". */
+  | "grpc_reflection_unsupported"
+  /** Reflection answered another error status, or an unusable descriptor; `details` = `{ code, name }` when a status. */
+  | "grpc_reflection_failed"
+  /** The .proto files don't compile (or can't be read); `message` = "greeter.proto:12:5: …". */
+  | "grpc_proto_invalid"
+  /** A descriptor set over 10 MB; `details` = `{ sizeBytes }`. */
+  | "grpc_descriptor_too_large"
+  /** grpc_send on a call that isn't open, already ended its sending side, or is unknown. */
+  | "grpc_not_connected"
+  /** grpc_send: the message isn't valid JSON or doesn't fit the input type; the message says why. */
+  | "grpc_invalid_message"
   | "internal";
 
 export type PrepareErrorDetails =
@@ -490,14 +661,28 @@ export type PrepareErrorDetails =
   | { kind: "emptyUrl" }
   /** The request inherits a collection auth from a newer ReqHarbor (unknown scheme). */
   | { kind: "inheritedAuthNeedsNewerVersion" }
-  /** send_request / export_curl got a WebSocket request. */
+  /** send_request / export_curl / graphql_* got a WebSocket or gRPC request. */
   | { kind: "notHttp" }
   /** ws_connect got a request whose kind isn't "ws". */
   | { kind: "notWebSocket" }
   | { kind: "invalidWsUrl"; message: string }
   | { kind: "invalidSocketIoAuth"; message: string }
   /** ws_connect: the Socket.IO auth payload uses an undefined variable (`message` = its name), e.g. `{{socketIoAuth}}` of a share. */
-  | { kind: "undefinedSocketIoAuthVariable"; message: string };
+  | { kind: "undefinedSocketIoAuthVariable"; message: string }
+  /** A grpc_* command or export_grpcurl got a request whose kind isn't "grpc". */
+  | { kind: "notGrpc" }
+  /** Another scheme than grpc / grpcs / http / https, or no host. */
+  | { kind: "invalidGrpcUrl"; message: string }
+  /** No service or method picked ("Pick a method"). */
+  | { kind: "noGrpcMethod" }
+  /** The picked method isn't in the services (`message` = "demo.Greeter/X isn't in the descriptor"). */
+  | { kind: "unknownGrpcMethod"; message: string }
+  /** A metadata name that isn't a header name or is reserved, or a `-bin` value that isn't base64. */
+  | { kind: "invalidGrpcMetadata"; message: string }
+  /** The message isn't JSON ("Invalid JSON at line L, col C: …") or doesn't fit the input type. */
+  | { kind: "invalidGrpcMessage"; message: string }
+  /** grpc_invoke on a method that streams (`callKind` ≠ "unary"): nothing was sent; connect to it instead (grpc_start). */
+  | { kind: "grpcStreamingMethod"; callKind: GrpcCallKind };
 
 export interface FormatErrorDetails {
   message: string;
@@ -572,6 +757,8 @@ export interface HistorySummary {
   sourceRequestId: string | null;
   /** WebSocket / Socket.IO sessions: duration and message counts (status and timeMs are null). */
   ws: WsSessionSummary | null;
+  /** gRPC calls (method "GRPC"): without response, headers, trailers and status details; status and timeMs are null. */
+  grpc: GrpcCallSummary | null;
 }
 
 export interface ResponseCookie {
@@ -1198,7 +1385,7 @@ export interface TransferPreview {
   items: number;
   /** Secret variables: never uploaded, each member sets their own value. */
   secretVariables: number;
-  /** Binary bodies and form files whose paths stay on this device. */
+  /** Binary bodies, form files and gRPC .proto files / import paths: paths that stay on this device. */
   filePaths: number;
   credentials: CredentialRow[];
   /** Copy mode: variables the target project's environments don't define. */
@@ -1287,6 +1474,101 @@ export interface WsFrame {
   truncated?: boolean;
   /** The final system "close": nothing follows on this connection (history is written). */
   last?: boolean;
+}
+
+// ───────────────────────────── gRPC (AC-GRPC-*) ─────────────────────────────
+
+export type GrpcFrameKind =
+  /** in / out: one message; `data` = its JSON (every field for received ones). */
+  | "message"
+  /** in: response headers; `data` = "name: value" lines. */
+  | "headers"
+  /** in: trailers; `data` = "name: value" lines. */
+  | "trailers"
+  /** out: the sending side was closed (End stream, or automatically for unary / server streaming). */
+  | "end"
+  /** system: the final status; `code`, `data` = "OK" or "NOT_FOUND: message", `details`. */
+  | "status"
+  /** system: connected (`data` = e.g. "Connected to grpcs://host:443 · demo.Greeter/Chat (bidi streaming)"). */
+  | "open"
+  | "error"
+  | "info"
+  /** system, always last (`last: true`): "Finished · 0 OK", "Failed · 14 UNAVAILABLE", "Connection failed", "Cancelled". */
+  | "close";
+
+/** One message-log entry of a gRPC stream (grpc_start's channel), delivered in order. Same shape as WsFrame. */
+export interface GrpcFrame {
+  dir: "in" | "out" | "system";
+  /** Unix epoch ms. */
+  ts: number;
+  kind: GrpcFrameKind;
+  data: string;
+  /** Encoded message bytes for messages; 0 otherwise. */
+  size: number;
+  /** status / close: the gRPC status code. */
+  code?: number;
+  /** status: decoded status details. */
+  details?: GrpcStatusDetail[];
+  /** `data` was cut at 256 KB (`size` is the whole message). */
+  truncated?: boolean;
+  /** The final system "close": nothing follows on this call (history is written). */
+  last?: boolean;
+}
+
+export interface GrpcRequestArgs {
+  /** The request as edited (kind "grpc"). Never auto-saved. */
+  request: Request;
+  projectId?: string | null;
+}
+
+/** grpc_cached_descriptor result. */
+export interface GrpcDescriptorLookup {
+  /** The request's descriptor URL (cache key). */
+  url: string;
+  /** The cached descriptor is the `known` one: `descriptor` is left out. */
+  unchanged: boolean;
+  descriptor: GrpcDescriptor | null;
+}
+
+export interface GrpcInvokeArgs extends GrpcRequestArgs {
+  /** Client-generated id: cancel_request(executionId) cancels the call. */
+  executionId: string;
+}
+
+export interface GrpcInvokeResult {
+  executionId: string;
+  historyId: string;
+  callKind: GrpcCallKind;
+  /** e.g. "grpcs://api.example.com:443/demo.Greeter/SayHello" (secret values shown as {{name}}). */
+  resolvedUrl: string;
+  unresolvedVariables: string[];
+  /** The call got a status (any code). Exactly one of status / error is non-null. */
+  status: GrpcStatus | null;
+  /** DNS, connect, TLS, timeout (connecting) or cancelled. */
+  error: SendError | null;
+  /** The response message as pretty JSON (every field); null without one. */
+  response: string | null;
+  /** Names lowercase, received order. */
+  headers: [string, string][];
+  trailers: [string, string][];
+  timeMs: number;
+  /** Encoded response message bytes. */
+  sizeBytes: number;
+}
+
+export interface GrpcStartArgs extends GrpcRequestArgs {
+  /** Client-generated id; re-using one cancels the previous call. */
+  connectionId: string;
+  onEvent: EventChannel<GrpcFrame>;
+}
+
+export interface GrpcStartResult {
+  connectionId: string;
+  /** History entry written when the call ends (after the `last` frame). */
+  historyId: string;
+  callKind: GrpcCallKind;
+  resolvedUrl: string;
+  unresolvedVariables: string[];
 }
 
 export interface WsConnectArgs {
@@ -1396,6 +1678,29 @@ export interface Commands {
   cancel_request: { args: { executionId: string }; result: boolean };
 
   /**
+   * AC-GRPC-3/4: the services without a network call. Reflection: the cached descriptor for the request's origin
+   * (null when none); files: compiles the .proto files (rejects with grpc_proto_invalid). `known` = the one shown.
+   */
+  grpc_cached_descriptor: { args: GrpcRequestArgs & { known?: { url: string; fetchedAt: number } | null }; result: GrpcDescriptorLookup };
+  /**
+   * Reflection: asks the server (v1, then v1alpha), validates and caches the result; files: compiles them.
+   * Cancellable with cancel_request(executionId); not in history. Rejects with validation / read_only_newer or the grpc_* codes.
+   */
+  grpc_fetch_descriptor: { args: GrpcRequestArgs & { executionId?: string | null }; result: GrpcDescriptor };
+  /** Forget the cached reflection result of the request's origin; true when there was one. */
+  grpc_clear_descriptor: { args: GrpcRequestArgs; result: boolean };
+  /** AC-GRPC-7: one unary call (any call kind works: streams are reduced to one message each way). cancel_request(executionId) cancels it. */
+  grpc_invoke: { args: GrpcInvokeArgs; result: GrpcInvokeResult };
+  /** AC-GRPC-8: start a call; frames arrive on `onEvent`. Server streaming (and unary) send `grpc.message` and end at once. */
+  grpc_start: { args: GrpcStartArgs; result: GrpcStartResult };
+  /** Send one message (JSON text; variables resolve, fresh {{$…}}). Rejects with grpc_not_connected / grpc_invalid_message. */
+  grpc_send: { args: { connectionId: string; message: string }; result: null };
+  /** Close the sending side (half-close). False when nothing is open. */
+  grpc_end: { args: { connectionId: string }; result: boolean };
+  /** Cancel the call (CANCELLED). False when nothing is open. */
+  grpc_cancel: { args: { connectionId: string }; result: boolean };
+
+  /**
    * AC-GQL-2..4: POST the introspection query with the request's URL, params, headers, auth, settings and variables;
    * cache the schema for the schema URL unless `store` is false (the UI passes false, builds it, then calls
    * graphql_store_schema). Not recorded in history. `executionId` makes it cancellable with cancel_request.
@@ -1418,6 +1723,8 @@ export interface Commands {
 
   format_body: { args: { kind: "json" | "xml"; text: string }; result: string };
   url_to_params: { args: { url: string; params: KeyValue[] }; result: KeyValue[] };
+  /** AC-GRPC-11: a grpcurl command for a gRPC request (validation `notGrpc` for others). */
+  export_grpcurl: { args: { request: Request; projectId?: string | null; keepVariables: boolean }; result: string };
   params_to_url: { args: { url: string; params: KeyValue[] }; result: string };
 
   import_curl: { args: { text: string }; result: CurlImport };

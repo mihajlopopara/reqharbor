@@ -277,6 +277,7 @@ async fn ac_sync_3_two_devices_converge_and_only_entities_sync() {
             response: None,
             error: None,
             ws: None,
+            grpc: None,
         })
         .unwrap();
     let rep = sync_now(&mut a).await;

@@ -290,6 +290,7 @@ pub fn history_entry(
             message: e.message.replace(&prepared.url, &prepared.display_url),
         }),
         ws: None,
+        grpc: None,
     };
     redactor.redact_struct(&entry)
 }

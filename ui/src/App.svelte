@@ -17,6 +17,7 @@
   import ConfirmDialog from "./lib/dialogs/ConfirmDialog.svelte";
   import EnvPicker from "./lib/dialogs/EnvPicker.svelte";
   import SyncPrompts from "./lib/components/SyncPrompts.svelte";
+  import { loadGrpcUi } from "./lib/components/grpc/load";
 
   // Rarely used dialogs are code-split.
   const ImportDialog = () => import("./lib/dialogs/ImportDialog.svelte");
@@ -253,6 +254,10 @@
       <div class="right" data-pane="response">
         {#if app.middle.kind === "request" && app.request.kind === "ws"}
           <WsLog {stacked} ontogglelayout={toggleLayout} />
+        {:else if app.middle.kind === "request" && app.request.kind === "grpc"}
+          {#await loadGrpcUi() then m}
+            <m.GrpcResponse {stacked} ontogglelayout={toggleLayout} />
+          {/await}
         {:else}
           <ResponsePane {stacked} ontogglelayout={toggleLayout} />
         {/if}

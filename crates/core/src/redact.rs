@@ -81,6 +81,11 @@ impl Redactor {
     }
 
     /// Redact a serializable value by round-tripping it through JSON.
+    ///
+    /// Fails closed: when masking every string makes the value unreadable
+    /// (a secret that is a substring of an enum literal such as "system"),
+    /// the strings are masked one at a time and only those whose masking
+    /// breaks the value keep their text (they are enum literals, not data).
     pub fn redact_struct<T: serde::Serialize + serde::de::DeserializeOwned + Clone>(
         &self,
         value: &T,
@@ -88,16 +93,80 @@ impl Redactor {
         if self.is_empty() {
             return value.clone();
         }
-        let Ok(mut v) = serde_json::to_value(value) else {
+        let Ok(orig) = serde_json::to_value(value) else {
             return value.clone();
         };
-        self.redact_json(&mut v);
-        serde_json::from_value(v).unwrap_or_else(|_| value.clone())
+        let mut all = orig.clone();
+        self.redact_json(&mut all);
+        if let Ok(v) = serde_json::from_value(all) {
+            return v;
+        }
+        let mut leaves = Vec::new();
+        self.leaves(&orig, String::new(), &mut leaves);
+        let mut cur = orig;
+        for (ptr, masked) in leaves {
+            let Some(slot) = cur.pointer_mut(&ptr) else {
+                continue;
+            };
+            let before = std::mem::replace(slot, Value::String(masked));
+            if serde_json::from_value::<T>(cur.clone()).is_err() {
+                *cur.pointer_mut(&ptr).unwrap() = before;
+            }
+        }
+        serde_json::from_value(cur).unwrap_or_else(|_| value.clone())
+    }
+
+    /// (JSON pointer, masked text) of every string that holds a secret.
+    fn leaves(&self, v: &Value, ptr: String, out: &mut Vec<(String, String)>) {
+        match v {
+            Value::String(s) => {
+                if self.pairs.iter().any(|(n, _)| s.contains(n.as_str())) {
+                    out.push((ptr, self.redact(s)));
+                }
+            }
+            Value::Array(items) => {
+                for (i, x) in items.iter().enumerate() {
+                    self.leaves(x, format!("{ptr}/{i}"), out);
+                }
+            }
+            Value::Object(map) => {
+                for (k, x) in map {
+                    let k = k.replace('~', "~0").replace('/', "~1");
+                    self.leaves(x, format!("{ptr}/{k}"), out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redact_struct_fails_closed_when_a_secret_is_inside_an_enum_literal() {
+        #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        #[serde(rename_all = "lowercase")]
+        enum Dir {
+            System,
+            Out,
+        }
+        #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct F {
+            dir: Dir,
+            data: String,
+        }
+        let mut r = Redactor::default();
+        r.add("w", "stem");
+        let f = F {
+            dir: Dir::System,
+            data: "Couldn't resolve stem.example.dev".into(),
+        };
+        let out = r.redact_struct(&f);
+        assert_eq!(out.dir, Dir::System);
+        assert_eq!(out.data, "Couldn't resolve {{w}}.example.dev");
+        assert_ne!(out.dir, Dir::Out);
+    }
+
     use super::*;
     use crate::model::{Environment, Variable};
 

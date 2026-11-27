@@ -2229,6 +2229,25 @@ pub fn merge_request_extra(target: &mut Request, stored: &Request) {
         }
         _ => {}
     }
+    match (target.grpc.as_mut(), stored.grpc.as_ref()) {
+        // Same for `grpc` (AC-GRPC-1).
+        (None, Some(s)) => target.grpc = Some(s.clone()),
+        (Some(t), Some(s)) => {
+            merge_extra(&mut t.extra, &s.extra);
+            merge_list_extra(&mut t.messages, &s.messages, gmsg_key, gmsg_mut, gmsg_ref);
+        }
+        _ => {}
+    }
+}
+
+fn gmsg_key(m: &crate::model::GrpcSavedMessage) -> &str {
+    &m.name
+}
+fn gmsg_mut(m: &mut crate::model::GrpcSavedMessage) -> &mut Extra {
+    &mut m.extra
+}
+fn gmsg_ref(m: &crate::model::GrpcSavedMessage) -> &Extra {
+    &m.extra
 }
 
 fn msg_key(m: &SavedMessage) -> &str {

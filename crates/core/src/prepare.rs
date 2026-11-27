@@ -54,8 +54,9 @@ pub enum PrepareError {
     /// newer ReqHarbor (an unknown scheme): it can't be applied here.
     #[error("The collection's auth needs a newer version of ReqHarbor")]
     InheritedAuthNeedsNewerVersion,
-    /// A WebSocket request reached an HTTP-only path (send, cURL export).
-    #[error("This is a WebSocket request: connect to it instead")]
+    /// A WebSocket or gRPC request reached an HTTP-only path (send, cURL
+    /// export, GraphQL schema).
+    #[error("This is a WebSocket or gRPC request: connect to it or invoke it instead")]
     NotHttp,
     /// An HTTP request reached `ws_connect`.
     #[error("This is not a WebSocket request")]
@@ -69,6 +70,22 @@ pub enum PrepareError {
     /// credentials). Carries the variable name.
     #[error("Define {{{{{0}}}}} (the shared Socket.IO auth payload) in your environment")]
     UndefinedSocketIoAuthVariable(String),
+    /// A non-gRPC request reached a gRPC command (AC-GRPC-*).
+    #[error("This is not a gRPC request")]
+    NotGrpc,
+    #[error("Invalid gRPC URL: {0}")]
+    InvalidGrpcUrl(String),
+    /// No service or method picked.
+    #[error("Pick a method")]
+    NoGrpcMethod,
+    /// The picked method isn't in the services.
+    #[error("{0}")]
+    UnknownGrpcMethod(String),
+    #[error("{0}")]
+    InvalidGrpcMetadata(String),
+    /// Invalid JSON, or JSON that doesn't fit the input type.
+    #[error("{0}")]
+    InvalidGrpcMessage(String),
 }
 
 /// The default Content-Type implied by a body type (AC-REQ-4). Multipart's

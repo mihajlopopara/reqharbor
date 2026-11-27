@@ -38,7 +38,9 @@ describe("version helpers (mirror core requires_newer_client)", () => {
     const r = scratchRequest();
     expect(isReadOnlyNewer(r, "0.1.0")).toBe(false);
     expect(isReadOnlyNewer({ ...r, kind: "http" }, "0.1.0")).toBe(false);
-    for (const kind of ["graphql", "grpc", "socketio"]) expect(isReadOnlyNewer({ ...r, kind }, "0.1.0")).toBe(true);
+    for (const kind of ["graphql", "mqtt", "socketio"]) expect(isReadOnlyNewer({ ...r, kind }, "0.1.0")).toBe(true);
+    // gRPC requests are editable in this build (AC-GRPC-1).
+    expect(isReadOnlyNewer({ ...r, kind: "grpc" }, "0.1.0")).toBe(false);
     // AC-WS-1: WebSocket requests are editable here, unless a part of them comes from a newer build.
     expect(isReadOnlyNewer({ ...r, kind: "ws" }, "0.1.0")).toBe(false);
     expect(isReadOnlyNewer({ ...r, kind: "ws", ws: { messages: [{ name: "m", kind: "cbor", body: "" }], protocols: [], autoReconnect: false } }, "0.1.0")).toBe(true);
@@ -46,7 +48,7 @@ describe("version helpers (mirror core requires_newer_client)", () => {
     expect(isReadOnlyNewer({ ...r, body: { type: "protobuf" } }, "0.1.0")).toBe(true);
     expect(isReadOnlyNewer({ ...r, minClientVersion: "9.0.0" }, "0.1.0")).toBe(true);
     expect(isReadOnlyNewer({ ...r, minClientVersion: "0.1.0" }, "0.1.0")).toBe(false);
-    expect(newerKindLabel({ kind: "grpc" })).toBe("GRPC");
+    expect(newerKindLabel({ kind: "mqtt" })).toBe("MQTT");
     expect(newerKindLabel({ kind: "graphql" })).toBe("GQL");
     expect(newerKindLabel({ kind: "websocket" })).toBe("WEBS");
     expect(newerKindLabel({})).toBe("NEW");
@@ -66,7 +68,7 @@ describe("version helpers (mirror core requires_newer_client)", () => {
   it("gives the right reason for each case, including minClientVersion only", () => {
     const r = scratchRequest();
     expect(readOnlyReason(r, "0.1.0")).toBeNull();
-    expect(readOnlyReason({ ...r, kind: "grpc" }, "0.1.0")).toBe("This is a “grpc” request");
+    expect(readOnlyReason({ ...r, kind: "mqtt" }, "0.1.0")).toBe("This is a “mqtt” request");
     expect(readOnlyReason({ ...r, body: { type: "protobuf" } }, "0.1.0")).toBe("Its body is “protobuf”");
     expect(readOnlyReason({ ...r, auth: { type: "oauth2" } }, "0.1.0")).toBe("Its auth is “oauth2”");
     // A newer minClientVersion with an ordinary (non-"none") body names the version, not the body.
@@ -78,7 +80,7 @@ describe("version helpers (mirror core requires_newer_client)", () => {
 describe("mock backend parity", () => {
   const server = new MockServer({ latency: 0, platform: "linux", newer: true });
   const call = makeCall((cmd, args) => server.invoke(cmd, args));
-  const grpc = () => server.requests.find((r) => r.kind === "grpc")!;
+  const grpc = () => server.requests.find((r) => r.kind === "mqtt")!;
   const proto = () => server.requests.find((r) => r.body.type === "protobuf")!;
 
   it("reports the app version and seeds newer requests with ?newer=1", async () => {
@@ -177,7 +179,7 @@ describe("mock backend parity", () => {
 describe("mock backend: containers never rewrite read-only requests (core parity)", () => {
   const server = new MockServer({ latency: 0, platform: "linux", newer: true });
   const call = makeCall((cmd, args) => server.invoke(cmd, args));
-  const grpc = () => server.requests.find((r) => r.kind === "grpc")!;
+  const grpc = () => server.requests.find((r) => r.kind === "mqtt")!;
   const proto = () => server.requests.find((r) => r.body.type === "protobuf")!;
   const users = () => server.collections.find((c) => c.id === grpc().collectionId)!;
   const other = () => server.collections.find((c) => c.projectId === users().projectId && c.id !== users().id)!;
@@ -279,12 +281,12 @@ describe("app store: view-only requests (AC-FWD-3)", () => {
 
   it("opens a gRPC request read-only and never saves, sends or renames it", async () => {
     expect(app.appVersion).toBe(MOCK_APP_VERSION);
-    const g = app.tree!.requests.find((r) => r.kind === "grpc")!;
+    const g = app.tree!.requests.find((r) => r.kind === "mqtt")!;
     expect(app.isReadOnly(g.id)).toBe(true);
     app.openRequest(g.id);
     expect(app.readOnly).toBe(true);
     // Unknown keys of the opened request stay on the editor copy.
-    expect((app.request as Request & { grpc?: unknown }).grpc).toBeTruthy();
+    expect((app.request as Request & { mqtt?: unknown }).mqtt).toBeTruthy();
 
     calls.length = 0;
     toasts.items = [];
@@ -306,7 +308,7 @@ describe("app store: view-only requests (AC-FWD-3)", () => {
   });
 
   it("the saved copy decides: an editor copy that lost `kind` is still read-only", () => {
-    const g = app.tree!.requests.find((r) => r.kind === "grpc")!;
+    const g = app.tree!.requests.find((r) => r.kind === "mqtt")!;
     app.openRequest(g.id);
     delete (app.request as Partial<Request>).kind;
     expect(app.readOnly).toBe(true);
@@ -327,13 +329,13 @@ describe("app store: view-only requests (AC-FWD-3)", () => {
     // Another device running a newer ReqHarbor turns both into gRPC requests; the pull lands.
     for (const id of [target.id, other.id]) {
       const stored = server.requests.find((r) => r.id === id)!;
-      stored.kind = "grpc";
-      (stored as Request & { grpc?: unknown }).grpc = { service: "S", method: "M" };
+      stored.kind = "mqtt";
+      (stored as Request & { mqtt?: unknown }).mqtt = { topic: "t" };
     }
     toasts.items = [];
     server.emit("sync://changed", { pushed: 0, pulled: 2, deleted: 0, conflicts: [], skipped: [], tooLarge: [], unsupported: [], restored: false, cursor: 1 });
     await vi.waitFor(() => expect(app.readOnly).toBe(true));
-    expect(app.request.kind).toBe("grpc");
+    expect(app.request.kind).toBe("mqtt");
     expect(app.request.url).not.toContain("draft.example");
     expect(app.dirty).toBe(false);
     expect(app.drafts).toEqual({});
@@ -357,12 +359,12 @@ describe("app store: view-only requests (AC-FWD-3)", () => {
 describe("mock backend: shares without credentials never leak unknown fields (core share.rs parity)", () => {
   const server = new MockServer({ latency: 0, platform: "linux", newer: true });
   const call = makeCall((cmd, args) => server.invoke(cmd, args));
-  const grpc = () => server.requests.find((r) => r.kind === "grpc")!;
-  const colId = server.requests.find((r) => r.kind === "grpc")!.collectionId;
+  const grpc = () => server.requests.find((r) => r.kind === "mqtt")!;
+  const colId = server.requests.find((r) => r.kind === "mqtt")!.collectionId;
   const col = () => server.collections.find((c) => c.id === colId)!;
 
   it("refuses a collection or request share holding a newer request unless credentials are included", async () => {
-    (grpc() as Request & { grpc: Record<string, unknown> }).grpc.metadata = [{ key: "authorization", value: "Bearer grpc-s3cret" }];
+    (grpc() as Request & { mqtt: Record<string, unknown> }).mqtt.metadata = [{ key: "authorization", value: "Bearer grpc-s3cret" }];
     for (const [kind, entityId] of [["collection", col().id], ["request", grpc().id]] as const) {
       const e = await rejects(call("share_preview", { kind, entityId, includeCredentials: false, environmentId: null }));
       expect(e.code).toBe("read_only_newer");

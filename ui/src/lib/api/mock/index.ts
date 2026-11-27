@@ -22,6 +22,11 @@ import type {
   Events,
   Folder,
   GraphqlSchema,
+  ErrorKind,
+  GrpcCallKind,
+  GrpcCallSummary,
+  GrpcDescriptor,
+  GrpcStatus,
   HistoryEntry,
   HistorySummary,
   KeyValue,
@@ -60,6 +65,8 @@ import { seed, defaultSettings } from "./seed";
 import { importCurl, looksLikeCurl, exportCurl } from "./curl";
 import { convertSpec, reportOf } from "./openapi";
 import { MockChannel, MockWs, isMockChannel, toOutMessage } from "./ws";
+import { MockGrpc, connectError, demoDescriptor, grpcurl, hasMethod, messageProblem, metadataProblem, unaryAnswer } from "./grpc";
+import { CALL_KIND_LONG, findMethod, grpcTarget, type GrpcTarget } from "../../util/grpc";
 import { normalizeNamespace, stampMinClientVersion, wsUrl } from "../../util/ws";
 import {
   bodyKindOf,
@@ -110,13 +117,18 @@ export const WS_SHAPE: KeyShape = {
   objects: { socketIo: { known: ["path", "namespace", "version", "auth"] } },
   lists: { messages: { known: ["name", "kind", "body", "event", "ack"] } },
 };
+export const GRPC_SHAPE: KeyShape = {
+  known: ["service", "method", "message", "protoSource", "protoFiles", "importPaths", "messages"],
+  lists: { messages: { known: ["name", "body"] } },
+};
 export const REQUEST_SHAPE: KeyShape = {
-  known: ["id", "kind", "minClientVersion", "collectionId", "folderId", "name", "method", "url", "params", "headers", "auth", "body", "settings", "ws", "sortOrder", "createdAt", "updatedAt"],
-  // Like core: a UI that dropped `ws` (or the stamp) doesn't wipe it.
-  restore: ["minClientVersion", "ws"],
+  known: ["id", "kind", "minClientVersion", "collectionId", "folderId", "name", "method", "url", "params", "headers", "auth", "body", "settings", "ws", "grpc", "sortOrder", "createdAt", "updatedAt"],
+  // Like core: a UI that dropped `ws` / `grpc` (or the stamp) doesn't wipe it.
+  restore: ["minClientVersion", "ws", "grpc"],
   objects: {
     auth: AUTH_SHAPE,
     ws: WS_SHAPE,
+    grpc: GRPC_SHAPE,
     settings: { known: ["followRedirects", "timeoutMs", "verifyTls"] },
     body: {
       known: ["type", "text", "form", "formEncoded", "graphql", "binaryPath"],
@@ -261,13 +273,13 @@ export function newerRequests(collectionId: string, ts: number): Request[] {
     {
       ...base(),
       id: ulid(ts),
-      kind: "grpc",
+      kind: "mqtt",
       name: "Say hello",
       method: "POST",
-      url: "grpc://greeter.example.com:443",
+      url: "mqtts://broker.example.com:8883",
       body: { type: "none" },
       sortOrder: 90,
-      grpc: { service: "helloworld.Greeter", method: "SayHello", message: '{ "name": "Ada" }' },
+      mqtt: { topic: "greetings/hello", qos: 1, message: '{ "name": "Ada" }' },
     } as Request,
     {
       ...base(),
@@ -353,6 +365,11 @@ export class MockServer {
   /** WebSocket sessions (AC-WS-*): the echo / Socket.IO server and what each history entry needs. */
   ws: MockWs;
   private wsMeta = new Map<string, { request: Request; projectId: string | null; historyId: string; ts: number; displayUrl: string; method: "WS" | "SIO"; sio: boolean }>();
+  /** gRPC (AC-GRPC-*): the fake server, reflection results per origin, running calls. */
+  private grpcCalls: MockGrpc;
+  private grpcCache = new Map<string, GrpcDescriptor>();
+  private grpcDescriptors = new Map<string, GrpcDescriptor>();
+  private grpcMeta = new Map<string, { request: Request; projectId: string | null; historyId: string; ts: number; displayUrl: string; inputType: string }>();
   accounts: MockAccounts;
   spaces: MockSpaces;
   teams: MockTeams;
@@ -379,6 +396,25 @@ export class MockServer {
           resolvedUrl: m.displayUrl,
           method: m.method,
           ws: summary,
+        };
+        if (error) entry.error = error;
+        this.addHistory(entry, null);
+      },
+    });
+    this.grpcCalls = new MockGrpc({
+      latency: () => this.opts.latency ?? 1,
+      finished: (id, summary, error) => {
+        const m = this.grpcMeta.get(id);
+        if (!m) return;
+        this.grpcMeta.delete(id);
+        const entry: HistoryEntry = {
+          id: m.historyId,
+          timestamp: m.ts,
+          sourceRequestId: m.request.collectionId ? m.request.id : null,
+          request: m.request,
+          resolvedUrl: m.displayUrl,
+          method: "GRPC",
+          grpc: summary,
         };
         if (error) entry.error = error;
         this.addHistory(entry, null);
@@ -811,7 +847,7 @@ export class MockServer {
     if (isReadOnlyNewer(request, MOCK_APP_VERSION) || this.requests.some((r) => r.id === request.id && isReadOnlyNewer(r, MOCK_APP_VERSION))) {
       fail("read_only_newer", "This request needs a newer version of ReqHarbor");
     }
-    if (request.kind === "ws") fail("validation", "This is a WebSocket request: connect to it instead", { kind: "notHttp" });
+    if (request.kind === "ws" || request.kind === "grpc") fail("validation", "This is a WebSocket or gRPC request: connect to it or invoke it instead", { kind: "notHttp" });
     return projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
   }
 
@@ -918,7 +954,148 @@ export class MockServer {
       errorKind: h.error?.kind ?? null,
       sourceRequestId: h.sourceRequestId,
       ws: h.ws ?? null,
+      grpc: h.grpc ? (({ response: _r, responseTruncated: _t, headers: _h, trailers: _tr, ...g }) => ({ ...g, ...(g.status ? { status: { ...g.status, details: [] } } : {}) }))(h.grpc) : null,
     };
+  }
+
+  // ───────────── gRPC (mirrors core grpc::prepare_grpc, API_CONTRACT §3.16) ─────────────
+
+  private grpcPrepare(request: Request, projectId: string | null | undefined, requireMethod: boolean) {
+    if (isReadOnlyNewer(request, MOCK_APP_VERSION) || this.requests.some((r) => r.id === request.id && isReadOnlyNewer(r, MOCK_APP_VERSION))) {
+      fail("read_only_newer", "This request needs a newer version of ReqHarbor");
+    }
+    if (request.kind !== "grpc") fail("validation", "This is not a gRPC request", { kind: "notGrpc" });
+    if (!request.url.trim()) fail("validation", "URL is empty", { kind: "emptyUrl" });
+    const cfg = request.grpc ?? { service: "", method: "", message: "{}", protoSource: "reflection", protoFiles: [], importPaths: [], messages: [] };
+    if (requireMethod && (!cfg.service.trim() || !cfg.method.trim())) fail("validation", "Pick a method", { kind: "noGrpcMethod" });
+    const pid = projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
+    if (request.auth.type === "inherit" && !isKnownAuth(this.inheritedAuth(request))) {
+      fail("validation", "The collection's auth needs a newer version of ReqHarbor", { kind: "inheritedAuthNeedsNewerVersion" });
+    }
+    const dynamic = dynamicMemo();
+    const res = this.resolveRequest(request, pid, false, dynamic);
+    const disp = this.resolveRequest(request, pid, true, dynamic);
+    let target: GrpcTarget;
+    try {
+      target = grpcTarget(res.url);
+    } catch (e) {
+      const message = (e as Error).message;
+      return fail("validation", `Invalid gRPC URL: ${message}`, { kind: "invalidGrpcUrl", message });
+    }
+    let displayOrigin = target.origin;
+    try {
+      displayOrigin = grpcTarget(disp.url).origin;
+    } catch {
+      /* as resolved */
+    }
+    const metadata: [string, string][] = res.headers.map((h) => [h.key.trim().toLowerCase(), h.value]);
+    const has = (k: string) => metadata.some(([n]) => n === k);
+    if (!has("authorization")) {
+      if (res.auth.type === "basic") metadata.push(["authorization", `Basic ${btoa(`${res.auth.username ?? ""}:${res.auth.password ?? ""}`)}`]);
+      if (res.auth.type === "bearer") metadata.push(["authorization", `Bearer ${res.auth.token ?? ""}`]);
+    }
+    if (res.auth.type === "apikey" && res.auth.apiKey?.key) metadata.push([res.auth.apiKey.key.trim().toLowerCase(), res.auth.apiKey.value]);
+    for (const [k, v] of metadata) {
+      const problem = metadataProblem(k, v);
+      if (problem) fail("validation", problem, { kind: "invalidGrpcMetadata", message: problem });
+    }
+    const { resolve, unresolved } = this.resolver(pid, false, dynamic);
+    const message = resolve(cfg.message).trim() || "{}";
+    const protoFiles = cfg.protoFiles.map((x) => resolve(x.trim())).filter(Boolean);
+    const importPaths = cfg.importPaths.map((x) => resolve(x.trim())).filter(Boolean);
+    const service = cfg.service.trim();
+    const method = cfg.method.trim();
+    return {
+      pid: pid ?? null,
+      target,
+      displayOrigin,
+      displayUrl: `${displayOrigin}/${service}/${method}`,
+      metadata,
+      message,
+      service,
+      method,
+      files: cfg.protoSource === "files",
+      protoFiles,
+      importPaths,
+      unresolved: [...new Set([...res.unresolved, ...unresolved])],
+      timeoutMs: request.settings.timeoutMs,
+      verifyTls: request.settings.verifyTls,
+    };
+  }
+
+  /** Like grpcPrepare, with every {{variable}} left literal (Export "Keep {{variables}}"). */
+  private grpcPrepareLiteral(request: Request) {
+    if (request.kind !== "grpc") fail("validation", "This is not a gRPC request", { kind: "notGrpc" });
+    const cfg = request.grpc;
+    if (!cfg?.service.trim() || !cfg.method.trim()) fail("validation", "Pick a method", { kind: "noGrpcMethod" });
+    let target: GrpcTarget;
+    try {
+      target = grpcTarget(request.url);
+    } catch {
+      const t = request.url.trim().replace(/^[a-z]+:\/\//i, "").replace(/\/.*$/, "");
+      target = { tls: true, host: t, port: 443, origin: t, extra: false };
+    }
+    const metadata: [string, string][] = request.headers.filter((h) => h.enabled && h.key.trim()).map((h) => [h.key.trim().toLowerCase(), h.value]);
+    const a = request.auth;
+    if (!metadata.some(([k]) => k === "authorization")) {
+      if (a.type === "basic") metadata.push(["authorization", `Basic ${btoa(`${a.username ?? ""}:${a.password ?? ""}`)}`]);
+      if (a.type === "bearer") metadata.push(["authorization", `Bearer ${a.token ?? ""}`]);
+    }
+    if (a.type === "apikey" && a.apiKey?.key) metadata.push([a.apiKey.key.trim().toLowerCase(), a.apiKey.value]);
+    return {
+      target,
+      metadata,
+      message: cfg!.message.trim() || "{}",
+      service: cfg!.service.trim(),
+      method: cfg!.method.trim(),
+      files: cfg!.protoSource === "files",
+      protoFiles: cfg!.protoFiles,
+      importPaths: cfg!.importPaths,
+      timeoutMs: request.settings.timeoutMs,
+      verifyTls: request.settings.verifyTls,
+    };
+  }
+
+  /** Compiling the fake .proto files: any path ending in .proto works; one containing "invalid" doesn't. */
+  private grpcCompile(p: ReturnType<MockServer["grpcPrepare"]>): GrpcDescriptor | null {
+    if (!p.protoFiles.length) return null;
+    const bad = p.protoFiles.find((f) => f.includes("invalid") || !f.endsWith(".proto"));
+    if (bad) fail("grpc_proto_invalid", `${bad.split("/").pop()}:3:1: expected "syntax", "package", "import", "message", "enum" or "service"`);
+    return demoDescriptor(p.displayOrigin, this.now(), "files", p.protoFiles);
+  }
+
+  /** Reflection on the fake server: hosts containing "noreflection" have none. */
+  private async grpcReflect(p: ReturnType<MockServer["grpcPrepare"]>, signal?: AbortSignal): Promise<GrpcDescriptor> {
+    const err = connectError(p.target.host, p.target.port);
+    try {
+      await this.delay(120, signal);
+    } catch {
+      throw new MockError("grpc_network", "Cancelled", { kind: "cancelled" });
+    }
+    if (err) throw new MockError("grpc_network", err.message, { kind: err.kind });
+    if (p.target.host.includes("noreflection")) fail("grpc_reflection_unsupported", "This server doesn't support reflection. Use .proto files instead.");
+    const d = demoDescriptor(p.displayOrigin, this.now(), "reflection");
+    this.grpcCache.set(d.url, d);
+    return d;
+  }
+
+  /** grpc_start calls that are still reflecting: connectionId → abort. */
+  private grpcPending = new Map<string, AbortController>();
+
+  /** The services a call uses (compiled, cached, or reflected now). */
+  private async grpcCallDescriptor(p: ReturnType<MockServer["grpcPrepare"]>, signal?: AbortSignal): Promise<GrpcDescriptor> {
+    if (p.files) return this.grpcCompile(p) ?? fail("grpc_proto_invalid", "No .proto files: add them in the Proto tab");
+    const cached = this.grpcCache.get(p.displayOrigin);
+    if (cached && hasMethod(cached, p.service, p.method)) return cached;
+    return this.grpcReflect(p, signal);
+  }
+
+  private grpcCheck(d: GrpcDescriptor, p: ReturnType<MockServer["grpcPrepare"]>) {
+    const m = findMethod(d, p.service, p.method);
+    if (!m) return fail("validation", `${p.service}/${p.method} isn't in the descriptor`, { kind: "unknownGrpcMethod", message: `${p.service}/${p.method} isn't in the descriptor` });
+    const checked = messageProblem(d, m.inputType, p.message);
+    if ("problem" in checked) return fail("validation", checked.problem, { kind: "invalidGrpcMessage", message: checked.problem });
+    return { method: m, input: checked.input };
   }
 
   /** Where a share of this entity goes: its project's space (account mode) or token sync. */
@@ -963,6 +1140,11 @@ export class MockServer {
       if (sio?.auth?.trim()) {
         credentialFields++;
         if (replace) sio.auth = "{{socketIoAuth}}";
+      }
+      // Mirrors core sanitize_request: .proto paths are device-local, never shared (AC-GRPC-12).
+      if (c.grpc) {
+        c.grpc.protoFiles = [];
+        c.grpc.importPaths = [];
       }
       // The auth block is handled by scrubAuth (unknown schemes as a whole).
       const { auth, ...rest } = c;
@@ -1107,6 +1289,7 @@ export class MockServer {
     for (const r of reqs) {
       if (r.body.type === "binary" && r.body.binaryPath) out.push(`“${r.name}”: binary file path “${r.body.binaryPath}” was cleared — choose the file again`);
       for (const f of r.body.form ?? []) if (f.kind === "file" && f.value) out.push(`“${r.name}”: form file “${f.key}” (${f.value}) was cleared and disabled`);
+      if ((r.grpc?.protoFiles.length ?? 0) + (r.grpc?.importPaths.length ?? 0) > 0) out.push(`“${r.name}”: the shared .proto files and import paths were removed; choose the .proto files again (or use server reflection)`);
     }
     return out;
   }
@@ -1239,7 +1422,8 @@ export class MockServer {
   }
 
   private filePaths(r: Request): number {
-    return (r.body.binaryPath?.trim() ? 1 : 0) + (r.body.form ?? []).filter((f) => f.kind === "file" && f.value.trim()).length;
+    const grpcPaths = [...(r.grpc?.protoFiles ?? []), ...(r.grpc?.importPaths ?? [])].filter((x) => x.trim()).length;
+    return (r.body.binaryPath?.trim() ? 1 : 0) + (r.body.form ?? []).filter((f) => f.kind === "file" && f.value.trim()).length + grpcPaths;
   }
 
   /** Mirrors core `move_check` + `move_preview`. */
@@ -1763,7 +1947,7 @@ export class MockServer {
       if (isReadOnlyNewer(request, MOCK_APP_VERSION) || this.requests.some((r) => r.id === request.id && isReadOnlyNewer(r, MOCK_APP_VERSION))) {
         fail("read_only_newer", "This request needs a newer version of ReqHarbor");
       }
-      if (request.kind === "ws") fail("validation", "This is a WebSocket request: connect to it instead", { kind: "notHttp" });
+      if (request.kind === "ws" || request.kind === "grpc") fail("validation", "This is a WebSocket or gRPC request: connect to it or invoke it instead", { kind: "notHttp" });
       const pid = projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
       const { prepared, displayUrl, unresolved } = this.prepare(request, pid);
       const ctrl = new AbortController();
@@ -1883,6 +2067,164 @@ export class MockServer {
       if (new TextEncoder().encode(reason ?? "").length > 123) fail("invalid", "The close reason can be at most 123 bytes");
       return this.ws.close(connectionId, code ?? null, reason ?? "");
     },
+    grpc_cached_descriptor: async ({ request, projectId, known }) => {
+      const p = this.grpcPrepare(request, projectId, false);
+      if (p.files) return { url: p.displayOrigin, unchanged: false, descriptor: this.grpcCompile(p) };
+      const d = this.grpcCache.get(p.displayOrigin);
+      const unchanged = !!d && !!known && known.url === d.url && known.fetchedAt === d.fetchedAt;
+      return { url: p.displayOrigin, unchanged, descriptor: d && !unchanged ? clone(d) : null };
+    },
+    grpc_fetch_descriptor: async ({ request, projectId, executionId }) => {
+      const p = this.grpcPrepare(request, projectId, false);
+      if (p.files) return this.grpcCompile(p) ?? fail("grpc_proto_invalid", "No .proto files: add them in the Proto tab");
+      const ctrl = new AbortController();
+      const id = executionId ?? ulid();
+      this.inflight.set(id, ctrl);
+      try {
+        return clone(await this.grpcReflect(p, ctrl.signal));
+      } finally {
+        this.inflight.delete(id);
+      }
+    },
+    grpc_clear_descriptor: ({ request, projectId }) => {
+      const p = this.grpcPrepare(request, projectId, false);
+      return this.grpcCache.delete(p.displayOrigin);
+    },
+    grpc_invoke: async ({ executionId, request, projectId }) => {
+      const p = this.grpcPrepare(request, projectId, true);
+      const ctrl = new AbortController();
+      this.inflight.set(executionId, ctrl);
+      const ts = this.now();
+      const started = Date.now();
+      let error: SendError | null = null;
+      let status: GrpcStatus | null = null;
+      let response: string | null = null;
+      let callKind: GrpcCallKind = "unary";
+      try {
+        let d: GrpcDescriptor;
+        try {
+          d = await this.grpcCallDescriptor(p, ctrl.signal);
+        } catch (e) {
+          if (e instanceof MockError && e.code === "grpc_network") {
+            error = { kind: ((e.details as { kind?: ErrorKind } | undefined)?.kind ?? "other") as ErrorKind, message: e.message };
+            d = null as never;
+          } else throw e;
+        }
+        if (!error) {
+          // A streaming method never runs as a one-shot invoke (the core rejects it before sending).
+          const streams = findMethod(d, p.service, p.method);
+          if (streams && streams.callKind !== "unary") {
+            fail("validation", `This is a ${CALL_KIND_LONG[streams.callKind]} method: connect to it instead of invoking it`, { kind: "grpcStreamingMethod", callKind: streams.callKind });
+          }
+          const { method, input } = this.grpcCheck(d, p);
+          callKind = method.callKind;
+          const err = connectError(p.target.host, p.target.port);
+          try {
+            await this.delay(80, ctrl.signal);
+            if (err) error = err;
+            else {
+              const ans = unaryAnswer(p.service, p.method, input);
+              status = ans.status;
+              response = ans.response;
+            }
+          } catch {
+            error = { kind: "cancelled", message: "Cancelled" };
+          }
+        }
+      } finally {
+        this.inflight.delete(executionId);
+      }
+      const headers: [string, string][] = status ? [["content-type", "application/grpc"], ["x-mock-server", "reqharbor"]] : [];
+      const trailers: [string, string][] = status ? [["x-request-cost", "1"]] : [];
+      const sizeBytes = response ? new TextEncoder().encode(JSON.stringify(JSON.parse(response))).length : 0;
+      const timeMs = Date.now() - started;
+      const historyId = ulid(ts);
+      const summary: GrpcCallSummary = { service: p.service, method: p.method, callKind, durationMs: timeMs, sent: status ? 1 : 0, received: response ? 1 : 0 };
+      if (status) {
+        summary.status = status;
+        summary.headers = headers;
+        summary.trailers = trailers;
+        if (response) summary.response = response;
+      }
+      const entry: HistoryEntry = {
+        id: historyId,
+        timestamp: ts,
+        sourceRequestId: request.collectionId ? request.id : null,
+        request: clone(request),
+        resolvedUrl: p.displayUrl,
+        method: "GRPC",
+        grpc: summary,
+      };
+      if (error) entry.error = error;
+      this.addHistory(entry, null);
+      return { executionId, historyId, callKind, resolvedUrl: p.displayUrl, unresolvedVariables: p.unresolved, status, error: status ? null : error, response, headers, trailers, timeMs, sizeBytes };
+    },
+    grpc_start: async ({ connectionId, request, projectId, onEvent }) => {
+      const p = this.grpcPrepare(request, projectId, true);
+      // Cancellable while it reflects, like the core (`grpc_cancel` reaches a call that isn't registered yet).
+      const pending = new AbortController();
+      this.grpcPending.set(connectionId, pending);
+      let d: GrpcDescriptor;
+      try {
+        d = await this.grpcCallDescriptor(p, pending.signal);
+      } finally {
+        if (this.grpcPending.get(connectionId) === pending) this.grpcPending.delete(connectionId);
+      }
+      if (pending.signal.aborted) throw new MockError("grpc_network", "Cancelled", { kind: "cancelled" });
+      const m = findMethod(d, p.service, p.method) ?? fail("validation", `${p.service}/${p.method} isn't in the descriptor`, { kind: "unknownGrpcMethod", message: `${p.service}/${p.method} isn't in the descriptor` });
+      let input: Record<string, unknown> = {};
+      if (m.callKind === "unary" || m.callKind === "serverStreaming") input = this.grpcCheck(d, p).input;
+      const ts = this.now();
+      const historyId = ulid(ts);
+      this.grpcMeta.set(connectionId, { request: clone(request), projectId: p.pid, historyId, ts, displayUrl: p.displayUrl, inputType: m.inputType });
+      this.grpcDescriptors.set(connectionId, d);
+      this.grpcCalls.start(
+        connectionId,
+        { service: p.service, method: p.method, kind: m.callKind, origin: p.target.origin, host: p.target.host, port: p.target.port, first: p.message, input },
+        onEvent,
+      );
+      return { connectionId, historyId, callKind: m.callKind, resolvedUrl: p.displayUrl, unresolvedVariables: p.unresolved };
+    },
+    grpc_send: ({ connectionId, message }) => {
+      const meta = this.grpcMeta.get(connectionId);
+      const d = this.grpcDescriptors.get(connectionId);
+      if (!meta || !d || !this.grpcCalls.calls.has(connectionId)) return fail("grpc_not_connected", "Not connected");
+      const { resolve } = this.resolver(meta.projectId, false);
+      const checked = messageProblem(d, meta.inputType, resolve(message));
+      if ("problem" in checked) return fail("grpc_invalid_message", checked.problem);
+      try {
+        this.grpcCalls.send(connectionId, JSON.stringify(checked.input, null, 2));
+        return null;
+      } catch (e) {
+        return fail("grpc_not_connected", (e as Error).message);
+      }
+    },
+    grpc_end: ({ connectionId }) => this.grpcCalls.end(connectionId),
+    grpc_cancel: ({ connectionId }) => {
+      const pending = this.grpcPending.get(connectionId);
+      if (pending) {
+        pending.abort();
+        return true;
+      }
+      return this.grpcCalls.cancel(connectionId);
+    },
+    export_grpcurl: ({ request, projectId, keepVariables }) => {
+      const p = keepVariables ? this.grpcPrepareLiteral(request) : this.grpcPrepare(request, projectId, true);
+      return grpcurl({
+        tls: p.target.tls,
+        verifyTls: p.verifyTls,
+        metadata: p.metadata,
+        protoFiles: p.protoFiles,
+        importPaths: p.importPaths,
+        files: p.files,
+        message: p.message,
+        timeoutMs: p.timeoutMs,
+        host: p.target.host,
+        port: p.target.port,
+        service: p.service,
+        method: p.method,
+      });
+    },
     graphql_fetch_schema: async ({ request, projectId, executionId, store }) => {
       const { url, pid, g } = await this.graphqlSchemaUrl(request, projectId);
       const { prepared } = this.prepare(g.introspectionRequest(request), pid);
@@ -1982,7 +2324,7 @@ export class MockServer {
     looks_like_curl: ({ text }) => looksLikeCurl(text),
     export_curl: ({ request, projectId, keepVariables }) => {
       if (isReadOnlyNewer(request, MOCK_APP_VERSION)) fail("read_only_newer", "This request needs a newer version of ReqHarbor");
-      if (request.kind === "ws") fail("validation", "This is a WebSocket request: connect to it instead", { kind: "notHttp" });
+      if (request.kind === "ws" || request.kind === "grpc") fail("validation", "This is a WebSocket or gRPC request: connect to it or invoke it instead", { kind: "notHttp" });
       if (keepVariables) return exportCurl(request, true, this.inheritedAuth(request));
       const pid = projectId ?? (request.collectionId ? this.collections.find((c) => c.id === request.collectionId)?.projectId : null) ?? this.settings.activeProjectId;
       const dynamic = dynamicMemo();
@@ -2379,6 +2721,10 @@ export class MockServer {
       const warnings = this.shareFileWarnings(snap);
       const clean = (r: Request): Request => {
         if (r.body.type === "binary") r.body.binaryPath = "";
+        if (r.grpc) {
+          r.grpc.protoFiles = [];
+          r.grpc.importPaths = [];
+        }
         for (const f of r.body.form ?? []) if (f.kind === "file") {
           f.value = "";
           f.enabled = false;

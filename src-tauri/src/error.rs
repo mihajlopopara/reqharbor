@@ -85,6 +85,42 @@ impl From<GraphqlError> for CommandError {
     }
 }
 
+impl From<reqharbor_core::grpc::GrpcError> for CommandError {
+    fn from(e: reqharbor_core::grpc::GrpcError) -> Self {
+        use reqharbor_core::grpc::GrpcError;
+        let message = e.to_string();
+        let (code, details) = match e {
+            GrpcError::Prepare(p) => return p.into(),
+            GrpcError::Network(s) => ("grpc_network", serde_json::json!({ "kind": s.kind })),
+            GrpcError::ReflectionUnsupported => {
+                ("grpc_reflection_unsupported", serde_json::Value::Null)
+            }
+            GrpcError::ReflectionFailed { status, .. } => (
+                "grpc_reflection_failed",
+                status.map_or(
+                    serde_json::Value::Null,
+                    |(code, name)| serde_json::json!({ "code": code, "name": name }),
+                ),
+            ),
+            GrpcError::ProtoInvalid(_) => ("grpc_proto_invalid", serde_json::Value::Null),
+            GrpcError::TooLarge(size) => (
+                "grpc_descriptor_too_large",
+                serde_json::json!({ "sizeBytes": size }),
+            ),
+            GrpcError::Io(_) => ("io", serde_json::Value::Null),
+            GrpcError::StreamingMethod(kind) => (
+                "validation",
+                serde_json::json!({ "kind": "grpcStreamingMethod", "callKind": kind }),
+            ),
+        };
+        let mut err = CommandError::new(code, message);
+        if !details.is_null() {
+            err.details = Some(details);
+        }
+        err
+    }
+}
+
 impl From<CurlError> for CommandError {
     fn from(e: CurlError) -> Self {
         let code = match e {

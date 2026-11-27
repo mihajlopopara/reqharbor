@@ -8,9 +8,10 @@ export interface TreeRow {
   collectionId: string;
   /** For folders: parent folder; for requests: containing folder. */
   parentFolderId: string | null;
-  /** HTTP method, or "WS" / "SIO" for WebSocket requests (then `ws` is true). */
+  /** HTTP method, "WS" / "SIO" for WebSocket requests (then `ws` is true), "gRPC" for gRPC ones (`grpc` true). */
   method?: string;
   ws?: boolean;
+  grpc?: boolean;
   url?: string;
   count?: number;
   hasChildren: boolean;
@@ -122,8 +123,9 @@ export function flattenTree(ix: TreeIndex, expanded: ReadonlySet<string>, filter
         name: r.name,
         collectionId,
         parentFolderId: folderId,
-        method: r.kind === "ws" ? (r.ws?.socketIo ? "SIO" : "WS") : r.method,
+        method: r.kind === "ws" ? (r.ws?.socketIo ? "SIO" : "WS") : r.kind === "grpc" ? "gRPC" : r.method,
         ws: r.kind === "ws",
+        grpc: r.kind === "grpc",
         url: r.url,
         hasChildren: false,
         expanded: false,

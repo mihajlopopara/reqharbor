@@ -123,7 +123,7 @@
           }}
           onkeydown={() => {}}
         >
-          <span class="m {h.ws ? 'm-ws' : methodClass(h.method)}" title={h.ws ? (h.method === "SIO" ? "Socket.IO session" : "WebSocket session") : h.method}><Hl text={methodLabel(h.method)} query={filter} /></span>
+          <span class="m {h.ws ? 'm-ws' : h.grpc ? 'm-grpc' : methodClass(h.method)}" title={h.ws ? (h.method === "SIO" ? "Socket.IO session" : "WebSocket session") : h.grpc ? "gRPC call" : h.method}><Hl text={h.grpc ? "gRPC" : methodLabel(h.method)} query={filter} /></span>
           <span class="hurl"
             ><span class="host"><Hl text={hp.host} query={filter} /></span>{#if hp.path}<span class="path"><Hl text={hp.path} query={filter} /></span>{/if}</span
           >
@@ -131,12 +131,19 @@
             <span>{relativeTime(h.timestamp, app.now)}</span>
             {#if h.ws}
               <span class="code-chip ws-counts" title="{h.ws.sent} sent · {h.ws.received} received" data-testid="history-ws">↑{h.ws.sent} ↓{h.ws.received}</span>
+            {:else if h.grpc}
+              {#if h.grpc.callKind !== "unary"}<span class="code-chip ws-counts" title="{h.grpc.sent} sent · {h.grpc.received} received">↑{h.grpc.sent} ↓{h.grpc.received}</span>{/if}
+              {#if h.grpc.status}
+                <span class="code-chip {h.grpc.status.code === 0 ? 's2' : 'serr'}" title={h.grpc.status.message || h.grpc.status.name} data-testid="history-grpc-status"><Hl text={h.grpc.status.name} query={filter} /></span>
+              {:else if h.errorKind}
+                <span class="code-chip {h.errorKind === 'cancelled' ? 'scan' : 'serr'}">{ERROR_LABEL[h.errorKind]}</span>
+              {/if}
             {:else if h.status !== null}
               <span class="code-chip {statusClass(h.status)}" data-testid="history-status"><Hl text={String(h.status)} query={filter} /></span>
             {:else if h.errorKind}
               <span class="code-chip {h.errorKind === 'cancelled' ? 'scan' : 'serr'}">{ERROR_LABEL[h.errorKind]}</span>
             {/if}
-            {#if h.timeMs !== null}<span class="dur">{formatMs(h.timeMs)}</span>{:else if h.ws}<span class="dur">{formatDuration(h.ws.durationMs)}</span>{/if}
+            {#if h.timeMs !== null}<span class="dur">{formatMs(h.timeMs)}</span>{:else if h.ws}<span class="dur">{formatDuration(h.ws.durationMs)}</span>{:else if h.grpc}<span class="dur">{h.grpc.callKind === "unary" ? formatMs(h.grpc.durationMs) : formatDuration(h.grpc.durationMs)}</span>{/if}
           </span>
           <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
           <span

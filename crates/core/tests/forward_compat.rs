@@ -272,7 +272,7 @@ fn ac_fwd_2_kind_defaults_to_http_and_is_omitted() {
     assert!(v.get("minClientVersion").is_none());
     for (s, k) in [
         ("graphql", RequestKind::Graphql),
-        ("grpc", RequestKind::Grpc),
+        ("mqtt", RequestKind::Other("mqtt".into())),
         ("socketio", RequestKind::Other("socketio".into())),
     ] {
         let r: Request = serde_json::from_value(json!({"id": "x", "kind": s})).unwrap();
@@ -284,7 +284,11 @@ fn ac_fwd_2_kind_defaults_to_http_and_is_omitted() {
     let r: Request = serde_json::from_value(json!({"id": "x", "kind": "ws"})).unwrap();
     assert_eq!(r.kind, RequestKind::Ws);
     assert!(r.is_editable());
-    assert_eq!(serde_json::to_value(&r).unwrap()["kind"], "ws");
+    assert_eq!(serde_json::to_value(&r).unwrap()["kind"], "ws"); // gRPC requests too (AC-GRPC-1).
+    let r: Request = serde_json::from_value(json!({"id": "x", "kind": "grpc"})).unwrap();
+    assert_eq!(r.kind, RequestKind::Grpc);
+    assert!(r.is_editable());
+    assert_eq!(serde_json::to_value(&r).unwrap()["kind"], "grpc");
 }
 
 #[test]
@@ -452,8 +456,8 @@ fn ac_fwd_4_min_client_version() {
 #[test]
 fn non_http_requests_are_never_sent() {
     let mut r: Request = serde_json::from_value(json!({
-        "id": "x", "url": "https://a.dev", "kind": "grpc",
-        "grpc": {"service": "S", "method": "M"}
+        "id": "x", "url": "https://a.dev", "kind": "mqtt",
+        "mqtt": {"service": "S", "method": "M"}
     }))
     .unwrap();
     let err = prepare(&r, &VarScope::empty(), None).unwrap_err();
@@ -472,11 +476,11 @@ fn non_http_requests_are_never_sent() {
     assert!(prepare(&r, &VarScope::empty(), None).is_ok());
 }
 
-fn grpc_request(id: &str, collection_id: &str) -> Value {
+fn newer_request(id: &str, collection_id: &str) -> Value {
     json!({
         "id": id, "collectionId": collection_id, "name": "Say hello",
-        "kind": "grpc", "method": "POST", "url": "grpc://svc:443",
-        "grpc": {"service": "Greeter", "method": "SayHello", "message": "{}"},
+        "kind": "mqtt", "method": "POST", "url": "grpc://svc:443",
+        "mqtt": {"service": "Greeter", "method": "SayHello", "message": "{}"},
         "updatedAt": 5
     })
 }
@@ -487,7 +491,7 @@ fn store_mutators_refuse_read_only_requests() {
     let mut s = Store::open(dir.path()).unwrap();
     let pid = s.project_list()[0].id.clone();
     let c = s.create_collection(&pid, "C").unwrap();
-    let r: Request = serde_json::from_value(grpc_request("g1", &c.id)).unwrap();
+    let r: Request = serde_json::from_value(newer_request("g1", &c.id)).unwrap();
     s.projects.get_mut(&pid).unwrap().requests.push(r.clone());
     let ro = |e: StoreError| matches!(e, StoreError::ReadOnlyNewer(_));
 
@@ -581,7 +585,7 @@ fn guarded_store() -> (tempfile::TempDir, Store, String, String, String, String)
     let c = s.create_collection(&pid, "C").unwrap().id;
     let c2 = s.create_collection(&pid, "C2").unwrap().id;
     let f = s.create_folder(&c, None, "F").unwrap().id;
-    let mut g: Request = serde_json::from_value(grpc_request("g1", &c)).unwrap();
+    let mut g: Request = serde_json::from_value(newer_request("g1", &c)).unwrap();
     g.folder_id = Some(f.clone());
     g.sort_order = 2;
     s.projects.get_mut(&pid).unwrap().requests.push(g);
@@ -684,7 +688,7 @@ fn reordering_siblings_keeps_read_only_sort_orders() {
 
     // Two adjacent read-only siblings leave no gap: moving between them is
     // refused and nothing changes.
-    let mut g2: Request = serde_json::from_value(grpc_request("g2", &c)).unwrap();
+    let mut g2: Request = serde_json::from_value(newer_request("g2", &c)).unwrap();
     g2.folder_id = Some(f.clone());
     g2.sort_order = 3;
     s.projects.get_mut(&pid).unwrap().requests.push(g2);
@@ -921,7 +925,7 @@ async fn ac_fwd_5_unknown_pull_types_are_skipped_and_kept() {
                 10,
                 json!({"id": "c1", "projectId": "p1", "name": "Col"}),
             ),
-            change("request", "g1", 4, 10, grpc_request("g1", "c1")),
+            change("request", "g1", 4, 10, newer_request("g1", "c1")),
             change(
                 "protoFile",
                 "pf1",
@@ -941,8 +945,8 @@ async fn ac_fwd_5_unknown_pull_types_are_skipped_and_kept() {
     assert_eq!(s.workspace.sync.as_ref().unwrap().cursor, 5);
     assert_eq!(s.projects["p1"].project.extra.get("fxP"), Some(&json!(1)));
     let g = s.request("g1").unwrap();
-    assert_eq!(g.kind, RequestKind::Grpc);
-    assert!(g.extra.contains_key("grpc"));
+    assert_eq!(g.kind, RequestKind::Other("mqtt".into()));
+    assert!(g.extra.contains_key("mqtt"));
     // Latest version per (type, id) is kept and persisted.
     assert_eq!(s.sync_state.unknown_changes.len(), 1);
     assert_eq!(s.sync_state.unknown_changes[0]["rev"], 5);
@@ -980,7 +984,7 @@ async fn read_only_requests_are_never_pushed_when_modified_locally() {
             json!({"id": "f1", "collectionId": "c1", "name": "F"}),
         ),
         change("request", "g1", 4, 10, {
-            let mut g = grpc_request("g1", "c1");
+            let mut g = newer_request("g1", "c1");
             g["folderId"] = json!("f1");
             g
         }),
@@ -1031,7 +1035,7 @@ async fn read_only_requests_are_never_pushed_when_modified_locally() {
     let report = sync::apply_pull(
         &mut s,
         vec![
-            serde_json::from_value(change("request", "g1", 6, 11, grpc_request("g1", "c1")))
+            serde_json::from_value(change("request", "g1", 6, 11, newer_request("g1", "c1")))
                 .unwrap(),
         ],
         6,
@@ -1635,11 +1639,11 @@ proptest! {
 
 /// A gRPC request whose metadata holds a bearer token (a field this build
 /// doesn't know), inside collection `c`.
-fn grpc_with_token(id: &str, collection_id: &str) -> Value {
+fn newer_with_token(id: &str, collection_id: &str) -> Value {
     json!({
         "id": id, "collectionId": collection_id, "name": "Say hello",
-        "kind": "grpc", "method": "POST", "url": "grpc://svc:443",
-        "grpc": {"service": "Greeter", "method": "SayHello",
+        "kind": "mqtt", "method": "POST", "url": "grpc://svc:443",
+        "mqtt": {"service": "Greeter", "method": "SayHello",
                  "metadata": [{"key": "authorization", "value": "Bearer grpc-s3cret"}]},
         "updatedAt": 5
     })
@@ -1651,7 +1655,7 @@ fn share_without_credentials_never_leaks_unknown_fields() {
     let mut s = Store::open(dir.path()).unwrap();
     let pid = s.project_list()[0].id.clone();
     let c = s.create_collection(&pid, "C").unwrap();
-    let g: Request = serde_json::from_value(grpc_with_token("g1", &c.id)).unwrap();
+    let g: Request = serde_json::from_value(newer_with_token("g1", &c.id)).unwrap();
     s.projects.get_mut(&pid).unwrap().requests.push(g);
     let off = ShareOptions::default();
     let on = ShareOptions {

@@ -10,7 +10,7 @@
   import VirtualList from "./VirtualList.svelte";
   import Icon from "./Icon.svelte";
 
-  /** The response pane of a WebSocket / Socket.IO request: the message log (AC-WS-5). */
+  /** The response pane of a WebSocket / Socket.IO request and of gRPC streams: the message log (AC-WS-5, AC-GRPC-8). */
   let { stacked, ontogglelayout }: { stacked: boolean; ontogglelayout: () => void } = $props();
 
   let filter = $state<LogFilter>({ ...EMPTY_FILTER });
@@ -35,6 +35,12 @@
   const shownCount = $derived(view.shown.length);
   const history = $derived(!session ? (app.currentResponse?.fromHistory ? app.currentResponse : null) : null);
   const live = $derived(session ? session.state !== "closed" : false);
+  /** A gRPC stream (live or from history). */
+  const isGrpc = $derived(session ? session.transport === "grpc" : app.request.kind === "grpc");
+  const grpcSummary = $derived(history?.grpc?.summary ?? null);
+  function reconnect() {
+    void (isGrpc ? app.grpcRun() : app.wsConnect());
+  }
   const filtered = $derived(filter.text.trim() !== "" || filter.dir !== "all" || filter.hideHeartbeats);
 
   const DIRS: { v: DirFilter; label: string }[] = [
@@ -102,18 +108,38 @@
       case "closing":
         return "Closing";
       case "closed":
+        if (session.status) return session.status.code === 0 ? "Finished" : "Failed";
         return session.error ? "Failed" : "Closed";
       default:
         return "";
     }
   });
-  const stateClass = $derived(session?.state === "open" ? "s2" : session?.state === "connecting" || session?.state === "closing" ? "s3" : session?.error ? "serr" : "scan");
+  const stateClass = $derived(
+    session?.state === "open" ? "s2" : session?.state === "connecting" || session?.state === "closing" ? "s3" : session?.status ? (session.status.code === 0 ? "s2" : "serr") : session?.error ? "serr" : "scan",
+  );
   const duration = $derived(session ? Math.max(0, (session.endedAt ?? now) - session.startedAt) : 0);
   /** While live the strip ticks once a second: whole seconds read calmer than milliseconds. */
   const durationText = $derived(live && duration < 60_000 ? `${Math.floor(duration / 1000)} s` : formatDuration(duration));
 
   const DIR_LABEL = { in: "Received", out: "Sent", system: "System" } as const;
-  const KIND_LABEL: Record<string, string> = { text: "Text", binary: "Binary", ping: "Ping", pong: "Pong", close: "Close", event: "Event", ack: "Ack", error: "Error", open: "Open", reconnecting: "Retry", info: "Info" };
+  const KIND_LABEL: Record<string, string> = {
+    text: "Text",
+    binary: "Binary",
+    ping: "Ping",
+    pong: "Pong",
+    close: "Close",
+    event: "Event",
+    ack: "Ack",
+    error: "Error",
+    open: "Open",
+    reconnecting: "Retry",
+    info: "Info",
+    message: "Message",
+    headers: "Headers",
+    trailers: "Trailers",
+    end: "End",
+    status: "Status",
+  };
   const shortcuts = $derived([
     { label: "Connect / Send message", keys: shortcutKeys("Mod+Enter", app.platform) },
     { label: "Change Environment", keys: shortcutKeys("Mod+E", app.platform) },
@@ -125,10 +151,14 @@
   <div class="row1">
     <span class="faint grow info" data-testid="ws-log-info">
       {#if session}
-        {session.method === "SIO" ? "Socket.IO" : "WebSocket"} · <span class="mono" title={session.resolvedUrl}>{session.resolvedUrl}</span>
+        {#if session.method === "GRPC"}
+          gRPC · <span class="mono">{session.title}</span> · <span class="mono" title={session.resolvedUrl}>{session.resolvedUrl.replace(/\/[^/]+\/[^/]+$/, "")}</span>
+        {:else}
+          {session.method === "SIO" ? "Socket.IO" : "WebSocket"} · <span class="mono" title={session.resolvedUrl}>{session.resolvedUrl}</span>
+        {/if}
       {:else if history?.fromHistory}
         From history · {dateTime(history.fromHistory)}
-        <button class="link" type="button" onclick={() => void app.wsConnect()} data-testid="ws-reconnect">Reconnect</button>
+        <button class="link" type="button" onclick={reconnect} data-testid="ws-reconnect">Reconnect</button>
       {/if}
     </span>
     <button class="icon-btn" type="button" aria-label="Copy messages" title="Copy the shown messages" disabled={!shownCount} onclick={copyAll} data-testid="ws-copy-all"><Icon name="copy" /></button>
@@ -149,12 +179,22 @@
         <span class="status-pill {stateClass}" data-testid="ws-state" data-state={session.state}>{stateLabel}</span>
         <span>Time <b data-testid="ws-duration">{durationText}</b></span>
         <span title="Data messages sent / received">Messages <b data-testid="ws-counts">↑{session.sent} ↓{session.received}</b></span>
+        {#if session.status}
+          <span class="status-pill {session.status.code === 0 ? 's2' : 'serr'}" title={session.status.message || undefined} data-testid="grpc-stream-status" data-code={session.status.code}>{session.status.code} {session.status.name}</span>
+        {/if}
         {#if session.unresolved.length}
           <span class="unres" title={session.unresolved.map((u) => `{{${u}}}`).join(", ")} data-testid="unresolved-warning"><Icon name="alert" small />{session.unresolved.length} unresolved variable{session.unresolved.length === 1 ? "" : "s"}</span>
         {/if}
       {:else if history?.wsSummary}
         <span class="status-pill {history.error ? 'serr' : 'scan'}">{history.error ? "Failed" : "Closed"}</span>
         <span data-testid="ws-history-summary">{summaryText(history.wsSummary)}</span>
+      {:else if grpcSummary}
+        {#if grpcSummary.status}
+          <span class="status-pill {grpcSummary.status.code === 0 ? 's2' : 'serr'}" data-testid="grpc-stream-status">{grpcSummary.status.code} {grpcSummary.status.name}</span>
+        {:else}
+          <span class="status-pill {history?.error ? 'serr' : 'scan'}">{history?.error ? "Failed" : "Closed"}</span>
+        {/if}
+        <span data-testid="ws-history-summary">{summaryText(grpcSummary)}</span>
       {/if}
     </div>
   </div>
@@ -167,7 +207,7 @@
       </div>
     {:else}
       <div class="empty cheat" data-testid="ws-log-empty">
-        <p class="faint">{history ? "Messages of past sessions aren't kept. Reconnect to start a new one." : "Connect to see messages here."}</p>
+        <p class="faint">{history ? "Messages of past sessions aren't kept. Reconnect to start a new one." : isGrpc ? "Invoke or connect to see messages here." : "Connect to see messages here."}</p>
         <div class="shortcuts">
           {#each shortcuts as s (s.label)}
             <span>{s.label}</span>
@@ -201,15 +241,17 @@
           <button type="button" aria-pressed={filter.dir === d.v} onclick={() => (filter = { ...filter, dir: d.v })} data-testid="ws-dir-{d.v}">{d.label}</button>
         {/each}
       </span>
-      <label class="checkbox small" title="Hide ping and pong frames">
-        <input type="checkbox" checked={filter.hideHeartbeats} onchange={(e) => (filter = { ...filter, hideHeartbeats: e.currentTarget.checked })} data-testid="ws-hide-pings" />Hide pings
-      </label>
+      {#if !isGrpc}
+        <label class="checkbox small" title="Hide ping and pong frames">
+          <input type="checkbox" checked={filter.hideHeartbeats} onchange={(e) => (filter = { ...filter, hideHeartbeats: e.currentTarget.checked })} data-testid="ws-hide-pings" />Hide pings
+        </label>
+      {/if}
     </div>
 
     {#if session.error && session.state === "closed" && !view.all.some((f) => f.kind === "open")}
       <div class="pad">
         <div class="err" role="alert" data-testid="ws-error"><h3><Icon name="alert" />Couldn't connect</h3><code class="selectable">{session.error}</code>
-          <div class="actions"><button class="btn btn-secondary btn-sm" type="button" onclick={() => void app.wsConnect()}>Retry</button>
+          <div class="actions"><button class="btn btn-secondary btn-sm" type="button" onclick={reconnect}>Retry</button>
           {#if /tls/i.test(session.error) && app.request.settings.verifyTls}
             <button class="btn btn-ghost btn-sm" type="button" onclick={() => { app.request.settings.verifyTls = false; toasts.info("TLS verification disabled for this request"); }}>Disable TLS verification for this request</button>
           {/if}</div>

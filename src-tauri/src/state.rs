@@ -1,6 +1,7 @@
 //! Shared application state managed by Tauri.
 
 use crate::error::{CmdResult, CommandError};
+use crate::grpc_rt::GrpcRegistry;
 use crate::registry::{CancelRegistry, Debouncer, ResponseCache};
 pub use crate::sync_policy::SyncStatus;
 use crate::ws_rt::WsRegistry;
@@ -26,6 +27,8 @@ pub struct AppState {
     pub sync_lock: tokio::sync::Mutex<()>,
     /// connectionId -> open WebSocket session (AC-WS-3).
     pub ws: WsRegistry,
+    /// connectionId -> running gRPC call (AC-GRPC-8).
+    pub grpc: GrpcRegistry,
 }
 
 impl AppState {
@@ -42,6 +45,7 @@ impl AppState {
             retry: Debouncer::default(),
             sync_lock: tokio::sync::Mutex::new(()),
             ws: WsRegistry::default(),
+            grpc: GrpcRegistry::default(),
         })
     }
 

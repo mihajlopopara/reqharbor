@@ -2452,6 +2452,55 @@ async fn m2_team_pushes_leave_device_local_paths_here() {
 }
 
 #[tokio::test]
+async fn ac_grpc_4_team_pull_keeps_this_devices_proto_paths() {
+    let (server, g) = go().await;
+    let (a, _) = personal_device(&server, &g).await;
+    bind_team(&a, &server, Role::Editor);
+    team_exists(&g, "editor");
+    let (_, c, _) = team_project(&a, &server, &g).await;
+    let rid = a.with(|s| {
+        let mut r = http_req("POST", "grpc://localhost:50051");
+        r.kind = RequestKind::Grpc;
+        r.grpc = Some(GrpcConfig {
+            service: "demo.Greeter".into(),
+            method: "SayHello".into(),
+            proto_source: ProtoSource::Files,
+            proto_files: vec!["/Users/priya/protos/greeter.proto".into()],
+            import_paths: vec!["/Users/priya/protos".into()],
+            ..GrpcConfig::default()
+        });
+        s.create_request(&c, None, r).unwrap().id
+    });
+    a.run(&server, &g).await;
+    // The push leaves the paths out.
+    let pushed = server_ent(&g, TEAM, "request", &rid).unwrap().data.unwrap();
+    assert_eq!(pushed["grpc"]["protoFiles"], json!([]));
+    assert_eq!(pushed["grpc"]["importPaths"], json!([]));
+    // A teammate's edit comes back with empty lists: this device keeps its own.
+    let mut theirs: Request = serde_json::from_value(pushed).unwrap();
+    theirs.name = "Hello v2".into();
+    theirs.grpc.as_mut().unwrap().method = "LotsOfReplies".into();
+    theirs.updated_at = now_ms() + 1_000;
+    seed(
+        &g,
+        TEAM,
+        "request",
+        &rid,
+        theirs.updated_at,
+        serde_json::to_value(&theirs).unwrap(),
+    );
+    a.run(&server, &g).await;
+    a.with(|s| {
+        let r = s.request(&rid).unwrap();
+        assert_eq!(r.name, "Hello v2");
+        let g = r.grpc.as_ref().unwrap();
+        assert_eq!(g.method, "LotsOfReplies");
+        assert_eq!(g.proto_files, vec!["/Users/priya/protos/greeter.proto"]);
+        assert_eq!(g.import_paths, vec!["/Users/priya/protos"]);
+    });
+}
+
+#[tokio::test]
 async fn m2_copy_to_project_and_duplicate_use_new_ids_and_leave_the_source() {
     let (server, g) = go().await;
     let (a, pid) = personal_device(&server, &g).await;

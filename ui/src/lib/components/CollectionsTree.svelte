@@ -435,7 +435,7 @@
             {@const req = app.index?.requestById.get(r.id)}
             <span class="m m-custom" title={req?.kind ?? "http"} data-testid="tree-kind">{newerKindLabel(req ?? {})}</span>
           {:else}
-            <span class="m {r.ws ? 'm-ws' : methodClass(r.method ?? 'GET')}" title={r.ws ? (r.method === "SIO" ? "Socket.IO" : "WebSocket") : r.method} data-testid={r.ws ? "tree-ws" : undefined}>{methodLabel(r.method ?? "GET")}</span>
+            <span class="m {r.ws ? 'm-ws' : r.grpc ? 'm-grpc' : methodClass(r.method ?? 'GET')}" title={r.ws ? (r.method === "SIO" ? "Socket.IO" : "WebSocket") : r.grpc ? "gRPC" : r.method} data-testid={r.ws ? "tree-ws" : r.grpc ? "tree-grpc" : undefined}>{methodLabel(r.method ?? "GET")}</span>
           {/if}
         {/if}
         {#if ui.renaming?.id === r.id}
@@ -475,7 +475,7 @@
           {@const why = skippedReasonText(app.skippedReasons.get(r.id) ?? "too_large")}
           <span class="skipped" title={why.title} data-testid="not-synced-badge"><Icon name="cloud-off" small />{why.label}</span>
         {/if}
-        {#if r.kind === "request" && r.ws}
+        {#if r.kind === "request" && (r.ws || r.grpc)}
           {@const st = ws.session(r.id)?.state}
           {#if st === "open" || st === "connecting" || st === "closing"}
             {@const label = st === "open" ? "Connected" : st === "connecting" ? "Connecting" : "Closing"}

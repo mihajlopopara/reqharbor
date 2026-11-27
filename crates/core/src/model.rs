@@ -69,10 +69,10 @@ macro_rules! open_string_enum {
 }
 
 open_string_enum! {
-    /// What a request talks (AC-FWD-2). `Http` and `Ws` (WebSocket, with
-    /// Socket.IO as a mode of it) are editable in this build; the others are
-    /// reserved for GraphQL and gRPC editors. Omitted from JSON when `Http`,
-    /// so older readers see no change.
+    /// What a request talks (AC-FWD-2). `Http`, `Ws` (WebSocket, with
+    /// Socket.IO as a mode of it) and `Grpc` are editable in this build;
+    /// `Graphql` stays reserved (GraphQL is a body type, PRODUCT §5.14).
+    /// Omitted from JSON when `Http`, so older readers see no change.
     pub enum RequestKind {
         #[default]
         Http = "http",
@@ -89,9 +89,15 @@ impl RequestKind {
     pub fn is_ws(&self) -> bool {
         *self == RequestKind::Ws
     }
-    /// Kinds this build can edit and run: HTTP and WebSocket.
+    pub fn is_grpc(&self) -> bool {
+        *self == RequestKind::Grpc
+    }
+    /// Kinds this build can edit and run: HTTP, WebSocket and gRPC.
     pub fn is_supported(&self) -> bool {
-        matches!(self, RequestKind::Http | RequestKind::Ws)
+        matches!(
+            self,
+            RequestKind::Http | RequestKind::Ws | RequestKind::Grpc
+        )
     }
 }
 
@@ -310,6 +316,10 @@ pub struct Request {
     /// switched back to HTTP, so switching again loses nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws: Option<WsConfig>,
+    /// gRPC settings (kind `grpc`, AC-GRPC-*). Kept when the kind is
+    /// switched back to HTTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc: Option<GrpcConfig>,
     #[serde(default)]
     pub sort_order: i64,
     #[serde(default)]
@@ -341,6 +351,7 @@ impl Default for Request {
             body: Body::default(),
             settings: RequestSettings::default(),
             ws: None,
+            grpc: None,
             sort_order: 0,
             created_at: 0,
             updated_at: 0,
@@ -354,9 +365,10 @@ pub const NEEDS_NEWER_VERSION: &str = "This request needs a newer version of Req
 
 impl Request {
     /// False when this build cannot faithfully edit or send the request: a
-    /// kind other than HTTP or WebSocket, an unknown body type, form field
-    /// kind, auth scheme, API key location, WebSocket message kind or
-    /// Socket.IO version, or a `minClientVersion` newer than this build
+    /// kind other than HTTP, WebSocket or gRPC, an unknown body type, form
+    /// field kind, auth scheme, API key location, WebSocket message kind,
+    /// Socket.IO version or gRPC proto source, or a `minClientVersion` newer
+    /// than this build
     /// (AC-FWD-3/4). Such requests are read-only, are never sent, and a
     /// locally modified version is never pushed.
     pub fn is_editable(&self) -> bool {
@@ -364,30 +376,34 @@ impl Request {
             && self.body.is_known()
             && self.auth.is_known()
             && self.ws.as_ref().is_none_or(WsConfig::is_known)
+            && self.grpc.as_ref().is_none_or(GrpcConfig::is_known)
             && !self
                 .min_client_version
                 .as_deref()
                 .is_some_and(requires_newer_client)
     }
 
-    /// A WebSocket request must not be edited by a ReqHarbor that predates
-    /// WebSocket support (an older client would drop `ws` on save): stamp
-    /// `minClientVersion` with [`WS_MIN_CLIENT_VERSION`] unless an equal or
-    /// newer one is already there. Never the running version, so a newer
-    /// patch build doesn't lock out older WebSocket-capable builds.
+    /// A WebSocket or gRPC request must not be edited by a ReqHarbor that
+    /// predates its kind (an older client would drop `ws` / `grpc` on save):
+    /// stamp `minClientVersion` with [`WS_MIN_CLIENT_VERSION`] /
+    /// [`GRPC_MIN_CLIENT_VERSION`] unless an equal or newer one is already
+    /// there. Never the running version, so a newer patch build doesn't lock
+    /// out older builds that support the kind (AC-WS-1, AC-GRPC-1).
     pub fn stamp_min_client_version(&mut self) {
-        if !self.kind.is_ws() {
-            return;
-        }
+        let min = match self.kind {
+            RequestKind::Ws => WS_MIN_CLIENT_VERSION,
+            RequestKind::Grpc => GRPC_MIN_CLIENT_VERSION,
+            _ => return,
+        };
         let older = match self.min_client_version.as_deref() {
             None => true,
-            Some(v) => match (parse_version(v), parse_version(WS_MIN_CLIENT_VERSION)) {
+            Some(v) => match (parse_version(v), parse_version(min)) {
                 (Some(have), Some(min)) => have < min,
                 _ => false,
             },
         };
         if older {
-            self.min_client_version = Some(WS_MIN_CLIENT_VERSION.to_string());
+            self.min_client_version = Some(min.to_string());
         }
     }
 }
@@ -397,6 +413,100 @@ impl Request {
 /// raise it only when the `ws` format changes in a way older builds would
 /// lose on save.
 pub const WS_MIN_CLIENT_VERSION: &str = "0.1.0";
+
+/// The first ReqHarbor that edits and runs gRPC requests: the
+/// `minClientVersion` stamped on every `grpc` request (AC-GRPC-1). Fixed;
+/// builds before gRPC support already treat the kind as read-only, so raise
+/// it only when the `grpc` format changes in a way older gRPC-capable builds
+/// would lose on save.
+pub const GRPC_MIN_CLIENT_VERSION: &str = "0.1.0";
+
+open_string_enum! {
+    /// Where a gRPC request's services come from. Unknown values round-trip
+    /// and make the request read-only (AC-FWD-3).
+    pub enum ProtoSource {
+        #[default]
+        Reflection = "reflection",
+        Files = "files",
+    }
+}
+
+/// gRPC settings of a `grpc` request (AC-GRPC-*). The request's headers are
+/// the metadata, its auth applies as metadata, `settings.timeoutMs` is the
+/// unary deadline and `settings.verifyTls` applies; TLS follows the URL
+/// scheme.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcConfig {
+    /// Full service name (`demo.Greeter`); empty until a method is picked.
+    #[serde(default)]
+    pub service: String,
+    /// Method name (`SayHello`).
+    #[serde(default)]
+    pub method: String,
+    /// The request message as JSON text; empty counts as `{}`.
+    #[serde(default = "default_grpc_message")]
+    pub message: String,
+    #[serde(default)]
+    pub proto_source: ProtoSource,
+    /// Device-local `.proto` paths (AC-GRPC-4).
+    #[serde(default)]
+    pub proto_files: Vec<String>,
+    /// Device-local import folders.
+    #[serde(default)]
+    pub import_paths: Vec<String>,
+    /// Saved messages, in user order.
+    #[serde(default)]
+    pub messages: Vec<GrpcSavedMessage>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+fn default_grpc_message() -> String {
+    "{}".to_string()
+}
+
+impl Default for GrpcConfig {
+    fn default() -> Self {
+        GrpcConfig {
+            service: String::new(),
+            method: String::new(),
+            message: default_grpc_message(),
+            proto_source: ProtoSource::Reflection,
+            proto_files: Vec::new(),
+            import_paths: Vec::new(),
+            messages: Vec::new(),
+            extra: Extra::new(),
+        }
+    }
+}
+
+impl GrpcConfig {
+    /// False when the proto source comes from a newer ReqHarbor.
+    pub fn is_known(&self) -> bool {
+        self.proto_source.is_known()
+    }
+    /// Device-local paths (proto files and import folders) it holds.
+    pub fn local_paths(&self) -> usize {
+        self.proto_files
+            .iter()
+            .chain(&self.import_paths)
+            .filter(|p| !p.trim().is_empty())
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcSavedMessage {
+    #[serde(default)]
+    pub name: String,
+    /// JSON text.
+    #[serde(default)]
+    pub body: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
 
 /// Socket.IO protocol version this build speaks (Engine.IO v4 transport).
 pub const SOCKET_IO_VERSION: u32 = 4;
@@ -970,6 +1080,91 @@ pub struct HistoryEntry {
     /// Set for a WebSocket / Socket.IO session (method `WS` / `SIO`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ws: Option<WsSessionSummary>,
+    /// Set for a gRPC call or stream (method `GRPC`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grpc: Option<GrpcCallSummary>,
+}
+
+/// The four gRPC call kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GrpcCallKind {
+    Unary,
+    ServerStreaming,
+    ClientStreaming,
+    BidiStreaming,
+}
+
+impl GrpcCallKind {
+    pub fn from_streaming(client: bool, server: bool) -> Self {
+        match (client, server) {
+            (false, false) => GrpcCallKind::Unary,
+            (false, true) => GrpcCallKind::ServerStreaming,
+            (true, false) => GrpcCallKind::ClientStreaming,
+            (true, true) => GrpcCallKind::BidiStreaming,
+        }
+    }
+    /// "unary", "server streaming", …
+    pub fn label(&self) -> &'static str {
+        match self {
+            GrpcCallKind::Unary => "unary",
+            GrpcCallKind::ServerStreaming => "server streaming",
+            GrpcCallKind::ClientStreaming => "client streaming",
+            GrpcCallKind::BidiStreaming => "bidi streaming",
+        }
+    }
+    /// The client sends one message and ends (unary, server streaming).
+    pub fn single_request(&self) -> bool {
+        matches!(self, GrpcCallKind::Unary | GrpcCallKind::ServerStreaming)
+    }
+}
+
+/// A decoded `google.rpc.Status` detail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcStatusDetail {
+    pub type_url: String,
+    /// Pretty JSON when the type is known.
+    pub json: Option<String>,
+    pub base64: String,
+}
+
+/// A gRPC status (AC-GRPC-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcStatus {
+    pub code: i32,
+    /// `OK`, `NOT_FOUND`, … (`CODE_17` for an unknown code).
+    pub name: String,
+    pub message: String,
+    #[serde(default)]
+    pub details: Vec<GrpcStatusDetail>,
+}
+
+/// One gRPC call in history (AC-GRPC-10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrpcCallSummary {
+    pub service: String,
+    pub method: String,
+    pub call_kind: GrpcCallKind,
+    pub duration_ms: u64,
+    pub sent: u64,
+    pub received: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<GrpcStatus>,
+    /// Unary: the response message as pretty JSON (≤ 1 MB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub response_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<Vec<(String, String)>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trailers: Option<Vec<(String, String)>>,
+    /// Keys from a newer ReqHarbor, kept on rewrite (AC-FWD-1).
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// Summary of a finished WebSocket session, for history (AC-WS-7).

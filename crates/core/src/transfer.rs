@@ -1171,7 +1171,8 @@ fn file_paths(r: &Request) -> usize {
         .flatten()
         .filter(|f| f.kind == FormFieldKind::File && !f.value.trim().is_empty())
         .count();
-    binary + form
+    let grpc = r.grpc.as_ref().map_or(0, |g| g.local_paths());
+    binary + form + grpc
 }
 
 fn request_text(r: &Request) -> Vec<String> {

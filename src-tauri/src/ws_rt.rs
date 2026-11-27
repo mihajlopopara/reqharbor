@@ -5,7 +5,7 @@
 //! it can be unit-tested.
 
 use reqharbor_core::CancellationToken;
-use reqharbor_core::ws::{OutMessage, WsCommand, WsFrame};
+use reqharbor_core::ws::{OutMessage, WsCommand};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -128,10 +128,10 @@ impl WsRegistry {
 /// The session's frame sink: forwards each frame with `send` (the webview
 /// channel) and, on the first failure (the webview reloaded or went away),
 /// cancels the session instead of letting it run and reconnect with no UI.
-pub fn channel_emitter<E>(
-    send: impl Fn(WsFrame) -> Result<(), E> + Send + Sync,
+pub fn channel_emitter<T, E>(
+    send: impl Fn(T) -> Result<(), E> + Send + Sync,
     cancel: CancellationToken,
-) -> impl Fn(WsFrame) + Send + Sync {
+) -> impl Fn(T) + Send + Sync {
     let failed = AtomicBool::new(false);
     move |f| {
         if failed.load(Ordering::Relaxed) {
@@ -147,7 +147,7 @@ pub fn channel_emitter<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqharbor_core::ws::{Dir, FrameKind};
+    use reqharbor_core::ws::{Dir, FrameKind, WsFrame};
 
     #[test]
     fn a_failing_channel_cancels_the_session_once() {

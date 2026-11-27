@@ -20,6 +20,9 @@ import {
   type ResponseMeta,
   type SavedMessage,
   type WsSessionSummary,
+  type GrpcCallKind,
+  type GrpcCallSummary,
+  type GrpcStatus,
   type SendError,
   type Settings,
   type SyncStatus,
@@ -39,7 +42,9 @@ import { RESTORED_NOTICE } from "../util/format";
 import { toasts } from "./toasts.svelte";
 import { ui } from "./ui.svelte";
 import { ws } from "./ws.svelte";
-import { messageError, switchKind } from "../util/ws";
+import { grpc } from "./grpc.svelte";
+import { messageError, switchKind, type KindTarget } from "../util/ws";
+import { isStreaming, sendsMessages, tryTarget } from "../util/grpc";
 import { hasComments, withOperation } from "../util/graphql";
 import { shortcutText } from "../util/shortcuts";
 
@@ -68,6 +73,25 @@ export interface ResponseView {
   wsSummary?: WsSessionSummary | null;
   /** The request had a GraphQL body: the strip counts `errors` in a JSON answer (AC-GQL-11). */
   graphql?: boolean;
+  /** A gRPC call (AC-GRPC-7, AC-GRPC-10): the unary answer, or a stream summary from history. */
+  grpc?: GrpcView | null;
+}
+
+/** What the gRPC response pane shows. */
+export interface GrpcView {
+  service: string;
+  method: string;
+  callKind: GrpcCallKind;
+  status: GrpcStatus | null;
+  /** Pretty JSON of the response message (unary). */
+  response: string | null;
+  responseTruncated: boolean;
+  headers: [string, string][];
+  trailers: [string, string][];
+  timeMs: number | null;
+  sizeBytes: number | null;
+  /** History entry of a stream (or unary) call. */
+  summary: GrpcCallSummary | null;
 }
 
 /** Which GraphQL editor a Format error belongs to (AC-GQL-7). */
@@ -650,6 +674,7 @@ class AppStore {
       const prevId = this.request.id;
       if (this.responses[prevId]) this.responses = { ...this.responses, [created.id]: { ...this.responses[prevId], requestId: created.id } };
       ws.rekey(prevId, created.id);
+      grpc.rekey(prevId, created.id);
       this.openRequest(created.id, { reveal: true });
       toasts.success(`Saved to ${this.index?.collectionById.get(collectionId)?.name ?? "collection"}`);
     } catch (e) {
@@ -662,12 +687,19 @@ class AppStore {
     if (this.middle.kind !== "request") return;
     // ⌘Enter on a WebSocket request: send the composed message when open, else connect.
     if (this.request.kind === "ws") return ws.session(this.request.id)?.state === "open" ? this.wsSendDraft() : this.wsConnectOrDisconnect();
+    if (this.request.kind === "grpc") {
+      const s = ws.session(this.request.id);
+      // ⌘Enter on an open client / bidi stream sends the composed message (AC-GRPC-8).
+      if (s?.transport === "grpc" && s.state === "open" && sendsMessages(s.callKind) && !s.halfClosed) return this.grpcSendDraft();
+      return this.grpcRunOrCancel();
+    }
     if (this.currentInflight) return this.cancel();
     return this.send();
   }
 
   async send() {
     if (this.request.kind === "ws") return this.wsConnect();
+    if (this.request.kind === "grpc") return this.grpcRun();
     // AC-GQL-9: send the operation the picker shows (stored requests may lack or carry a stale one).
     const req = withOperation($state.snapshot(this.request) as Request);
     if (this.readOnly) {
@@ -732,12 +764,183 @@ class AppStore {
 
   // ───────────── WebSocket (AC-WS-*) ─────────────
 
-  /** Method dropdown: switch the open request between HTTP (with `method`), WebSocket and Socket.IO. */
-  setKind(target: "http" | "ws" | "sio", method = "GET") {
+  /** Method dropdown: switch the open request between HTTP (with `method`), WebSocket, Socket.IO and gRPC. */
+  setKind(target: KindTarget, method = "GET") {
     if (this.readOnly) return;
-    if (target === "http" && ws.isLive(this.request.id)) void ws.disconnect(this.request.id);
+    const s = ws.session(this.request.id);
+    const transport = target === "grpc" ? "grpc" : target === "http" ? null : "ws";
+    if (s && ws.isLive(this.request.id) && s.transport !== transport) void ws.disconnect(this.request.id);
     switchKind(this.request, target, method);
     this.sendBlocked = null;
+  }
+
+  // ───────────── gRPC (AC-GRPC-*) ─────────────
+
+  /** The call kind of the open gRPC request's method (services, else its live stream), null when unknown. */
+  grpcCallKind(r: Request = this.request): GrpcCallKind | null {
+    const k = grpc.callKind(r);
+    if (k) return k;
+    const s = ws.session(r.id);
+    const g = r.grpc;
+    if (s?.transport === "grpc" && g && s.callKind && s.title.endsWith(`/${g.method}`)) return s.callKind;
+    // What a rejected Invoke taught us when the services aren't cached (AC-GRPC-7).
+    const hint = g ? this.grpcKindHints[r.id] : undefined;
+    return hint && g && hint.key === `${g.service}/${g.method}` ? hint.kind : null;
+  }
+
+  /** requestId → the call kind the core reported for its method ("grpcStreamingMethod"). */
+  grpcKindHints = $state<Record<string, { key: string; kind: GrpcCallKind }>>({});
+
+  /** The gRPC call of the open request is live: an Invoke in flight or a stream. */
+  grpcLive(r: Request = this.request): boolean {
+    return !!this.inflight[r.id] || (ws.session(r.id)?.transport === "grpc" && ws.isLive(r.id));
+  }
+
+  /** Request bar button: Invoke / Connect, or Cancel while live. */
+  async grpcRunOrCancel() {
+    const id = this.request.id;
+    if (this.inflight[id]) return this.cancel();
+    if (ws.session(id)?.transport === "grpc" && ws.isLive(id)) return ws.disconnect(id);
+    return this.grpcRun();
+  }
+
+  /** Checks the UI can make before anything is sent; the inline reason, or null. */
+  private grpcBlocked(req: Request): string | null {
+    if (this.readOnly) return NEEDS_NEWER_VERSION;
+    if (!req.url.trim()) return "Enter a URL";
+    if (!tryTarget(req.url) && !/\{\{/.test(req.url)) return "Use grpc://, grpcs://, http:// or https://";
+    if (!req.grpc?.service || !req.grpc.method) return "Pick a method";
+    return null;
+  }
+
+  /** A grpc_* rejection as the inline reason under the bar. */
+  private grpcReject(req: Request, e: unknown) {
+    const err = toCommandError(e);
+    if (err.code === "read_only_newer") this.sendBlocked = NEEDS_NEWER_VERSION;
+    else if (err.code === "validation") {
+      const d = err.details as { kind?: string } | undefined;
+      this.sendBlocked = d?.kind === "emptyUrl" ? "Enter a URL" : d?.kind === "noGrpcMethod" ? "Pick a method" : err.message;
+    } else if (err.code.startsWith("grpc_")) {
+      this.sendBlocked = err.message;
+      grpc.reportError(req.id, err);
+    } else this.reportError(err);
+  }
+
+  /** Invoke (unary; also when the kind isn't known yet) or start a stream. */
+  async grpcRun() {
+    const req = $state.snapshot(this.request) as Request;
+    const blocked = this.grpcBlocked(req);
+    if (blocked) {
+      this.sendBlocked = blocked;
+      return;
+    }
+    this.sendBlocked = null;
+    const kind = this.grpcCallKind(req);
+    if (isStreaming(kind)) return this.grpcStart(req, kind);
+    return this.grpcInvoke(req);
+  }
+
+  /** Start a stream, then pick up the services the call just fetched or compiled. */
+  private async grpcStart(req: Request, kind: GrpcCallKind | null) {
+    try {
+      await ws.startGrpc(req, this.activeProjectId, kind);
+    } catch (e) {
+      this.grpcReject(req, e);
+    }
+    void grpc.refreshCached(req, this.activeProjectId);
+  }
+
+  async grpcInvoke(req: Request) {
+    let streaming: GrpcCallKind | null = null;
+    const executionId = ulid();
+    const startedAt = Date.now();
+    this.inflight = { ...this.inflight, [req.id]: { executionId, startedAt } };
+    const envName = this.activeEnv?.name ?? null;
+    try {
+      const res = await call("grpc_invoke", { executionId, request: req, projectId: this.activeProjectId });
+      this.setResponse({
+        requestId: req.id,
+        response: null,
+        error: res.error,
+        unresolved: res.unresolvedVariables,
+        sentAt: startedAt,
+        elapsedMs: Date.now() - startedAt,
+        envName,
+        method: "GRPC",
+        resolvedUrl: res.resolvedUrl,
+        historyId: res.historyId,
+        fromHistory: null,
+        body: null,
+        bodyLimited: false,
+        bodyError: null,
+        grpc: {
+          service: req.grpc?.service ?? "",
+          method: req.grpc?.method ?? "",
+          callKind: res.callKind,
+          status: res.status,
+          response: res.response,
+          responseTruncated: false,
+          headers: res.headers,
+          trailers: res.trailers,
+          timeMs: res.timeMs,
+          sizeBytes: res.sizeBytes,
+          summary: null,
+        },
+      });
+      void this.loadHistory();
+    } catch (e) {
+      const err = toCommandError(e);
+      const d = err.details as { kind?: string; callKind?: GrpcCallKind } | undefined;
+      if (err.code === "validation" && d?.kind === "grpcStreamingMethod" && d.callKind) {
+        // The services weren't known, so the button said Invoke: the method streams (AC-GRPC-7/8).
+        streaming = d.callKind;
+        this.grpcKindHints = { ...this.grpcKindHints, [req.id]: { key: `${req.grpc?.service}/${req.grpc?.method}`, kind: d.callKind } };
+        if (d.callKind !== "serverStreaming") this.sendBlocked = "This method streams: use Connect";
+      } else this.grpcReject(req, e);
+    } finally {
+      const { [req.id]: _x, ...rest } = this.inflight;
+      this.inflight = rest;
+    }
+    // The call fetched (or compiled) the services: show them, and the right button.
+    void grpc.refreshCached(req, this.activeProjectId);
+    // A server-streaming method shows every message: start it as a stream right away.
+    if (streaming === "serverStreaming") await this.grpcStart(req, streaming);
+  }
+
+  /** Send the Message tab's JSON on the open client / bidi stream. */
+  async grpcSendDraft(): Promise<boolean> {
+    const r = this.request;
+    const text = r.grpc?.message ?? "";
+    if (!/\{\{/.test(text) && text.trim()) {
+      try {
+        JSON.parse(text);
+      } catch (e) {
+        toasts.error(`Invalid JSON: ${(e as Error).message}`);
+        return false;
+      }
+    }
+    return this.grpcSend(text);
+  }
+
+  async grpcSend(message: string): Promise<boolean> {
+    try {
+      await ws.grpcSend(this.request.id, message);
+      return true;
+    } catch (e) {
+      this.reportError(e);
+      return false;
+    }
+  }
+
+  async grpcEnd() {
+    await ws.grpcEnd(this.request.id);
+  }
+
+  /** Save the Message tab's JSON to the request's saved messages (marks it dirty). */
+  grpcSaveDraft(name: string) {
+    const g = this.request.grpc;
+    if (this.readOnly || this.request.kind !== "grpc" || !g) return;
+    g.messages.push({ name: name.trim(), body: g.message });
   }
 
   /** Request bar button: Connect when closed, Disconnect (or stop connecting) when live. */
@@ -859,6 +1062,21 @@ class AppStore {
         bodyError: null,
         wsSummary: entry.ws ?? null,
         graphql: entry.request.body?.type === "graphql",
+        grpc: entry.grpc
+          ? {
+              service: entry.grpc.service,
+              method: entry.grpc.method,
+              callKind: entry.grpc.callKind,
+              status: entry.grpc.status ?? null,
+              response: entry.grpc.response ?? null,
+              responseTruncated: !!entry.grpc.responseTruncated,
+              headers: entry.grpc.headers ?? [],
+              trailers: entry.grpc.trailers ?? [],
+              timeMs: entry.grpc.durationMs,
+              sizeBytes: null,
+              summary: entry.grpc,
+            }
+          : null,
       };
       this.setResponse(view);
       if (response) void this.fetchBody(view);
@@ -995,8 +1213,26 @@ class AppStore {
     return call("export_curl", { request: withOperation($state.snapshot(this.request) as Request), projectId: this.activeProjectId, keepVariables });
   }
 
+  /** AC-GRPC-11: a grpcurl command for the open gRPC request. */
+  async exportGrpcurl(keepVariables: boolean): Promise<string> {
+    return call("export_grpcurl", { request: $state.snapshot(this.request) as Request, projectId: this.activeProjectId, keepVariables });
+  }
+
   async copyCurl() {
     if (this.middle.kind !== "request") return;
+    if (this.request.kind === "grpc") {
+      try {
+        await copyText(await this.exportGrpcurl(this.exportKeepVariables));
+        toasts.success("grpcurl command copied to clipboard");
+      } catch (e) {
+        this.reportError(e);
+      }
+      return;
+    }
+    if (this.request.kind === "ws") {
+      toasts.info("WebSocket requests have no cURL form");
+      return;
+    }
     try {
       await copyText(await this.exportCurl(this.exportKeepVariables));
       toasts.success("cURL copied to clipboard");

@@ -15,11 +15,16 @@
   import WsSavedMessages from "./WsSavedMessages.svelte";
   import WsSettings from "./WsSettings.svelte";
   import { ws } from "../stores/ws.svelte";
+  import { grpc } from "../stores/grpc.svelte";
   import { isSocketIo } from "../util/ws";
+  import { GRPC_URL_PLACEHOLDER, sendsMessages, tryTarget } from "../util/grpc";
+  import { prettyJson } from "../util/json";
+  import { loadGrpcUi } from "./grpc/load";
+  import type { Request } from "../api/types";
   import { call, type EditedBy } from "../api";
   import { editedByText } from "../util/teams";
 
-  type ReqTab = "query" | "headers" | "auth" | "body" | "tests" | "prerun" | "message" | "saved" | "settings";
+  type ReqTab = "query" | "headers" | "auth" | "body" | "tests" | "prerun" | "message" | "saved" | "settings" | "proto";
   let tab = $state<ReqTab>("query");
   let lastId = "";
   let urlEl = $state<HTMLInputElement>();
@@ -55,7 +60,31 @@
   const wsSession = $derived(isWs ? ws.session(r.id) : null);
   const wsState = $derived(wsSession?.state ?? "idle");
   const wsLive = $derived(wsState === "connecting" || wsState === "open" || wsState === "closing");
-  const savedCount = $derived(r.ws?.messages.length ?? 0);
+  /** AC-GRPC-1: a gRPC request gets the method picker, Invoke / Connect and its own tabs. */
+  const isGrpc = $derived(r.kind === "grpc");
+  const grpcKind = $derived(isGrpc ? app.grpcCallKind() : null);
+  const grpcLive = $derived(isGrpc && app.grpcLive());
+  const grpcSession = $derived(isGrpc ? ws.session(r.id) : null);
+  const grpcConnecting = $derived(grpcSession?.transport === "grpc" && grpcSession.state === "connecting");
+  const grpcPathHint = $derived(isGrpc && !!tryTarget(r.url)?.extra);
+  /** The lazy gRPC UI chunk, once a gRPC request was opened. */
+  let grpcUi = $state.raw<Awaited<ReturnType<typeof loadGrpcUi>> | null>(null);
+  $effect(() => {
+    if (isGrpc && !grpcUi) void loadGrpcUi().then((m) => (grpcUi = m));
+  });
+  // AC-GRPC-3/4: the cached / compiled services on open and whenever their inputs change.
+  const grpcLookupKey = $derived.by(() => {
+    if (!isGrpc) return "";
+    const g = r.grpc;
+    const envs = app.environments.filter((e) => e.projectId === null || e.id === app.activeEnv?.id).map((e) => e.variables);
+    return JSON.stringify([r.id, r.url, g?.protoSource, g?.protoFiles, g?.importPaths, envs, app.activeProjectId]);
+  });
+  $effect(() => {
+    if (!grpcLookupKey) return;
+    const t = setTimeout(() => untrack(() => void grpc.refreshCached($state.snapshot(app.request) as Request, app.activeProjectId)), 250);
+    return () => clearTimeout(t);
+  });
+  const savedCount = $derived(isGrpc ? (r.grpc?.messages.length ?? 0) : (r.ws?.messages.length ?? 0));
   /** AC-FWD-3/4: a request from a newer ReqHarbor is view-only. */
   const ro = $derived(app.readOnly);
   /** Why (from the editor copy, else the saved copy), e.g. "This is a “grpc” request". */
@@ -83,11 +112,11 @@
   /** UX §6.2: a viewer's edits are scratch; Save explains instead of saving. */
   const VIEWER_SAVE = "Viewers can't change team projects. Duplicate to personal to experiment.";
 
-  // Pick a sensible tab when switching requests (or between HTTP and WebSocket).
-  let lastWs = false;
+  // Pick a sensible tab when switching requests (or between HTTP, WebSocket and gRPC).
+  let lastWs = "";
   $effect(() => {
     const id = r.id;
-    const w = isWs;
+    const w = isWs ? "ws" : isGrpc ? "grpc" : "";
     if (id === lastId && w === lastWs) return;
     lastId = id;
     lastWs = w;
@@ -118,6 +147,13 @@
 
   export async function format() {
     if (isWs) return;
+    if (isGrpc) {
+      tab = "message";
+      const g = app.request.grpc;
+      const p = g ? prettyJson(g.message || "{}") : null;
+      if (g && p !== null) g.message = p;
+      return;
+    }
     tab = "body";
     await tick();
     await bodyEd?.format();
@@ -149,8 +185,22 @@
     const saved = !app.isScratch;
     ui.openMenu(
       [
-        { label: "Copy as cURL", disabled: ro || isWs, reason: isWs ? "WebSocket requests have no cURL form" : undefined, shortcut: shortcutText("Mod+Shift+C", app.platform), action: () => void app.copyCurl(), testid: "menu-copy-curl" },
-        { label: "Export as cURL…", disabled: ro || isWs, reason: isWs ? "WebSocket requests have no cURL form" : undefined, action: () => (ui.exportCurl = { anchor: menuBtn ?? null }), testid: "menu-export-curl" },
+        ...(isGrpc ? [{ label: "Copy as grpcurl", disabled: ro, shortcut: shortcutText("Mod+Shift+C", app.platform), action: () => void app.copyCurl(), testid: "menu-copy-grpcurl" }] : []),
+        {
+          label: "Copy as cURL",
+          disabled: ro || isWs || isGrpc,
+          reason: isWs ? "WebSocket requests have no cURL form" : isGrpc ? "gRPC requests have no cURL form" : undefined,
+          shortcut: isGrpc ? undefined : shortcutText("Mod+Shift+C", app.platform),
+          action: () => void app.copyCurl(),
+          testid: "menu-copy-curl",
+        },
+        {
+          label: "Export as cURL…",
+          disabled: ro || isWs || isGrpc,
+          reason: isWs ? "WebSocket requests have no cURL form" : isGrpc ? "gRPC requests have no cURL form" : undefined,
+          action: () => (ui.exportCurl = { anchor: menuBtn ?? null }),
+          testid: "menu-export-curl",
+        },
         { label: "Share…", disabled: !saved || ro, action: () => (ui.shareDialog = { kind: "request", entityId: r.id, name: r.name }), testid: "menu-share" },
         { separator: true },
         { label: saved ? "Rename" : "Save to collection…", disabled: ro, shortcut: saved ? "F2" : shortcutText("Mod+S", app.platform), action: () => (saved ? startRename() : (ui.picker = { kind: "saveRequest" })) },
@@ -175,7 +225,8 @@
 
   const HTTP_TABS: ReqTab[] = ["query", "headers", "auth", "body", "tests", "prerun"];
   const WS_TABS: ReqTab[] = ["message", "saved", "headers", "auth", "query", "settings"];
-  const TABS = $derived(isWs ? WS_TABS : HTTP_TABS);
+  const GRPC_TABS: ReqTab[] = ["message", "saved", "headers", "auth", "proto", "settings"];
+  const TABS = $derived(isWs ? WS_TABS : isGrpc ? GRPC_TABS : HTTP_TABS);
 </script>
 
 <svelte:window
@@ -239,30 +290,52 @@
   <div class="row2">
     <div class="reqbar" class:invalid={!!app.sendBlocked && app.sendBlocked === "Enter a URL"}>
       <fieldset class="ro-fs" disabled={ro}>
-      <MethodSelect method={r.method} kind={isWs ? (sio ? "sio" : "ws") : "http"} onchange={(m) => (app.request.method = m)} onkind={(k, m) => app.setKind(k, m)} />
+      <MethodSelect method={r.method} kind={isWs ? (sio ? "sio" : "ws") : isGrpc ? "grpc" : "http"} onchange={(m) => (app.request.method = m)} onkind={(k, m) => app.setKind(k, m)} />
       <VarInput
         variant="url"
         lookup={app.lookup}
         value={r.url}
-        placeholder={isWs ? (sio ? "Enter a Socket.IO server URL, e.g. http://localhost:3000" : "Enter a ws:// or wss:// URL") : "Enter a URL or paste a cURL command"}
+        placeholder={isWs ? (sio ? "Enter a Socket.IO server URL, e.g. http://localhost:3000" : "Enter a ws:// or wss:// URL") : isGrpc ? GRPC_URL_PLACEHOLDER : "Enter a URL or paste a cURL command"}
         ariaLabel="URL"
         testid="url-input"
         disabled={ro}
         bind:inputEl={urlEl}
         oninput={(v) => app.setUrl(v)}
-        onpaste={isWs ? undefined : onUrlPaste}
+        onpaste={isWs || isGrpc ? undefined : onUrlPaste}
         onkeydown={(e) => {
           if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
             e.preventDefault();
             if (isWs) {
               if (!wsLive) void app.wsConnect();
+            } else if (isGrpc) {
+              if (!grpcLive) void app.grpcRun();
             } else void app.send();
           }
         }}
       />
+      {#if isGrpc && grpcUi}
+        <grpcUi.GrpcMethodPicker onuseFiles={() => {
+          if (app.request.grpc) app.request.grpc.protoSource = "files";
+          tab = "proto";
+        }} />
+      {/if}
       </fieldset>
     </div>
-    {#if isWs}
+    {#if isGrpc}
+    <button
+      class="btn send"
+      class:btn-primary={!grpcLive}
+      class:btn-secondary={grpcLive}
+      type="button"
+      disabled={!grpcLive && (ro || !r.url.trim())}
+      title={ro ? NEEDS_NEWER_VERSION : (app.sendBlocked ?? (grpcLive ? "Cancel the call" : `${sendsMessages(grpcKind) ? "Connect" : "Invoke"}  ${shortcutText("Mod+Enter", app.platform)}`))}
+      onclick={() => void app.grpcRunOrCancel()}
+      data-testid="grpc-invoke"
+      data-state={grpcLive ? "live" : "idle"}
+    >
+      {#if grpcLive}{#if grpcConnecting || app.currentInflight}<span class="spinner" aria-hidden="true"></span>{/if}Cancel{:else if sendsMessages(grpcKind)}Connect{:else}Invoke{/if}
+    </button>
+    {:else if isWs}
     <button
       class="btn send"
       class:btn-primary={!wsLive}
@@ -293,6 +366,8 @@
   </div>
   {#if app.sendBlocked}
     <div class="blocked" role="alert" data-testid="send-blocked"><Icon name="alert" small />{app.sendBlocked}</div>
+  {:else if grpcPathHint}
+    <div class="blocked info" data-testid="grpc-path-hint"><Icon name="info" small />gRPC uses only scheme, host and port</div>
   {/if}
 
   <div class="tabs">
@@ -309,19 +384,20 @@
         onkeydown={(e) => tabKey(e, TABS)}
       >
         {#if t === "query"}Query{#if queryCount}<sup data-testid="badge-query">{queryCount}</sup>{/if}
-        {:else if t === "headers"}Headers{#if headerCount}<sup data-testid="badge-headers">{headerCount}</sup>{/if}
+        {:else if t === "headers"}{isGrpc ? "Metadata" : "Headers"}{#if headerCount}<sup data-testid="badge-headers">{headerCount}</sup>{/if}
         {:else if t === "auth"}Auth{#if r.auth.type !== "none"}<span class="dot" title={r.auth.type}></span>{/if}
         {:else if t === "body"}Body{#if r.body.type !== "none"}<span class="dot" title={r.body.type}></span>{:else if queryHint}<span class="dot warn" title="QUERY requests normally carry a body"></span>{/if}
         {:else if t === "tests"}Tests
         {:else if t === "message"}Message
         {:else if t === "saved"}Saved messages{#if savedCount}<sup data-testid="badge-saved">{savedCount}</sup>{/if}
         {:else if t === "settings"}Settings
+        {:else if t === "proto"}Proto
         {:else}Pre Run{/if}
       </button>
     {/each}
     </div>
     <span class="end">
-      {#if !isWs}
+      {#if !isWs && !isGrpc}
       <button
         class="icon-btn"
         type="button"
@@ -393,6 +469,18 @@
       </div>
     {:else if tab === "body"}
       <BodyEditor bind:this={bodyEd} bind:editor={bodyCm} />
+    {:else if isGrpc && (tab === "message" || tab === "saved" || tab === "proto" || tab === "settings")}
+      {#if !grpcUi}
+        <div class="empty"><p class="faint">Loading…</p></div>
+      {:else if tab === "message"}
+        <grpcUi.GrpcMessage />
+      {:else if tab === "saved"}
+        <grpcUi.GrpcSavedMessages onload={() => (tab = "message")} />
+      {:else if tab === "proto"}
+        <grpcUi.GrpcProto />
+      {:else}
+        <grpcUi.GrpcSettings />
+      {/if}
     {:else if tab === "message"}
       <WsComposer />
     {:else if tab === "saved"}
@@ -518,6 +606,9 @@
     display: flex;
     gap: var(--sp-2);
     align-items: center;
+  }
+  .blocked.info {
+    color: var(--text-3);
   }
   .tabs .end {
     position: relative;

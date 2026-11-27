@@ -7,6 +7,7 @@ pub mod curl;
 pub mod dynamic;
 pub mod format;
 pub mod graphql;
+pub mod grpc;
 pub mod history;
 pub mod http;
 pub mod model;

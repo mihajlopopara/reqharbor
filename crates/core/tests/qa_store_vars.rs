@@ -359,6 +359,7 @@ fn entry(i: usize) -> HistoryEntry {
         response: None,
         error: None,
         ws: None,
+        grpc: None,
     }
 }
 

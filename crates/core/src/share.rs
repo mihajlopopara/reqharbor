@@ -167,6 +167,12 @@ fn strip_request_extra(r: &mut Request, replace: bool) -> usize {
             n += strip_extra(&mut sio.extra, replace);
         }
     }
+    if let Some(g) = r.grpc.as_mut() {
+        n += strip_extra(&mut g.extra, replace);
+        for m in &mut g.messages {
+            n += strip_extra(&mut m.extra, replace);
+        }
+    }
     n
 }
 
@@ -195,6 +201,12 @@ fn share_needs_credentials(name: &str) -> StoreError {
 }
 
 fn sanitize_request(r: &mut Request, replace: bool) -> usize {
+    // `.proto` files and import folders are paths on this device: never
+    // shared, whatever the options (AC-GRPC-12).
+    if let Some(g) = r.grpc.as_mut() {
+        g.proto_files.clear();
+        g.import_paths.clear();
+    }
     let mut n = sanitize_auth(&mut r.auth, replace);
     n += strip_request_extra(r, replace);
     for h in &mut r.headers {
@@ -402,6 +414,18 @@ pub fn strip_file_references(r: &mut Request, warnings: &mut Vec<String>) {
             f.value.clear();
             f.enabled = false;
         }
+    }
+    // Shares never carry the paths, so a request that uses `.proto` files
+    // arrives with empty lists: say so too (AC-GRPC-12).
+    if let Some(g) = r.grpc.as_mut()
+        && (g.local_paths() > 0 || g.proto_source == ProtoSource::Files)
+    {
+        warnings.push(format!(
+            "\"{}\": the shared .proto files and import paths were removed; choose the .proto files again (or use server reflection)",
+            r.name
+        ));
+        g.proto_files.clear();
+        g.import_paths.clear();
     }
 }
 

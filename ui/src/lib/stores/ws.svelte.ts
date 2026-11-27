@@ -1,11 +1,13 @@
 /**
- * WebSocket / Socket.IO sessions (AC-WS-*), one per open request: connection state, the message
- * log (streamed over ws_connect's channel) and the composer draft. Frames are buffered and flushed
- * at most once per animation frame so a chatty server can't stall the UI.
+ * Streaming sessions, one per open request: WebSocket / Socket.IO connections (AC-WS-*) and gRPC
+ * streams (AC-GRPC-8). Connection state, the message log (streamed over ws_connect's /
+ * grpc_start's channel) and the WebSocket composer draft. Frames are buffered and flushed at most
+ * once per animation frame so a chatty server can't stall the UI.
  */
-import { call, channel, toCommandError, type Request, type SavedMessage, type WsFrame } from "../api";
+import { call, channel, toCommandError, type GrpcCallKind, type GrpcFrame, type Request, type SavedMessage, type WsFrame } from "../api";
 import { ulid } from "../util/ulid";
-import { defaultMessage, isSocketIo, logEntry, nextState, trimLog, type LogEntry, type WsConnState } from "../util/ws";
+import { defaultMessage, isSocketIo, logEntry, nextState, trimLog, type LogEntry, type StreamFrame, type WsConnState } from "../util/ws";
+import { shortName, statusName } from "../util/grpc";
 
 export type { LogEntry };
 
@@ -17,7 +19,17 @@ export interface WsSession {
   saved: boolean;
   connectionId: string;
   state: WsConnState;
-  method: "WS" | "SIO";
+  method: "WS" | "SIO" | "GRPC";
+  /** Which commands drive it: ws_* or grpc_*. */
+  transport: "ws" | "grpc";
+  /** gRPC: "Greeter/Chat" (row 1 of the log); "" for WebSocket. */
+  title: string;
+  /** gRPC: the call kind. */
+  callKind: GrpcCallKind | null;
+  /** gRPC: the sending side was closed (End stream). */
+  halfClosed: boolean;
+  /** gRPC: the final status, once it arrived. */
+  status: { code: number; name: string; message: string } | null;
   resolvedUrl: string;
   unresolved: string[];
   startedAt: number;
@@ -31,7 +43,7 @@ export interface WsSession {
   rev: number;
 }
 
-const DATA_KINDS = new Set(["text", "binary", "event", "ack"]);
+const DATA_KINDS = new Set(["text", "binary", "event", "ack", "message"]);
 
 class WsStore {
   /** Session per request id (the last one stays after it closes, with its log). */
@@ -48,7 +60,7 @@ class WsStore {
   private registered = new Set<string>();
   /** Connections of discarded sessions still winding down: their last frame refreshes history. */
   private discarded = new Set<string>();
-  private pending = new Map<string, WsFrame[]>();
+  private pending = new Map<string, StreamFrame[]>();
   private flushScheduled = false;
   private seq = 0;
   /** Called when a session ends (history reload). */
@@ -93,6 +105,30 @@ class WsStore {
 
   /** Open a connection for `req` (validation problems reject with a CommandError). */
   async connect(req: Request, projectId: string | null): Promise<void> {
+    await this.begin(req, projectId, { transport: "ws", method: isSocketIo(req) ? "SIO" : "WS", title: "", callKind: null }, async (connectionId) => {
+      const onEvent = await channel<WsFrame>((f) => this.push(connectionId, f));
+      const res = await call("ws_connect", { connectionId, request: req, projectId, onEvent });
+      return { resolvedUrl: res.resolvedUrl, unresolved: res.unresolvedVariables, method: res.method, callKind: null };
+    });
+  }
+
+  /** Start a gRPC call streamed into the log (AC-GRPC-8); validation problems reject. */
+  async startGrpc(req: Request, projectId: string | null, callKind: GrpcCallKind | null): Promise<void> {
+    const g = req.grpc;
+    const title = g ? `${shortName(g.service)}/${g.method}` : "";
+    await this.begin(req, projectId, { transport: "grpc", method: "GRPC", title, callKind }, async (connectionId) => {
+      const onEvent = await channel<GrpcFrame>((f) => this.push(connectionId, f));
+      const res = await call("grpc_start", { connectionId, request: req, projectId, onEvent });
+      return { resolvedUrl: res.resolvedUrl, unresolved: res.unresolvedVariables, method: "GRPC" as const, callKind: res.callKind };
+    });
+  }
+
+  private async begin(
+    req: Request,
+    projectId: string | null,
+    kind: Pick<WsSession, "transport" | "method" | "title" | "callKind">,
+    start: (connectionId: string) => Promise<{ resolvedUrl: string; unresolved: string[]; method: WsSession["method"]; callKind: GrpcCallKind | null }>,
+  ): Promise<void> {
     const prev = this.sessions[req.id];
     if (prev && this.isLive(req.id)) {
       // Its last frame still arrives after its log is gone: that clears its bookkeeping.
@@ -107,7 +143,9 @@ class WsStore {
       saved: !!req.collectionId,
       connectionId,
       state: "connecting",
-      method: isSocketIo(req) ? "SIO" : "WS",
+      ...kind,
+      halfClosed: false,
+      status: null,
       resolvedUrl: req.url,
       unresolved: [],
       startedAt: Date.now(),
@@ -119,20 +157,18 @@ class WsStore {
     };
     if (prev) this.dropLog(prev.connectionId);
     this.sessions[req.id] = session;
-    const onEvent = await channel<WsFrame>((f) => this.push(connectionId, f));
     try {
-      const res = await call("ws_connect", { connectionId, request: req, projectId, onEvent });
+      const res = await start(connectionId);
       this.registered.add(connectionId);
       const s = this.byConnection(connectionId);
       if (s) {
         s.resolvedUrl = res.resolvedUrl;
-        s.unresolved = res.unresolvedVariables;
+        s.unresolved = res.unresolved;
         s.method = res.method;
+        if (res.callKind) s.callKind = res.callKind;
       }
-      // Cancel (or a delete) came while ws_connect was in flight: stop it now that Rust knows it.
-      if (this.cancelPending.delete(connectionId)) {
-        await call("ws_close", { connectionId, code: null, reason: null }).catch(() => false);
-      }
+      // Cancel (or a delete) came while the start was in flight: stop it now that Rust knows it.
+      if (this.cancelPending.delete(connectionId)) await this.stop(kind.transport, connectionId);
     } catch (e) {
       this.cancelPending.delete(connectionId);
       const s = this.byConnection(connectionId);
@@ -157,16 +193,39 @@ class WsStore {
     return call("ws_ping", { connectionId: s.connectionId });
   }
 
+  /** gRPC: send one message (JSON text) on the open call. */
+  async grpcSend(requestId: string, message: string): Promise<void> {
+    const s = this.sessions[requestId];
+    if (!s || s.transport !== "grpc" || s.state !== "open" || s.halfClosed) throw { code: "grpc_not_connected", message: "The stream isn't open" };
+    await call("grpc_send", { connectionId: s.connectionId, message });
+  }
+
+  /** gRPC: close the sending side (End stream). */
+  async grpcEnd(requestId: string): Promise<boolean> {
+    const s = this.sessions[requestId];
+    if (!s || s.transport !== "grpc" || s.state !== "open" || s.halfClosed) return false;
+    s.halfClosed = true;
+    return call("grpc_end", { connectionId: s.connectionId }).catch(() => false);
+  }
+
+  private async stop(transport: WsSession["transport"], connectionId: string, code?: number, reason?: string): Promise<void> {
+    if (transport === "grpc") await call("grpc_cancel", { connectionId }).catch(() => false);
+    else await call("ws_close", { connectionId, code: code ?? null, reason: reason ?? null }).catch(() => false);
+  }
+
+  /** Close a WebSocket (or stop connecting); cancel a gRPC call. */
   async disconnect(requestId: string, code?: number, reason?: string): Promise<void> {
     const s = this.sessions[requestId];
     if (!s || !this.isLive(requestId)) return;
-    if (s.state === "open") s.state = "closing";
+    if (s.state === "open" && s.transport === "ws") s.state = "closing";
     if (!this.registered.has(s.connectionId)) {
-      // ws_connect hasn't resolved yet: Rust doesn't know the id, so close once it does.
+      // The start hasn't resolved yet. A gRPC call is already known to Rust (it registers while it
+      // connects and reflects): cancel it right away. Either way, stop it once the start resolves.
       this.cancelPending.add(s.connectionId);
+      if (s.transport === "grpc") await call("grpc_cancel", { connectionId: s.connectionId }).catch(() => false);
       return;
     }
-    await call("ws_close", { connectionId: s.connectionId, code: code ?? null, reason: reason ?? null }).catch(() => false);
+    await this.stop(s.transport, s.connectionId, code, reason);
   }
 
   /**
@@ -253,7 +312,7 @@ class WsStore {
   }
 
   /** Channel callback: frames arrive in order; they are applied in batches. */
-  push(connectionId: string, f: WsFrame) {
+  push(connectionId: string, f: StreamFrame) {
     const q = this.pending.get(connectionId);
     if (q) q.push(f);
     else this.pending.set(connectionId, [f]);
@@ -292,6 +351,11 @@ class WsStore {
         }
         if (f.dir === "system" && f.kind === "error" && !s.error && s.state === "connecting") s.error = f.data;
         if (f.kind === "open") s.error = null;
+        if (f.kind === "end" && f.dir === "out") s.halfClosed = true;
+        if (f.kind === "status" && f.code !== undefined) {
+          const i = f.data.indexOf(": ");
+          s.status = { code: f.code, name: statusName(f.code), message: i >= 0 ? f.data.slice(i + 2) : f.data === statusName(f.code) ? "" : f.data };
+        }
         if (f.last) {
           s.endedAt = f.ts;
           ended = true;

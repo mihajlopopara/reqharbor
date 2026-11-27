@@ -5,6 +5,7 @@ mod auth_rt;
 mod commands;
 mod error;
 mod graphql_rt;
+mod grpc_rt;
 mod registry;
 mod secret_store;
 mod state;
@@ -26,6 +27,7 @@ fn main() {
                 && let Some(state) = webview.try_state::<AppState>()
             {
                 state.ws.close_all();
+                state.grpc.cancel_all();
             }
         })
         // One process per data dir: a second launch focuses the first window
@@ -172,6 +174,15 @@ fn main() {
             graphql_rt::graphql_load_schema_file,
             graphql_rt::graphql_store_schema,
             graphql_rt::graphql_clear_schema,
+            grpc_rt::grpc_cached_descriptor,
+            grpc_rt::grpc_fetch_descriptor,
+            grpc_rt::grpc_clear_descriptor,
+            grpc_rt::grpc_invoke,
+            grpc_rt::grpc_start,
+            grpc_rt::grpc_send,
+            grpc_rt::grpc_end,
+            grpc_rt::grpc_cancel,
+            grpc_rt::export_grpcurl,
             teams_rt::teams_list,
             teams_rt::team_create,
             teams_rt::team_get,
@@ -203,10 +214,10 @@ fn main() {
             // the sessions a moment to send it and write their history.
             if let RunEvent::Exit = event
                 && let Some(state) = app.try_state::<AppState>()
-                && state.ws.close_all() > 0
+                && state.ws.close_all() + state.grpc.cancel_all() > 0
             {
                 let until = std::time::Instant::now() + std::time::Duration::from_millis(800);
-                while state.ws.len() > 0 && std::time::Instant::now() < until {
+                while state.ws.len() + state.grpc.len() > 0 && std::time::Instant::now() < until {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
             }

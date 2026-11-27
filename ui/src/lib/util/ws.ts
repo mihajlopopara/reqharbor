@@ -2,9 +2,9 @@
  * WebSocket / Socket.IO helpers shared by the UI and the mock (AC-WS-*): kind switching, message
  * defaults and validation, and the message log (state machine, filter, previews).
  */
-import type { Request, SavedMessage, SocketIoConfig, WsConfig, WsFrame, WsSessionSummary } from "../api/types";
+import type { GrpcFrame, GrpcStatusDetail, Request, SavedMessage, SocketIoConfig, WsConfig, WsFrame, WsSessionSummary } from "../api/types";
+import { GRPC_MIN_CLIENT_VERSION, defaultGrpc, stampAtLeast } from "./grpc";
 import { prettyJson } from "./json";
-import { parseVersion } from "./request";
 import { formatDuration } from "./format";
 
 export const DEFAULT_SIO_PATH = "/socket.io/";
@@ -20,8 +20,14 @@ export const SEARCH_PREVIEW = 8 * 1024;
 /** The filter field's tooltip: what it searches, and what it doesn't. */
 export const FILTER_HINT = `Matches the event name, the kind, or text in the first ${SEARCH_PREVIEW / 1024} KB of each message; text further into a longer message isn't searched`;
 
+/**
+ * A message-log frame: a WebSocket / Socket.IO frame or a gRPC stream frame (AC-GRPC-8), which
+ * share one shape so the same log renders both.
+ */
+export type StreamFrame = Omit<WsFrame, "kind"> & { kind: WsFrame["kind"] | GrpcFrame["kind"]; details?: GrpcStatusDetail[] };
+
 /** A frame as the log keeps it: with a stable key and its cached search text. */
-export interface LogEntry extends WsFrame {
+export interface LogEntry extends StreamFrame {
   /** Stable key within a session's log. */
   seq: number;
   /** Lowercased event name + the start of the payload: what the text filter matches. */
@@ -31,7 +37,7 @@ export interface LogEntry extends WsFrame {
 }
 
 /** Wrap a frame for the log: computes the cached search text once. */
-export function logEntry(f: WsFrame, seq: number): LogEntry {
+export function logEntry(f: StreamFrame, seq: number): LogEntry {
   const search = `${f.event ? `${f.event.toLowerCase()} ` : ""}${f.data.slice(0, SEARCH_PREVIEW).toLowerCase()}`;
   return { ...f, seq, search, cost: (f.data.length + search.length) * 2 + 64 };
 }
@@ -69,9 +75,10 @@ export function isSocketIo(r: Pick<Request, "kind" | "ws">): boolean {
   return r.kind === "ws" && !!r.ws?.socketIo;
 }
 
-/** Badge for the method column: "WS" / "SIO" for WebSocket requests, else the HTTP method. */
+/** Badge for the method column: "WS" / "SIO" for WebSocket requests, "gRPC" for gRPC ones, else the HTTP method. */
 export function requestBadge(r: Pick<Request, "kind" | "ws" | "method">): { label: string; cls: string | null } {
   if (r.kind === "ws") return { label: r.ws?.socketIo ? "SIO" : "WS", cls: "m-ws" };
+  if (r.kind === "grpc") return { label: "gRPC", cls: "m-grpc" };
   return { label: r.method, cls: null };
 }
 
@@ -84,27 +91,35 @@ export const WS_MIN_CLIENT_VERSION = "0.1.0";
 
 /** Keeps the newer of the current stamp and WS_MIN_CLIENT_VERSION (never lowers a `minClientVersion`). */
 function stamp(current: string | undefined): string {
-  if (current === undefined) return WS_MIN_CLIENT_VERSION;
-  const a = parseVersion(current);
-  const b = parseVersion(WS_MIN_CLIENT_VERSION);
-  if (!a || !b) return current;
-  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i] ? current : WS_MIN_CLIENT_VERSION;
-  return current;
-}
-
-/** Mirrors core `Request::stamp_min_client_version`: WebSocket requests carry at least WS_MIN_CLIENT_VERSION. */
-export function stampMinClientVersion(r: Request): void {
-  if (r.kind === "ws") r.minClientVersion = stamp(r.minClientVersion);
+  return stampAtLeast(current, WS_MIN_CLIENT_VERSION);
 }
 
 /**
- * Switch a request (in place) to WebSocket ("ws"), Socket.IO ("sio") or back to HTTP with `method`.
- * `ws` is kept when going back to HTTP; WebSocket kinds stamp `minClientVersion` (AC-WS-1).
+ * Mirrors core `Request::stamp_min_client_version`: WebSocket requests carry at least
+ * WS_MIN_CLIENT_VERSION, gRPC requests at least GRPC_MIN_CLIENT_VERSION.
  */
-export function switchKind(r: Request, target: "http" | "ws" | "sio", method = "GET"): void {
+export function stampMinClientVersion(r: Request): void {
+  if (r.kind === "ws") r.minClientVersion = stamp(r.minClientVersion);
+  else if (r.kind === "grpc") r.minClientVersion = stampAtLeast(r.minClientVersion, GRPC_MIN_CLIENT_VERSION);
+}
+
+export type KindTarget = "http" | "ws" | "sio" | "grpc";
+
+/**
+ * Switch a request (in place) to WebSocket ("ws"), Socket.IO ("sio"), gRPC ("grpc") or back to HTTP
+ * with `method`. `ws` and `grpc` are kept when switching away; WebSocket and gRPC stamp
+ * `minClientVersion` (AC-WS-1, AC-GRPC-1).
+ */
+export function switchKind(r: Request, target: KindTarget, method = "GET"): void {
   if (target === "http") {
     delete r.kind;
     r.method = method;
+    return;
+  }
+  if (target === "grpc") {
+    r.kind = "grpc";
+    r.grpc ??= defaultGrpc();
+    r.minClientVersion = stampAtLeast(r.minClientVersion, GRPC_MIN_CLIENT_VERSION);
     return;
   }
   r.kind = "ws";
@@ -149,7 +164,7 @@ export function messageTitle(m: SavedMessage): string {
 export type WsConnState = "idle" | "connecting" | "open" | "closing" | "closed";
 
 /** Connection state after `f` arrives. */
-export function nextState(state: WsConnState, f: WsFrame): WsConnState {
+export function nextState(state: WsConnState, f: StreamFrame): WsConnState {
   if (f.dir !== "system") {
     if (f.dir === "out" && f.kind === "close") return "closing";
     return state;
@@ -175,7 +190,7 @@ export const EMPTY_FILTER: LogFilter = { text: "", dir: "all", hideHeartbeats: f
  * Frames matching the filter. Text matches case-insensitively against the event name and the first
  * SEARCH_PREVIEW bytes of the payload (the cached `search` of a log entry), or the kind.
  */
-export function filterLog<T extends WsFrame & { search?: string }>(frames: readonly T[], f: LogFilter): T[] {
+export function filterLog<T extends StreamFrame & { search?: string }>(frames: readonly T[], f: LogFilter): T[] {
   const q = f.text.trim().toLowerCase();
   if (!q && f.dir === "all" && !f.hideHeartbeats) return frames as T[];
   return frames.filter((fr) => {
@@ -211,7 +226,7 @@ export function base64Hex(b64: string, max = 64): string {
 }
 
 /** One-line preview of a frame for the log row. */
-export function frameSummary(f: WsFrame): string {
+export function frameSummary(f: StreamFrame): string {
   switch (f.kind) {
     case "binary":
       return `Binary · ${base64Hex(f.data, 16)}`;
@@ -227,6 +242,13 @@ export function frameSummary(f: WsFrame): string {
       return `${f.event ?? "event"}${f.ackId !== undefined ? ` #${f.ackId}` : ""} ${argsPreview(f.data)}`.trim();
     case "ack":
       return `Ack #${f.ackId ?? "?"} ${argsPreview(f.data)}`.trim();
+    case "headers":
+    case "trailers":
+      return f.data ? f.data.split("\n").join(" · ") : "(none)";
+    case "end":
+      return f.data || "End of stream";
+    case "status":
+      return f.code !== undefined ? `${f.code} ${f.data}` : f.data;
     default:
       return f.data.replace(/\s+/g, " ");
   }
@@ -240,10 +262,14 @@ function argsPreview(data: string): string {
 }
 
 /** The expanded view of a frame: pretty JSON when the payload is JSON, decoded text, or hex. */
-export function frameDetail(f: WsFrame): { text: string; json: boolean } {
+export function frameDetail(f: StreamFrame): { text: string; json: boolean } {
   if (f.kind === "binary" || f.kind === "ping" || f.kind === "pong") {
     const t = f.data ? base64Text(f.data) : "";
     return { text: t !== null && t !== "" ? t : base64Hex(f.data, 4096), json: false };
+  }
+  if (f.kind === "status" && f.details?.length) {
+    const lines = f.details.map((d) => `${d.typeUrl}\n${d.json ?? `base64 ${d.base64}`}`);
+    return { text: `${frameSummary(f)}\n\n${lines.join("\n\n")}`, json: false };
   }
   const pretty = f.dir !== "system" ? prettyJson(f.data) : null;
   if (pretty !== null) return { text: pretty, json: true };
@@ -251,13 +277,13 @@ export function frameDetail(f: WsFrame): { text: string; json: boolean } {
 }
 
 /** What Copy puts on the clipboard: the raw payload (decoded text for UTF-8 binary). */
-export function frameCopyText(f: WsFrame): string {
+export function frameCopyText(f: StreamFrame): string {
   if (f.kind === "event") return `${f.event ?? ""} ${f.data}`.trim();
   return f.data;
 }
 
 /** Height of a log row; expanded rows grow with their content (capped, then they scroll). */
-export function rowHeight(f: WsFrame, expanded: boolean): number {
+export function rowHeight(f: StreamFrame, expanded: boolean): number {
   const ROW = 30;
   if (!expanded) return ROW;
   const lines = frameDetail(f).text.split("\n").length;

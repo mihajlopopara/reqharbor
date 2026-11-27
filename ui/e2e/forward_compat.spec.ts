@@ -18,7 +18,7 @@ test("AC-FWD-3: tree badge, kind label and Open/Delete-only menu", async ({ page
   const grpc = node(page, "Say hello");
   await expect(grpc).toBeVisible();
   await expect(grpc.getByTestId("newer-badge")).toHaveAttribute("aria-label", "Requires a newer ReqHarbor");
-  await expect(grpc.getByTestId("tree-kind")).toHaveText("GRPC");
+  await expect(grpc.getByTestId("tree-kind")).toHaveText("MQTT");
   const proto = node(page, "Upload protobuf");
   await expect(proto.getByTestId("newer-badge")).toBeVisible();
   await expect(proto.getByTestId("tree-kind")).toHaveText("NEW");

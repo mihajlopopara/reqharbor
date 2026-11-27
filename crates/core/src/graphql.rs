@@ -452,11 +452,18 @@ impl SchemaCache {
         }
     }
 
+    /// A cache with the same file layout and eviction in another folder
+    /// (the gRPC descriptor cache).
+    pub fn in_dir(dir: PathBuf) -> Self {
+        SchemaCache { dir }
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    fn file_for(&self, url: &str) -> PathBuf {
+    /// `<dir>/<sha256(url)[..16] hex>.json`.
+    pub fn file_for(&self, url: &str) -> PathBuf {
         let digest = ring::digest::digest(&ring::digest::SHA256, url.as_bytes());
         let hex: String = digest
             .as_ref()

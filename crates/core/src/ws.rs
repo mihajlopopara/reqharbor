@@ -477,7 +477,9 @@ fn err(kind: ErrorKind, message: impl Into<String>) -> SendError {
     }
 }
 
-mod tls {
+/// TLS client configs shared by WebSocket and gRPC (ring, platform
+/// verifier, or accept-anything for `verifyTls: false`).
+pub(crate) mod tls {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::crypto::CryptoProvider;
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -566,6 +568,20 @@ mod tls {
             return Ok(c.clone());
         }
         let built = build(verify)?;
+        Ok(cell.get_or_init(|| built).clone())
+    }
+
+    /// [`config`] offering ALPN `h2` (gRPC over TLS).
+    pub fn h2_config(verify: bool) -> Result<Arc<ClientConfig>, String> {
+        static SECURE: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+        static INSECURE: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+        let cell = if verify { &SECURE } else { &INSECURE };
+        if let Some(c) = cell.get() {
+            return Ok(c.clone());
+        }
+        let mut cfg = (*config(verify)?).clone();
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+        let built = Arc::new(cfg);
         Ok(cell.get_or_init(|| built).clone())
     }
 }
@@ -1346,6 +1362,7 @@ pub fn history_entry(
             message: e.message.replace(&prepared.url, &prepared.display_url),
         }),
         ws: Some(stats.summary.clone()),
+        grpc: None,
     };
     redactor.redact_struct(&entry)
 }
@@ -1786,8 +1803,17 @@ mod tests {
             prepare_ws(&r, &VarScope::empty(), None).unwrap_err(),
             PrepareError::InvalidSocketIoAuth(_)
         ));
+        // A gRPC request (editable here) is not a WebSocket one; a newer kind is read-only.
         let r = Request {
             kind: RequestKind::Grpc,
+            ..ws_request("ws://a")
+        };
+        assert_eq!(
+            prepare_ws(&r, &VarScope::empty(), None).unwrap_err(),
+            PrepareError::NotWebSocket
+        );
+        let r = Request {
+            kind: RequestKind::Other("mqtt".into()),
             ..ws_request("ws://a")
         };
         assert_eq!(

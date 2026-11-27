@@ -369,6 +369,9 @@ span.icon-btn:hover {
 .m-ws {
   color: var(--method-ws);
 }
+.m-grpc {
+  color: var(--method-grpc);
+}
 .code-chip {
   display: inline-flex;
   align-items: center;

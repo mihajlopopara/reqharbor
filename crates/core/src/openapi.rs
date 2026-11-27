@@ -1082,6 +1082,7 @@ impl<'a> Importer<'a> {
             body,
             settings: RequestSettings::default(),
             ws: None,
+            grpc: None,
             sort_order: 0,
             created_at: 0,
             updated_at: 0,

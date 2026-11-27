@@ -5,7 +5,7 @@
 //! The file is compacted to the newest 500 entries on open and whenever it
 //! grows past 500 + [`COMPACT_SLACK`] lines.
 
-use crate::model::{ErrorKind, HistoryEntry, WsSessionSummary};
+use crate::model::{ErrorKind, GrpcCallSummary, HistoryEntry, WsSessionSummary};
 use crate::storage::{StoreError, atomic_write};
 use serde::Serialize;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -28,6 +28,9 @@ pub struct HistorySummary {
     pub source_request_id: Option<String>,
     /// WebSocket / Socket.IO sessions: duration and message counts.
     pub ws: Option<WsSessionSummary>,
+    /// gRPC calls: kind, counts, duration and status, without the response,
+    /// headers, trailers and status details (AC-GRPC-10).
+    pub grpc: Option<GrpcCallSummary>,
 }
 
 impl HistorySummary {
@@ -42,6 +45,17 @@ impl HistorySummary {
             error_kind: e.error.as_ref().map(|e| e.kind),
             source_request_id: e.source_request_id.clone(),
             ws: e.ws.clone(),
+            grpc: e.grpc.as_ref().map(|g| GrpcCallSummary {
+                response: None,
+                response_truncated: false,
+                headers: None,
+                trailers: None,
+                status: g.status.as_ref().map(|s| crate::model::GrpcStatus {
+                    details: Vec::new(),
+                    ..s.clone()
+                }),
+                ..g.clone()
+            }),
         }
     }
 
@@ -260,6 +274,7 @@ mod tests {
                 message: "cancelled".into(),
             }),
             ws: None,
+            grpc: None,
         }
     }
 

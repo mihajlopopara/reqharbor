@@ -161,6 +161,7 @@
   --method-options: #c3aa94;
   --method-custom: #a4a8ae;
   --method-ws: #f08cc4;        /* WebSocket / Socket.IO requests (WS, SIO) */
+  --method-grpc: #b5d147;      /* gRPC requests and calls */
 
   /* Status codes */
   --status-1xx: #aab1bd;
@@ -254,6 +255,7 @@
   --method-options: #75604c;
   --method-custom: #5c636e;
   --method-ws: #a3306f;
+  --method-grpc: #5a6e00;
 
   --status-1xx: #4a5260;
   --status-2xx: #167246;
@@ -339,6 +341,7 @@
     --method-options: #75604c;
     --method-custom: #5c636e;
     --method-ws: #a3306f;
+    --method-grpc: #5a6e00;
 
     --status-1xx: #4a5260;
     --status-2xx: #167246;

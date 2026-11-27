@@ -1163,8 +1163,18 @@ fn is_team_scope(store: &Store, scope: &Scope) -> bool {
 }
 
 /// Team pushes leave device-local paths out (AC-TSYNC-8): a binary body's
-/// path and the value of each form file field stay on this device.
+/// path, the value of each form file field and a gRPC request's `.proto`
+/// files and import folders (AC-GRPC-4) stay on this device.
 pub fn strip_device_local_paths(data: &mut Value) {
+    if let Some(grpc) = data.get_mut("grpc").and_then(Value::as_object_mut) {
+        for key in ["protoFiles", "importPaths"] {
+            if let Some(v) = grpc.get_mut(key)
+                && v.is_array()
+            {
+                *v = Value::Array(Vec::new());
+            }
+        }
+    }
     let Some(body) = data.get_mut("body").and_then(Value::as_object_mut) else {
         return;
     };
@@ -2230,6 +2240,14 @@ fn upsert_remote(store: &mut Store, scope: &Scope, change: &Change) -> Result<()
 /// Keep `local`'s binary path and form file values where `r` (pulled from a
 /// team space) has them blank.
 fn keep_local_paths(r: &mut Request, local: &Request) {
+    if let (Some(g), Some(lg)) = (r.grpc.as_mut(), local.grpc.as_ref()) {
+        if g.proto_files.is_empty() {
+            g.proto_files = lg.proto_files.clone();
+        }
+        if g.import_paths.is_empty() {
+            g.import_paths = lg.import_paths.clone();
+        }
+    }
     let blank = |v: &Option<String>| v.as_deref().is_none_or(str::is_empty);
     if blank(&r.body.binary_path) && !blank(&local.body.binary_path) {
         r.body.binary_path = local.body.binary_path.clone();

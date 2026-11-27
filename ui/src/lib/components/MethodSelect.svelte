@@ -6,7 +6,8 @@
 
   /**
    * Method dropdown (DESIGN §5.5): listbox, type-ahead, Custom… inline input. The WS / SIO entries
-   * switch the request kind to WebSocket / Socket.IO (AC-WS-1); `kind` says which one is current.
+   * switch the request kind to WebSocket / Socket.IO (AC-WS-1), the gRPC entry to gRPC (AC-GRPC-1);
+   * `kind` says which one is current.
    */
   let {
     method,
@@ -16,14 +17,17 @@
   }: {
     method: string;
     onchange: (m: string) => void;
-    kind?: "http" | "ws" | "sio";
-    onkind?: (k: "http" | "ws" | "sio", method?: string) => void;
+    kind?: "http" | "ws" | "sio" | "grpc";
+    onkind?: (k: "http" | "ws" | "sio" | "grpc", method?: string) => void;
   } = $props();
 
-  const HINTS: Record<string, string> = { QUERY: "safe, with body", HEAD: "headers only", OPTIONS: "capabilities", DELETE: "remove", WS: "WebSocket", SIO: "Socket.IO" };
-  const OPTIONS: readonly string[] = $derived([...STANDARD_METHODS, ...(onkind ? ["WS", "SIO"] : []), "CUSTOM"]);
+  const HINTS: Record<string, string> = { QUERY: "safe, with body", HEAD: "headers only", OPTIONS: "capabilities", DELETE: "remove", WS: "WebSocket", SIO: "Socket.IO", GRPC: "gRPC" };
+  const OPTIONS: readonly string[] = $derived([...STANDARD_METHODS, ...(onkind ? ["WS", "SIO", "GRPC"] : []), "CUSTOM"]);
   /** What the trigger shows and the list marks as current. */
-  const current = $derived(kind === "ws" ? "WS" : kind === "sio" ? "SIO" : method);
+  const current = $derived(kind === "ws" ? "WS" : kind === "sio" ? "SIO" : kind === "grpc" ? "GRPC" : method);
+  /** Printed name: "gRPC" for the gRPC entry. */
+  const label = (o: string) => (o === "GRPC" ? "gRPC" : o);
+  const optClass = (o: string) => (o === "WS" || o === "SIO" ? "m-ws" : o === "GRPC" ? "m-grpc" : methodClass(o));
 
   let open = $state(false);
   let hl = $state(0);
@@ -43,6 +47,7 @@
 
   function apply(m: string) {
     if (m === "WS" || m === "SIO") onkind?.(m === "WS" ? "ws" : "sio");
+    else if (m === "GRPC") onkind?.("grpc");
     else if (kind !== "http") onkind?.("http", m);
     else onchange(m);
   }
@@ -145,14 +150,14 @@
       type="button"
       aria-haspopup="listbox"
       aria-expanded={open}
-      aria-label="Method: {kind === 'ws' ? 'WebSocket' : kind === 'sio' ? 'Socket.IO' : method}"
+      aria-label="Method: {kind === 'ws' ? 'WebSocket' : kind === 'sio' ? 'Socket.IO' : kind === 'grpc' ? 'gRPC' : method}"
       title={current.length > 7 ? current : undefined}
       data-testid="method-select"
       data-method={current}
       onclick={() => (open ? (open = false) : void openList())}
       onkeydown={triggerKey}
     >
-      <span class="m {kind === 'http' ? methodClass(method) : 'm-ws'}">{methodLabel(current)}</span>
+      <span class="m {kind === 'http' ? methodClass(method) : optClass(current)}">{methodLabel(label(current))}</span>
       <Icon name="chev-d" small />
     </button>
   {/if}
@@ -185,7 +190,7 @@
             <span>Custom…</span>
             {#if kind === "http" && !STANDARD_METHODS.includes(method as never)}<span class="sc cur" aria-hidden="true"><span class="m m-custom">{method}</span><Icon name="check" small /></span>{/if}
           {:else}
-            <span class="m {o === 'WS' || o === 'SIO' ? 'm-ws' : methodClass(o)} big">{o}</span>
+            <span class="m {optClass(o)} big">{label(o)}</span>
             {#if o === current}<span class="sc cur" aria-hidden="true"><Icon name="check" small /></span>
             {:else if HINTS[o]}<span class="sc">{HINTS[o]}</span>{/if}
           {/if}
