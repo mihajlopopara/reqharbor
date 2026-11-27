@@ -36,3 +36,7 @@ button:disabled{opacity:.6;cursor:progress}
 .links{display:flex;flex-wrap:wrap;gap:var(--sp-6);font-size:var(--fs-md)}
 a{color:var(--accent-fg)}
 .ok{color:var(--method-get)}
+.providers{display:flex;flex-direction:column;gap:var(--sp-4);margin:0 0 var(--sp-6)}
+.button.secondary{background:var(--bg-input);color:var(--text-1);border:1px solid var(--border-strong)}
+.button.secondary:hover{background:var(--bg-active)}
+.or{text-align:center;margin:0 0 var(--sp-6)}

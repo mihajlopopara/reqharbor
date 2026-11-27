@@ -2,7 +2,8 @@
 {{define "content"}}<h1>{{if .Setup}}Create the admin account{{else}}Create your account{{end}}</h1>
 <p class="meta">{{if .Device}}On {{.Device}}, started {{.Started}}.{{else}}Started {{.Started}}.{{end}} Only continue if you just clicked Sign in in ReqHarbor.</p>
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
-<form method="post" action="/auth/password/signup">
+{{template "providers" .}}{{if and .Providers .PasswordAuth}}<p class="or meta">Or create an account with your email</p>{{end}}
+{{if .PasswordAuth}}<form method="post" action="/auth/password/signup">
 <input type="hidden" name="ar" value="{{.AR}}">
 {{if .NeedInvite}}<label>Invite code<input class="code" type="text" name="code" required maxlength="64" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX"></label>{{end}}
 <label>Name<input type="text" name="name" autocomplete="name" maxlength="100" value="{{.Name}}"></label>
@@ -10,6 +11,6 @@
 <label>Password<input type="password" name="password" autocomplete="new-password" required minlength="10" maxlength="256"></label>
 <p class="meta">At least 10 characters.</p>
 <button type="submit">Create account</button>
-</form>
+</form>{{end}}
 <div class="links"><a href="/auth/authorize?{{.ResumeQuery}}">I already have an account</a></div>
 {{end}}

@@ -2,6 +2,7 @@
 {{define "content"}}<h1>Sign in to {{.ServerName}}</h1>
 <p class="meta">{{if .Device}}On {{.Device}}, started {{.Started}}.{{else}}Started {{.Started}}.{{end}} Only continue if you just clicked Sign in in ReqHarbor.</p>
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+{{template "providers" .}}{{if and .Providers .PasswordAuth}}<p class="or meta">Or use your email and password</p>{{end}}
 {{if .PasswordAuth}}<form method="post" action="/auth/password/login"{{if .PoW}} data-challenge="{{.PoW.Challenge}}" data-difficulty="{{.PoW.Difficulty}}"{{end}}>
 <input type="hidden" name="ar" value="{{.AR}}">
 {{if .PoW}}<input type="hidden" name="pow" value="">
@@ -12,5 +13,5 @@
 <button type="submit">Sign in</button>
 </form>
 <div class="links">{{if .SignupLink}}<a href="/auth/signup?ar={{.AR}}">Create an account</a>{{end}}<a href="/auth/forgot">Forgot password?</a></div>
-{{else}}<p>This server has no sign-in method turned on. Ask its admin.</p>{{end}}
+{{else if not .Providers}}<p>This server has no sign-in method turned on. Ask its admin.</p>{{end}}
 {{end}}

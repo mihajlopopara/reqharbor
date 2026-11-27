@@ -599,9 +599,20 @@ func TestAuth_MethodsAreCheckedOnEveryAuthRoute(t *testing.T) {
 			t.Errorf("%s: %d %q", path, r.StatusCode, r.Header.Get("Allow"))
 		}
 	}
-	// Providers arrive in S5.
+	// A provider route of a provider that is not configured is 404 (S5: GitHub needs its
+	// credentials); configured provider routes are GET only.
 	if r := h.Call(t, "/auth/start/github", tu.Req{}); r.StatusCode != 404 {
 		t.Errorf("/auth/start/github %d", r.StatusCode)
+	}
+	gh := tu.NewFakeGitHub(t)
+	hg := tu.New(t, gh.Options()...)
+	for _, path := range []string{"/auth/start/github", "/auth/callback/github"} {
+		if r := hg.Call(t, path, tu.Req{Method: http.MethodPost}); r.StatusCode != 405 || r.Header.Get("Allow") != "GET" {
+			t.Errorf("%s: %d %q", path, r.StatusCode, r.Header.Get("Allow"))
+		}
+	}
+	if r := hg.Call(t, "/auth/start/google", tu.Req{}); r.StatusCode != 404 {
+		t.Errorf("/auth/start/google %d", r.StatusCode)
 	}
 }
 

@@ -100,6 +100,8 @@ func MethodLabel(tx store.ReadTx, userID string) (string, error) {
 		return "Google", nil
 	case "oidc":
 		return "single sign-on", nil
+	case "dev":
+		return "Dev sign-in", nil
 	}
 	return id.Provider, nil
 }

@@ -7,8 +7,10 @@
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
 <form method="post" action="/auth/code">
 <input type="hidden" name="ar" value="{{.AR}}">
+{{if .Continue}}<input type="hidden" name="continue" value="{{.Continue}}">{{end}}
 <label>{{if .Setup}}Setup code{{else}}Invite code{{end}}<input class="code" type="text" name="code" required maxlength="64" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" autofocus></label>
 <button type="submit">Continue</button>
 </form>
+{{if .Providers}}<p class="or meta">Or, if this server's admin email is yours:</p>{{template "providers" .}}{{end}}
 {{if not .Setup}}<div class="links"><a href="/auth/authorize?{{.ResumeQuery}}">Back to sign in</a></div>{{end}}
 {{end}}

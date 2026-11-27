@@ -103,6 +103,17 @@ func (t *rtx) IdentityOf(userID string) (*store.Identity, error) {
 	return &i, nil
 }
 
+func (t *rtx) IdentityBySubject(provider, issuer, subject string) (*store.Identity, error) {
+	var i store.Identity
+	err := t.row(`SELECT provider, issuer, subject, user_id, email, created_at, last_login_at FROM identities
+	              WHERE provider = ? AND issuer = ? AND subject = ?`, provider, issuer, subject).
+		Scan(&i.Provider, &i.Issuer, &i.Subject, &i.UserID, &i.Email, &i.CreatedAt, &i.LastLoginAt)
+	if err != nil {
+		return nil, notFound(err)
+	}
+	return &i, nil
+}
+
 func (t *rtx) PersonalSpace(userID string) (*store.Personal, error) {
 	var p store.Personal
 	err := t.row(`SELECT t.id, w.id, w.name, w.created_at FROM teams t JOIN workspaces w ON w.team_id = t.id
@@ -114,24 +125,29 @@ func (t *rtx) PersonalSpace(userID string) (*store.Personal, error) {
 }
 
 const authRequestCols = `id, browser_hash, client_id, redirect_uri, code_challenge, client_state, device_name, method_hint,
-	grant_token_hash, provider, password_attempts, code_attempts, user_id, code_hash, code_expires_at, created_at, expires_at, consumed_at`
+	grant_token_hash, provider, upstream_verifier, password_attempts, code_attempts, user_id, code_hash, code_expires_at, created_at, expires_at, consumed_at`
 
 func scanAuthRequest(r scanner) (*store.AuthRequest, error) {
 	var a store.AuthRequest
-	var hint, grant, provider, user, code sql.NullString
+	var hint, grant, provider, verifier, user, code sql.NullString
 	var codeExp, consumed sql.NullInt64
 	err := r.Scan(&a.ID, &a.BrowserHash, &a.ClientID, &a.RedirectURI, &a.CodeChallenge, &a.ClientState, &a.DeviceName, &hint,
-		&grant, &provider, &a.PasswordAttempts, &a.CodeAttempts, &user, &code, &codeExp, &a.CreatedAt, &a.ExpiresAt, &consumed)
+		&grant, &provider, &verifier, &a.PasswordAttempts, &a.CodeAttempts, &user, &code, &codeExp, &a.CreatedAt, &a.ExpiresAt, &consumed)
 	if err != nil {
 		return nil, notFound(err)
 	}
 	a.MethodHint, a.GrantTokenHash, a.Provider, a.UserID, a.CodeHash = nullStr(&hint), nullStr(&grant), nullStr(&provider), nullStr(&user), nullStr(&code)
+	a.UpstreamVerifier = nullStr(&verifier)
 	a.CodeExpiresAt, a.ConsumedAt = nullInt(&codeExp), nullInt(&consumed)
 	return &a, nil
 }
 
 func (t *rtx) AuthRequest(id string) (*store.AuthRequest, error) {
 	return scanAuthRequest(t.row("SELECT "+authRequestCols+" FROM auth_requests WHERE id = ?", id))
+}
+
+func (t *rtx) AuthRequestByUpstreamState(stateHash string) (*store.AuthRequest, error) {
+	return scanAuthRequest(t.row("SELECT "+authRequestCols+" FROM auth_requests WHERE upstream_state_hash = ?", stateHash))
 }
 
 const tokenCols = "token_hash, id, purpose, user_id, email, max_uses, uses, created_by, created_at, expires_at, revoked_at"
@@ -306,6 +322,19 @@ func (t *wtx) InsertIdentity(i store.Identity) error {
 	return err
 }
 
+func (t *wtx) TouchIdentity(provider, issuer, subject, email string, now int64) error {
+	return one(t.exec(`UPDATE identities SET email = CASE WHEN ?1 = '' THEN email ELSE ?1 END, last_login_at = ?2
+	     WHERE provider = ?3 AND issuer = ?4 AND subject = ?5`, email, now, provider, issuer, subject))
+}
+
+func (t *wtx) SetUserProfile(id, name string, avatarURL *string, now int64) error {
+	return one(t.exec("UPDATE users SET name = ?, avatar_url = ?, updated_at = ? WHERE id = ?", name, avatarURL, now, id))
+}
+
+func (t *wtx) SetUserEmail(id, email string, trusted bool, now int64) error {
+	return one(t.exec("UPDATE users SET email = ?, email_trusted = ?, updated_at = ? WHERE id = ?", email, boolInt(trusted), now, id))
+}
+
 func (t *wtx) InsertPersonal(userID string, p store.Personal) error {
 	if _, err := t.exec("INSERT INTO teams (id, name, personal, owner_user_id, created_at) VALUES (?, ?, 1, ?, ?)",
 		p.TeamID, p.Name, userID, p.CreatedAt); err != nil {
@@ -330,6 +359,21 @@ func (t *wtx) InsertAuthRequest(a store.AuthRequest) error {
 
 func (t *wtx) SetAuthRequestGrant(id, grantHash string) error {
 	return one(t.exec("UPDATE auth_requests SET grant_token_hash = ? WHERE id = ?", grantHash, id))
+}
+
+func (t *wtx) SetAuthRequestUpstream(id, provider, stateHash, verifier string) error {
+	return one(t.exec(`UPDATE auth_requests SET provider = ?, upstream_state_hash = ?, upstream_verifier = ?
+	     WHERE id = ? AND consumed_at IS NULL AND code_hash IS NULL`, provider, stateHash, verifier, id))
+}
+
+func (t *wtx) ClearAuthRequestUpstream(id string) error {
+	_, err := t.exec("UPDATE auth_requests SET upstream_state_hash = NULL, upstream_verifier = NULL WHERE id = ?", id)
+	return err
+}
+
+func (t *wtx) ConsumeAuthRequest(id string, now int64) error {
+	_, err := t.exec("UPDATE auth_requests SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL", now, id)
+	return err
 }
 
 func (t *wtx) IncrAuthRequestAttempts(id, field string) (int64, error) {

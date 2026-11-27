@@ -4,6 +4,7 @@
 package auth
 
 import (
+	"html/template"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mihajlopopara/reqharbor/server/internal/auth/providers"
 	"github.com/mihajlopopara/reqharbor/server/internal/auth/throttle"
 	"github.com/mihajlopopara/reqharbor/server/internal/clientip"
 	"github.com/mihajlopopara/reqharbor/server/internal/clock"
@@ -58,6 +60,8 @@ type Deps struct {
 	// UserCreated is called after an account was created through the pages (discovery rebuilds
 	// setupRequired).
 	UserCreated func()
+	// HTTPClient makes the outbound provider calls; nil means providers.DefaultHTTPClient.
+	HTTPClient *http.Client
 }
 
 // Service serves the auth routes.
@@ -66,6 +70,13 @@ type Service struct {
 	public     *url.URL
 	cookieName string
 	cop        *http.CrossOriginProtection
+
+	// External providers (S5), in their fixed order, and by id.
+	providers  []providers.Provider
+	providerBy map[string]providers.Provider
+
+	formPagesMu sync.Mutex
+	formPages   map[string]*template.Template
 
 	// Limiters (§5.9). Keys are prefixed with their purpose and hashed by ratelimit.
 	PagesLimiter   *ratelimit.Limiter // /auth/* per IP, 120 / min
@@ -93,6 +104,11 @@ func New(d Deps) *Service {
 		s.renderError(w, r, http.StatusForbidden, pageError{Code: "wrong_origin", Title: "Request blocked",
 			Message: "This form was sent from another site. Open this page from " + s.Config.PublicURL + "."})
 	}))
+	s.providers = providers.Enabled(d.Config, d.HTTPClient)
+	s.providerBy = make(map[string]providers.Provider, len(s.providers))
+	for _, p := range s.providers {
+		s.providerBy[p.ID()] = p
+	}
 	c := d.Clock
 	s.PagesLimiter = ratelimit.New(c, d.Config.RateAuthPerMin, time.Minute)
 	s.LoginLimiter = ratelimit.New(c, d.Config.RateLoginPerMin, time.Minute)
@@ -108,12 +124,17 @@ func (s *Service) Limiters() []*ratelimit.Limiter {
 	return []*ratelimit.Limiter{s.PagesLimiter, s.LoginLimiter, s.SignupLimiter, s.CodeLimiter, s.TokenLimiter, s.FailedExchange}
 }
 
-// Methods are the enabled sign-in methods in their fixed order (§5.1). External providers arrive
-// in S5 (GitHub) and M3 (Google, OIDC); the dev provider is never listed.
+// Methods are the enabled sign-in methods in their fixed order (§5.1): password, then each
+// configured provider (GitHub from S5; Google and OIDC in M3). The dev provider is never listed.
 func Methods(cfg *config.Config) []Method {
 	var out []Method
 	if cfg.PasswordAuth {
 		out = append(out, Method{ID: "password", Label: "Email and password"})
+	}
+	for _, p := range providers.Enabled(cfg, nil) {
+		if providers.Listed(p) {
+			out = append(out, Method{ID: p.ID(), Label: p.Label()})
+		}
 	}
 	return out
 }
@@ -138,6 +159,11 @@ func (s *Service) Register(mux *http.ServeMux) {
 	mux.Handle("/auth/done", page(http.HandlerFunc(s.done), nil))
 	mux.Handle("/auth/forgot", page(http.HandlerFunc(s.forgot), http.HandlerFunc(s.forgot)))
 	mux.Handle("/auth/reset", page(http.HandlerFunc(s.resetPage), http.HandlerFunc(s.reset)))
+	mux.Handle("/auth/start/{provider}", s.providerRoute(page(http.HandlerFunc(s.start), nil)))
+	mux.Handle("/auth/callback/{provider}", s.providerRoute(page(http.HandlerFunc(s.callback), nil)))
+	if dev := s.devProvider(); dev != nil {
+		mux.Handle(providers.DevFormPath, s.formRoute(dev, page(nil, http.HandlerFunc(s.devSubmit))))
+	}
 
 	mux.Handle("/v1/auth/token", httpx.Methods{{Name: "POST", Handler: httpx.Func(s.token)}})
 	mux.Handle("/v1/auth/logout", httpx.Methods{{Name: "POST", Handler: httpx.Func(s.logout)}})

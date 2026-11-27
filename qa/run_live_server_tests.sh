@@ -11,7 +11,9 @@
 #   2. cargo test --test qa_sync_live -- --ignored  (today's Rust client <-> Go server, token sync)
 #   3. cargo test --test qa_server_live -- --ignored (Go-server-only raw HTTP cases, including the S4
 #      accounts case: it signs up the first account with the setup code that `serve` logs, which this
-#      script reads from the log and passes as REQHARBOR_LIVE_SIGNUP_CODE)
+#      script reads from the log and passes as REQHARBOR_LIVE_SIGNUP_CODE; and the S5 dev-provider
+#      case, which signs up through the dev form with an invite made here with `invite create` and
+#      passed as REQHARBOR_LIVE_INVITE_CODE)
 #   4. cargo test --test qa_auth_live -- --ignored  (the client's sign-in, M1-client C1; §7.5 step 6)
 #      with REQHARBOR_LIVE_SIGNUP_CODE set to a multi-use invite made with `invite create`. It needs
 #      the S6 routes (GET /v1/me, sessions, personal spaces; §9, §10 S6), so by default
@@ -92,16 +94,24 @@ BASE="$BASE" bash "$ROOT/qa/worker_smoke.sh"
 SMOKE=$?
 
 cd "$ROOT" || exit 2
-run_live() { # run_live <test target> [signup code]
+run_live() { # run_live <test target> [signup code] [invite code]
   echo "=== live Rust client <-> Go server: $1 ==="
   REQHARBOR_SERVER_URL="$BASE" REQHARBOR_WORKER_URL="$BASE" REQHARBOR_LIVE_SIGNUP_CODE="${2:-}" \
+    REQHARBOR_LIVE_INVITE_CODE="${3:-}" \
     cargo test -p reqharbor-core --test "$1" -- --ignored --test-threads=1 2>&1 \
     | grep -vE '^\s+(Compiling|Running|Finished)'
   return "${PIPESTATUS[0]}"
 }
 run_live qa_sync_live
 SYNC=$?
-run_live qa_server_live "$SETUP_CODE"
+# The dev-provider case needs an invite. The CLI works next to the running server (no lock, short
+# transactions); the invite is consumed only after the setup-code case created the first account.
+LIVE_INVITE=$(rh invite create --uses 5 --ttl 1h | head -1)
+if [ -z "$LIVE_INVITE" ]; then
+  echo "invite create printed no code" >&2
+  exit 2
+fi
+run_live qa_server_live "$SETUP_CODE" "$LIVE_INVITE"
 SERVER=$?
 
 AUTH=skipped

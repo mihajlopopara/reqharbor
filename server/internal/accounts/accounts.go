@@ -87,6 +87,7 @@ func CodeHash(code string) string { return ids.SHA256Hex("code:" + NormalizeCode
 type CreateParams struct {
 	Email        string // normalised
 	Name         string
+	AvatarURL    *string // from a provider profile
 	EmailTrusted bool
 	// Exactly one of PHC (a password account) and Identity (an external identity) is set.
 	PHC      string
@@ -216,7 +217,7 @@ func Create(tx store.WriteTx, p CreateParams) (*Created, error) {
 
 	u := store.User{
 		ID: ids.ULID(p.Now), Email: p.Email, EmailTrusted: p.EmailTrusted, SignupVia: via, Name: p.Name,
-		IsAdmin: isAdmin, CreatedAt: now, UpdatedAt: now,
+		AvatarURL: p.AvatarURL, IsAdmin: isAdmin, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := tx.InsertUser(u); err != nil {
 		return nil, err

@@ -100,6 +100,18 @@ type Config struct {
 	BackupInterval  time.Duration
 	BackupKeep      int64
 	ShutdownTimeout time.Duration
+
+	// Test holds overrides that no environment variable reaches: Parse never sets them, only
+	// tests do (06-go-server.md §10 S5: fake provider servers).
+	Test TestOverrides
+}
+
+// TestOverrides point the external providers at fake servers in tests. Empty fields keep the
+// real endpoints.
+type TestOverrides struct {
+	GitHubAuthURL  string // default https://github.com/login/oauth/authorize
+	GitHubTokenURL string // default https://github.com/login/oauth/access_token
+	GitHubAPIURL   string // default https://api.github.com
 }
 
 // Error is a startup configuration error; serve exits with code 2 and its one-line message.

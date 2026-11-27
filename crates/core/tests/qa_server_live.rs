@@ -14,6 +14,11 @@
 //! The accounts case (S4) signs up the first account through the hosted pages with raw HTTP. It
 //! needs the setup code, which the script reads from the server log and passes as
 //! `REQHARBOR_LIVE_SIGNUP_CODE`.
+//!
+//! The dev-provider case (S5) signs up through the devauth build's dev form with an invite that
+//! the script creates with `invite create` and passes as `REQHARBOR_LIVE_INVITE_CODE`. An invite
+//! cannot create the first account, so it relies on libtest's name order (with
+//! --test-threads=1): `live_password_…` runs before `live_provider_dev_…`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -495,4 +500,99 @@ async fn live_password_sign_up_with_setup_code_then_tokens_refresh_grace_and_log
     let (status, body) = logout(&c, access).await;
     assert_eq!(status, 401, "{body}");
     assert!(body.contains("auth_required"), "{body}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_provider_dev_sign_in_is_unlisted_untrusted_and_follows_signup_rules() {
+    let invite = std::env::var("REQHARBOR_LIVE_INVITE_CODE")
+        .expect("REQHARBOR_LIVE_INVITE_CODE: an invite from `invite create` (qa/run_live_server_tests.sh sets it)");
+    let c = http();
+    let info: Value = c
+        .get(format!("{}/v1/server", server_url()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        info["auth"]["setupRequired"],
+        json!(false),
+        "the S4 case creates the first account before this one runs"
+    );
+    let methods: Vec<&str> = info["auth"]["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        ["password"],
+        "dev is never listed; GitHub is not configured"
+    );
+
+    // GitHub is not configured, so its routes do not exist.
+    let mut b = Browser::new();
+    let (status, _, _) = b.get("/auth/start/github?ar=x").await;
+    assert_eq!(status, 404);
+
+    // The authorize page offers the dev form to this loopback peer.
+    let (ar, html) = b.authorize("st-dev").await;
+    assert!(
+        html.contains(&format!("href=\"/auth/start/dev?ar={ar}\"")),
+        "{html}"
+    );
+    let (status, _, form_page) = b.get(&format!("/auth/start/dev?ar={ar}")).await;
+    assert_eq!(status, 200, "{form_page}");
+    assert!(form_page.contains(r#"action="/auth/dev""#), "{form_page}");
+
+    // Invite mode: without the code nothing is created.
+    let email = format!("dev-{}@example.test", random_ip().replace('.', "-"));
+    let (status, _, body) = b
+        .post(
+            "/auth/dev",
+            form(&[("ar", &ar), ("email", &email), ("name", "Dev")]),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("Enter the invite code your server admin gave you."),
+        "{body}"
+    );
+    let (status, headers, body) = b
+        .post(
+            "/auth/dev",
+            form(&[
+                ("ar", &ar),
+                ("email", &email),
+                ("name", "Dev"),
+                ("code", &invite),
+            ]),
+        )
+        .await;
+    let auth_code = loopback_code(status, &headers, &body, "st-dev");
+    let (status, t) = token(
+        &c,
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", "reqharbor-desktop"),
+            ("code", auth_code.as_str()),
+            ("code_verifier", PKCE_VERIFIER),
+            ("redirect_uri", REDIRECT),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(t["user"]["email"], json!(email));
+    assert_eq!(t["user"]["isAdmin"], json!(false));
+
+    // A returning dev identity signs in without a code.
+    let mut b2 = Browser::new();
+    let (ar2, _) = b2.authorize("st-dev-2").await;
+    let (status, headers, body) = b2
+        .post("/auth/dev", form(&[("ar", &ar2), ("email", &email)]))
+        .await;
+    loopback_code(status, &headers, &body, "st-dev-2");
 }

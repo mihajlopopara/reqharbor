@@ -15,9 +15,9 @@ This release (0.1, phases S0 to S3 of `docs/plans/accounts/06-go-server.md`) ser
 
 The source tree is past 0.1: phase S4 adds **accounts** (email and password sign-in through hosted
 pages under `/auth/*`, the token endpoint `POST /v1/auth/token`, `POST /v1/auth/logout`, setup and
-invite codes, CLI reset links). Personal-space sync (`/v1/me*`, `/v1/spaces/*`) and GitHub sign-in
-follow before the 0.2 release; until then the desktop app syncs with a workspace token
-(Settings > Sync).
+invite codes, CLI reset links) and S5 adds **GitHub sign-in**. Personal-space sync (`/v1/me*`,
+`/v1/spaces/*`) follows before the 0.2 release; until then the desktop app syncs with a workspace
+token (Settings > Sync).
 
 ## Quick start
 
@@ -125,6 +125,18 @@ and when all traffic arrives from one peer.
   20 failures for an email in an hour, the sign-in form asks the browser for a few seconds of
   proof of work. `reqharbor-server user unlock --email E` clears both. The database keeps only
   keyed hashes of (email, network) for 24 hours after the last failure.
+- **GitHub sign-in** is on when both `REQHARBOR_GITHUB_CLIENT_ID` and
+  `REQHARBOR_GITHUB_CLIENT_SECRET` (or `REQHARBOR_GITHUB_CLIENT_SECRET_FILE`, for Docker secrets)
+  are set; one without the other is a startup error. On GitHub, open Settings > Developer settings
+  > **OAuth Apps** (not a GitHub App) > New OAuth App, set the homepage to your public URL and the
+  authorization callback URL to exactly `{REQHARBOR_PUBLIC_URL}/auth/callback/github`, for example
+  `https://rh.example.com/auth/callback/github`. The server asks for `read:user user:email`, uses
+  the account's **primary verified** email (an account without one cannot sign up), and keys the
+  account by GitHub's numeric user id, never by email. GitHub's token is used once to read the
+  profile and then dropped. Signup rules apply as for passwords (an invite in `invite` mode; on a
+  fresh server the setup code, or a GitHub email equal to `REQHARBOR_ADMIN_EMAIL`, which then
+  becomes the admin). An email that already has an account is refused, never merged: one sign-in
+  method per account.
 - **Other commands:** `user list`, `user set-admin --email E --on|--off`, `user disable|enable
   --email E`, `user sessions revoke --email E`, `user set-password --email E --password-stdin`,
   `invite list`, `invite revoke ID`. In the image: `docker compose exec reqharbor /reqharbor-server
@@ -152,6 +164,8 @@ this release:
 | `REQHARBOR_MAX_DB_BYTES` | `0` (off) | Growing writes return 507 once the database reaches this size |
 | `REQHARBOR_MIN_FREE_DISK_BYTES` | `536870912` | Growing writes return 507 below this much free disk |
 | `REQHARBOR_LOG_LEVEL`, `REQHARBOR_LOG_FORMAT` | `info`, `json` | Logging |
+| `REQHARBOR_GITHUB_CLIENT_ID`, `REQHARBOR_GITHUB_CLIENT_SECRET` | empty | Both set: GitHub sign-in (the secret also as `…_SECRET_FILE`) |
+| `REQHARBOR_ADMIN_EMAIL` | empty | A GitHub (trusted) email that becomes admin when its account is created while no admin exists |
 
 The full table, including the account settings that 0.2 uses, is §6 of
 `docs/plans/accounts/06-go-server.md`.
@@ -190,6 +204,12 @@ docker compose run --rm go gofmt -l .
 docker compose run --rm --service-ports go go run ./cmd/reqharbor-server serve   # :8080, token sync open
 docker build -f server/Dockerfile -t reqharbor-server:dev server
 ```
+
+`docker compose run --rm go go test -tags devauth ./...` adds the dev sign-in provider's tests.
+That provider (a form taking any email, for automated tests) exists only in binaries built with
+`-tags devauth`; the image and release builds never contain it. A devauth binary refuses a
+listener that is not a loopback IP, answers 404 to dev-provider requests from any other TCP peer
+(forwarded headers do not count), and dev accounts' emails are never trusted.
 
 The live client suite runs the real Rust client against a devauth build:
 

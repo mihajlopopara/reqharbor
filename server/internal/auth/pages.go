@@ -14,6 +14,8 @@ import (
 	"github.com/mihajlopopara/reqharbor/server/internal/web"
 )
 
+var webFiles = web.Files
+
 var pageNames = []string{"authorize", "code", "signup", "done", "error", "forgot", "reset"}
 
 var pages = func() map[string]*template.Template {
@@ -56,6 +58,11 @@ type pageData struct {
 	Message, Hint string
 	Token         string
 	Done          bool
+
+	// External providers (S5).
+	Providers []pageLink // buttons for the enabled providers
+	Continue  string     // the provider to resume after a code was entered
+	Links     []pageLink // extra links on an error page
 }
 
 type pageError struct {
@@ -71,9 +78,13 @@ func (s *Service) base(title string) pageData {
 
 // render writes a hosted page with the /auth/* CSP, noindex and no-store.
 func (s *Service) render(w http.ResponseWriter, r *http.Request, status int, name string, d pageData) {
+	s.renderTemplate(w, r, status, pages[name], d)
+}
+
+func (s *Service) renderTemplate(w http.ResponseWriter, r *http.Request, status int, t *template.Template, d pageData) {
 	var buf bytes.Buffer
-	if err := pages[name].ExecuteTemplate(&buf, "layout", d); err != nil {
-		httpx.HandleError(w, r, fmt.Errorf("render %s: %w", name, err))
+	if err := t.ExecuteTemplate(&buf, "layout", d); err != nil {
+		httpx.HandleError(w, r, fmt.Errorf("render %s: %w", t.Name(), err))
 		return
 	}
 	h := w.Header()

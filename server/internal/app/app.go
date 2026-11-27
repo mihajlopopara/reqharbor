@@ -52,6 +52,9 @@ type Deps struct {
 	DB *db.DB
 	// Breaker may be nil; New then builds one from Config and DB.
 	Breaker *jobs.Breaker
+	// HTTPClient makes the outbound sign-in provider calls; nil means a client with the
+	// providers' default timeout. Tests pass one that trusts their fake providers.
+	HTTPClient *http.Client
 }
 
 // App is the HTTP application.
@@ -112,6 +115,7 @@ func New(d Deps) *App {
 	a.Auth = auth.New(auth.Deps{
 		Store: d.Store, Clock: d.Clock, Config: d.Config, Logger: d.Logger, ClientIP: a.Resolver,
 		Hasher: a.Hasher, Throttle: a.Throttle, Growth: a.accountGrowth, UserCreated: a.discovery.SetupDone,
+		HTTPClient: d.HTTPClient,
 	})
 	a.discovery.UsersExist = a.usersExist
 	mux := http.NewServeMux()

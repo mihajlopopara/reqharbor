@@ -43,12 +43,15 @@ type Harness struct {
 	// ClientVersion, when set, is sent as X-ReqHarbor-Version by the token helpers.
 	ClientVersion string
 
-	logger *slog.Logger
+	logger     *slog.Logger
+	httpClient *http.Client
 }
 
 type options struct {
-	env   []string
-	store store.Store
+	env    []string
+	store  store.Store
+	config []func(*config.Config)
+	client *http.Client
 }
 
 // Option customises New.
@@ -56,6 +59,15 @@ type Option func(*options)
 
 // WithEnv adds or overrides REQHARBOR_* settings ("KEY=VALUE").
 func WithEnv(kv ...string) Option { return func(o *options) { o.env = append(o.env, kv...) } }
+
+// WithConfig changes the parsed configuration before the server starts (for the test-only
+// fields no environment variable reaches, such as config.TestOverrides).
+func WithConfig(f func(*config.Config)) Option {
+	return func(o *options) { o.config = append(o.config, f) }
+}
+
+// WithHTTPClient sets the client of the outbound provider calls.
+func WithHTTPClient(c *http.Client) Option { return func(o *options) { o.client = c } }
 
 // WithStore serves from a stub store instead of a real database.
 func WithStore(s store.Store) Option { return func(o *options) { o.store = s } }
@@ -114,10 +126,13 @@ func New(t testing.TB, opts ...Option) *Harness {
 	}
 	dir := t.TempDir()
 	cfg := ParseEnv(t, append(DefaultEnv(dir), o.env...))
+	for _, f := range o.config {
+		f(cfg)
+	}
 	logs := &Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	clk := clock.NewFake(time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC))
-	h := &Harness{Clock: clk, Config: cfg, Logs: logs, logger: logger}
+	h := &Harness{Clock: clk, Config: cfg, Logs: logs, logger: logger, httpClient: o.client}
 
 	st := o.store
 	if st == nil {
@@ -133,7 +148,7 @@ func New(t testing.TB, opts ...Option) *Harness {
 		st = sqlite.New(d)
 	}
 	h.Store = st
-	deps := app.Deps{Config: cfg, Clock: clk, Store: st, Logger: logger, Version: app.DefaultVersion, DB: h.DB}
+	deps := app.Deps{Config: cfg, Clock: clk, Store: st, Logger: logger, Version: app.DefaultVersion, DB: h.DB, HTTPClient: o.client}
 	h.App = app.New(deps)
 	if o.store == nil {
 		if err := h.App.Init(context.Background()); err != nil {
@@ -165,7 +180,8 @@ func (h *Harness) Restart(t testing.TB) {
 	t.Cleanup(func() { d.Close() })
 	h.DB = d
 	h.Store = sqlite.New(d)
-	h.App = app.New(app.Deps{Config: h.Config, Clock: h.Clock, Store: h.Store, Logger: h.logger, Version: app.DefaultVersion, DB: d})
+	h.App = app.New(app.Deps{Config: h.Config, Clock: h.Clock, Store: h.Store, Logger: h.logger, Version: app.DefaultVersion, DB: d,
+		HTTPClient: h.httpClient})
 	if err := h.App.Init(context.Background()); err != nil {
 		t.Fatalf("init: %v", err)
 	}

@@ -8,3 +8,5 @@
 {{if .Insecure}}<div class="banner" role="note">This server doesn't use HTTPS. Others on your network may see your password.</div>{{end}}
 {{template "content" .}}
 </main>{{.Script}}</body></html>{{end}}
+{{- /* Provider buttons are plain links, never forms (§5.3), so the redirect to the provider is not a form navigation. */ -}}
+{{define "providers"}}{{if .Providers}}<div class="providers">{{range .Providers}}<a class="button{{if not .Primary}} secondary{{end}}" href="{{.Href}}">{{.Text}}</a>{{end}}</div>{{end}}{{end}}

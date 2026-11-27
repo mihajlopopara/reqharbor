@@ -127,9 +127,9 @@ func (b *Browser) PostWith(t testing.TB, path string, form url.Values, headers m
 	return b.do(t, "POST", path, form, headers)
 }
 
-var arRe = regexp.MustCompile(`name="ar" value="([A-Za-z0-9_-]{22})"`)
+var arRe = regexp.MustCompile(`(?:name="ar" value="|\?ar=)([A-Za-z0-9_-]{22})`)
 
-// AR returns the auth request id in a page.
+// AR returns the auth request id in a page (a form field, or a provider link's ?ar=).
 func AR(t testing.TB, res *Resp) string {
 	t.Helper()
 	m := arRe.FindSubmatch(res.Body)

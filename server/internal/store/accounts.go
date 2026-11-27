@@ -78,6 +78,7 @@ type AuthRequest struct {
 	MethodHint       *string
 	GrantTokenHash   *string
 	Provider         *string
+	UpstreamVerifier *string // PKCE verifier of the provider round trip (S5)
 	PasswordAttempts int64
 	CodeAttempts     int64
 	UserID           *string
@@ -135,9 +136,13 @@ type AccountsReadTx interface {
 	PasswordPHC(userID string) (string, error)
 	// IdentityOf returns the user's external identity, or ErrNotFound.
 	IdentityOf(userID string) (*Identity, error)
+	// IdentityBySubject returns the identity (provider, issuer, subject), or ErrNotFound.
+	IdentityBySubject(provider, issuer, subject string) (*Identity, error)
 	PersonalSpace(userID string) (*Personal, error)
 
 	AuthRequest(id string) (*AuthRequest, error)
+	// AuthRequestByUpstreamState finds the request whose provider round trip has this state hash.
+	AuthRequestByUpstreamState(stateHash string) (*AuthRequest, error)
 	OneTimeToken(hash string) (*OneTimeToken, error)
 	OneTimeTokens(purpose string) ([]OneTimeToken, error)
 
@@ -161,10 +166,23 @@ type AccountsWriteTx interface {
 	SetPassword(userID, phc string, now int64) error
 	InsertPassword(userID, phc string, now int64) error
 	InsertIdentity(i Identity) error
+	// TouchIdentity records a returning sign-in: the provider's current email (display only;
+	// "" keeps the stored one) and last_login_at.
+	TouchIdentity(provider, issuer, subject, email string, now int64) error
+	// SetUserProfile refreshes the name and avatar from a provider.
+	SetUserProfile(id, name string, avatarURL *string, now int64) error
+	// SetUserEmail changes users.email and email_trusted.
+	SetUserEmail(id, email string, trusted bool, now int64) error
 	InsertPersonal(userID string, p Personal) error
 
 	InsertAuthRequest(ar AuthRequest) error
 	SetAuthRequestGrant(id, grantHash string) error
+	// SetAuthRequestUpstream starts a provider round trip on the request (state stored hashed).
+	SetAuthRequestUpstream(id, provider, stateHash, verifier string) error
+	// ClearAuthRequestUpstream ends it, so the upstream state works once.
+	ClearAuthRequestUpstream(id string) error
+	// ConsumeAuthRequest ends a request without a code (the provider was cancelled).
+	ConsumeAuthRequest(id string, now int64) error
 	// IncrAuthRequestAttempts adds one to password_attempts or code_attempts and returns it.
 	IncrAuthRequestAttempts(id, field string) (int64, error)
 	SetAuthRequestCode(id, userID, codeHash string, codeExpiresAt int64) error

@@ -115,6 +115,10 @@ func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 	if users == 0 {
 		d := s.arPage("Set up "+s.Config.ServerName, &ar)
 		d.Setup = true
+		if s.Config.AdminEmail != "" {
+			// A trusted provider email equal to REQHARBOR_ADMIN_EMAIL also creates the admin (§5.6).
+			d.Providers = s.providerLinks(r, &ar)
+		}
 		s.render(w, r, http.StatusOK, "code", d)
 		return
 	}
@@ -125,7 +129,8 @@ func (s *Service) renderLogin(w http.ResponseWriter, r *http.Request, status int
 	d := s.arPage("Sign in", ar)
 	d.Email, d.Error, d.PoW = email, msg, pow
 	d.FocusPassword = email != ""
-	d.SignupLink = s.Config.Signup != config.SignupClosed
+	d.SignupLink = s.Config.Signup != config.SignupClosed && s.Config.PasswordAuth
+	d.Providers = s.providerLinks(r, ar)
 	if pow != nil {
 		d.Script = powTag
 	}
@@ -180,7 +185,8 @@ func (s *Service) signupPage(w http.ResponseWriter, r *http.Request) {
 // renderSignup shows the signup form, or the page that comes before it: the setup code while no
 // user exists, signup_closed, or password sign-in turned off.
 func (s *Service) renderSignup(w http.ResponseWriter, r *http.Request, status int, ar *store.AuthRequest, name, email, msg string) {
-	if !s.Config.PasswordAuth {
+	links := s.providerLinks(r, ar)
+	if !s.Config.PasswordAuth && len(links) == 0 {
 		s.renderError(w, r, http.StatusForbidden, errPasswordOff)
 		return
 	}
@@ -209,6 +215,7 @@ func (s *Service) renderSignup(w http.ResponseWriter, r *http.Request, status in
 	d.Setup = setup
 	d.NeedInvite = users > 0 && grant == nil && s.Config.Signup == config.SignupInvite
 	d.Name, d.Email, d.Error = name, email, msg
+	d.Providers = links
 	s.render(w, r, status, "signup", d)
 }
 
@@ -288,6 +295,11 @@ func (s *Service) code(w http.ResponseWriter, r *http.Request) {
 	if ar == nil {
 		return
 	}
+	// continue names the provider sign-in that asked for the code (S5); it resumes there.
+	cont := r.PostForm.Get("continue")
+	if _, ok := s.providerBy[cont]; !ok {
+		cont = ""
+	}
 	res, err := s.applyCode(r, ar, r.PostForm.Get("code"))
 	switch {
 	case err != nil:
@@ -303,11 +315,12 @@ func (s *Service) code(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		d := s.arPage("Enter code", ar)
-		d.Setup, d.Error = users == 0, msgInviteInvalid
+		d.Setup, d.Error, d.Continue = users == 0, msgInviteInvalid, cont
 		s.render(w, r, http.StatusBadRequest, "code", d)
+	case cont != "":
+		redirectSeeOther(w, "/auth/start/"+cont+"?ar="+ar.ID)
 	default:
-		w.Header().Set("Location", "/auth/signup?ar="+ar.ID)
-		w.WriteHeader(http.StatusSeeOther)
+		redirectSeeOther(w, "/auth/signup?ar="+ar.ID)
 	}
 }
 
