@@ -77,6 +77,10 @@ func mac(key []byte, parts ...string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// MAC is HMAC-SHA256 under the server's throttle key over the parts (domain-separated by the
+// first part); hex. S9 stores signup-code hashes with it, so a database copy cannot reverse them.
+func (t *Throttle) MAC(parts ...string) string { return mac(t.key, parts...) }
+
 // EmailKey is HMAC(key, email): it finds every row of one email without knowing any IP.
 func EmailKey(key []byte, email string) string { return mac(key, "email", email) }
 

@@ -125,17 +125,21 @@ func (t *rtx) PersonalSpace(userID string) (*store.Personal, error) {
 }
 
 const authRequestCols = `id, browser_hash, client_id, redirect_uri, code_challenge, client_state, device_name, method_hint,
-	grant_token_hash, provider, upstream_verifier, password_attempts, code_attempts, user_id, code_hash, code_expires_at, created_at, expires_at, consumed_at, ticket_hash`
+	grant_token_hash, provider, upstream_verifier, password_attempts, code_attempts, user_id, code_hash, code_expires_at, created_at, expires_at, consumed_at, ticket_hash,
+	pending_email, pending_name, pending_phc, email_code_hash, email_code_expires_at, email_code_attempts, email_codes_sent`
 
 func scanAuthRequest(r scanner) (*store.AuthRequest, error) {
 	var a store.AuthRequest
-	var hint, grant, provider, verifier, user, code, ticket sql.NullString
-	var codeExp, consumed sql.NullInt64
+	var hint, grant, provider, verifier, user, code, ticket, pEmail, pName, pPHC, eCode sql.NullString
+	var codeExp, consumed, eCodeExp sql.NullInt64
 	err := r.Scan(&a.ID, &a.BrowserHash, &a.ClientID, &a.RedirectURI, &a.CodeChallenge, &a.ClientState, &a.DeviceName, &hint,
-		&grant, &provider, &verifier, &a.PasswordAttempts, &a.CodeAttempts, &user, &code, &codeExp, &a.CreatedAt, &a.ExpiresAt, &consumed, &ticket)
+		&grant, &provider, &verifier, &a.PasswordAttempts, &a.CodeAttempts, &user, &code, &codeExp, &a.CreatedAt, &a.ExpiresAt, &consumed, &ticket,
+		&pEmail, &pName, &pPHC, &eCode, &eCodeExp, &a.EmailCodeAttempts, &a.EmailCodesSent)
 	if err != nil {
 		return nil, notFound(err)
 	}
+	a.PendingEmail, a.PendingName, a.PendingPHC, a.EmailCodeHash = nullStr(&pEmail), nullStr(&pName), nullStr(&pPHC), nullStr(&eCode)
+	a.EmailCodeExpiresAt = nullInt(&eCodeExp)
 	a.MethodHint, a.GrantTokenHash, a.Provider, a.UserID, a.CodeHash = nullStr(&hint), nullStr(&grant), nullStr(&provider), nullStr(&user), nullStr(&code)
 	a.UpstreamVerifier, a.TicketHash = nullStr(&verifier), nullStr(&ticket)
 	a.CodeExpiresAt, a.ConsumedAt = nullInt(&codeExp), nullInt(&consumed)
@@ -335,6 +339,23 @@ func (t *wtx) SetUserEmail(id, email string, trusted bool, now int64) error {
 	return one(t.exec("UPDATE users SET email = ?, email_trusted = ?, updated_at = ? WHERE id = ?", email, boolInt(trusted), now, id))
 }
 
+func (t *wtx) TrustUserEmail(id, email string, now int64) (bool, error) {
+	res, err := t.exec("UPDATE users SET email_trusted = 1, updated_at = ? WHERE id = ? AND email = ? AND email_trusted = 0", now, id, email)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+func (t *wtx) RevokeUserTokens(userID, purpose string, now int64) (int64, error) {
+	res, err := t.exec("UPDATE one_time_tokens SET revoked_at = ? WHERE user_id = ? AND purpose = ? AND revoked_at IS NULL", now, userID, purpose)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (t *wtx) InsertPersonal(userID string, p store.Personal) error {
 	if _, err := t.exec("INSERT INTO teams (id, name, personal, owner_user_id, created_at) VALUES (?, ?, 1, ?, ?)",
 		p.TeamID, p.Name, userID, p.CreatedAt); err != nil {
@@ -377,12 +398,33 @@ func (t *wtx) ConsumeAuthRequest(id string, now int64) error {
 }
 
 func (t *wtx) IncrAuthRequestAttempts(id, field string) (int64, error) {
-	if field != "password_attempts" && field != "code_attempts" {
+	if field != "password_attempts" && field != "code_attempts" && field != "email_code_attempts" {
 		return 0, fmt.Errorf("unknown attempts field %q", field)
 	}
 	var n int64
 	err := t.row("UPDATE auth_requests SET "+field+" = "+field+" + 1 WHERE id = ? RETURNING "+field, id).Scan(&n)
 	return n, notFound(err)
+}
+
+func (t *wtx) SetAuthRequestEmailCode(id string, p *store.PendingSignup, codeHash string, expiresAt int64) error {
+	if p != nil {
+		return one(t.exec(`UPDATE auth_requests SET pending_email = ?, pending_name = ?, pending_phc = ?, email_code_hash = ?,
+		       email_code_expires_at = ?, email_code_attempts = 0, email_codes_sent = email_codes_sent + 1
+		     WHERE id = ? AND consumed_at IS NULL AND code_hash IS NULL`, p.Email, p.Name, p.PHC, codeHash, expiresAt, id))
+	}
+	return one(t.exec(`UPDATE auth_requests SET email_code_hash = ?, email_code_expires_at = ?, email_code_attempts = 0,
+	       email_codes_sent = email_codes_sent + 1 WHERE id = ? AND consumed_at IS NULL AND code_hash IS NULL`, codeHash, expiresAt, id))
+}
+
+func (t *wtx) ClearAuthRequestEmailCode(id string) error {
+	_, err := t.exec("UPDATE auth_requests SET email_code_hash = NULL, email_code_expires_at = NULL WHERE id = ?", id)
+	return err
+}
+
+func (t *wtx) ClearAuthRequestPending(id string) error {
+	_, err := t.exec(`UPDATE auth_requests SET pending_email = NULL, pending_name = NULL, pending_phc = NULL, email_code_hash = NULL,
+	       email_code_expires_at = NULL WHERE id = ?`, id)
+	return err
 }
 
 func (t *wtx) SetAuthRequestCode(id, userID, codeHash string, codeExpiresAt int64) error {

@@ -80,14 +80,27 @@ type AuthRequest struct {
 	Provider         *string
 	UpstreamVerifier *string // PKCE verifier of the provider round trip (S5)
 	TicketHash       *string // SHA-256 of the team-invite signup ticket it was started with (M2)
-	PasswordAttempts int64
-	CodeAttempts     int64
-	UserID           *string
-	CodeHash         *string
-	CodeExpiresAt    *int64
-	CreatedAt        int64
-	ExpiresAt        int64
-	ConsumedAt       *int64
+	// A password signup waiting for its emailed code (S9, §5.5).
+	PendingEmail       *string
+	PendingName        *string
+	PendingPHC         *string
+	EmailCodeHash      *string
+	EmailCodeExpiresAt *int64
+	EmailCodeAttempts  int64
+	EmailCodesSent     int64
+	PasswordAttempts   int64
+	CodeAttempts       int64
+	UserID             *string
+	CodeHash           *string
+	CodeExpiresAt      *int64
+	CreatedAt          int64
+	ExpiresAt          int64
+	ConsumedAt         *int64
+}
+
+// PendingSignup is a password signup waiting for its emailed code (S9).
+type PendingSignup struct {
+	Email, Name, PHC string
 }
 
 // One-time token purposes.
@@ -174,6 +187,9 @@ type AccountsWriteTx interface {
 	SetUserProfile(id, name string, avatarURL *string, now int64) error
 	// SetUserEmail changes users.email and email_trusted.
 	SetUserEmail(id, email string, trusted bool, now int64) error
+	// TrustUserEmail sets email_trusted only while users.email still equals email (S9: a reset
+	// through a link sent to that address); it reports whether it did.
+	TrustUserEmail(id, email string, now int64) (bool, error)
 	InsertPersonal(userID string, p Personal) error
 
 	InsertAuthRequest(ar AuthRequest) error
@@ -184,8 +200,17 @@ type AccountsWriteTx interface {
 	ClearAuthRequestUpstream(id string) error
 	// ConsumeAuthRequest ends a request without a code (the provider was cancelled).
 	ConsumeAuthRequest(id string, now int64) error
-	// IncrAuthRequestAttempts adds one to password_attempts or code_attempts and returns it.
+	// IncrAuthRequestAttempts adds one to password_attempts, code_attempts or
+	// email_code_attempts and returns it.
 	IncrAuthRequestAttempts(id, field string) (int64, error)
+	// SetAuthRequestEmailCode stores a new emailed signup code (S9): the pending signup when p is
+	// not nil, the code hash and expiry; it resets email_code_attempts and adds one to
+	// email_codes_sent. ErrNotFound when the request is finished.
+	SetAuthRequestEmailCode(id string, p *PendingSignup, codeHash string, expiresAt int64) error
+	// ClearAuthRequestEmailCode burns the current emailed code.
+	ClearAuthRequestEmailCode(id string) error
+	// ClearAuthRequestPending drops the pending signup and its code (the account was created).
+	ClearAuthRequestPending(id string) error
 	SetAuthRequestCode(id, userID, codeHash string, codeExpiresAt int64) error
 	// ConsumeAuthCode marks the request holding codeHash consumed, if its code is unexpired and
 	// unused, and returns it; ErrNotFound otherwise.
@@ -196,6 +221,8 @@ type AccountsWriteTx interface {
 	UseOneTimeToken(hash string, now int64) (bool, error)
 	RevokeOneTimeToken(id string, now int64) (bool, error)
 	DeleteOneTimeTokens(purpose string) error
+	// RevokeUserTokens revokes every live token of purpose that belongs to userID.
+	RevokeUserTokens(userID, purpose string, now int64) (int64, error)
 
 	InsertSession(s Session) error
 	// RevokeSessionsBeyond revokes the user's oldest live sessions so at most keep stay live.

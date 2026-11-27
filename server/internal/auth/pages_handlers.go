@@ -127,8 +127,10 @@ func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 		d := s.arPage("Set up "+s.Config.ServerName, &ar)
 		d.Setup = true
 		if s.Config.AdminEmail != "" {
-			// A trusted provider email equal to REQHARBOR_ADMIN_EMAIL also creates the admin (§5.6).
+			// A trusted provider email equal to REQHARBOR_ADMIN_EMAIL also creates the admin (§5.6),
+			// and so does a password signup confirmed by an emailed code (S9).
 			d.Providers = s.providerLinks(r, &ar)
+			d.AdminSignup = s.adminEmailSignup()
 		}
 		s.render(w, r, http.StatusOK, "code", d)
 		return
@@ -212,7 +214,8 @@ func (s *Service) renderSignup(w http.ResponseWriter, r *http.Request, status in
 		return
 	}
 	setup := grant != nil && grant.Purpose == store.PurposeSetup
-	if users == 0 && !setup {
+	adminSignup := users == 0 && !setup && s.adminEmailSignup()
+	if users == 0 && !setup && !adminSignup {
 		d := s.arPage("Set up "+s.Config.ServerName, ar)
 		d.Setup, d.Error = true, msg
 		s.render(w, r, status, "code", d)
@@ -228,7 +231,7 @@ func (s *Service) renderSignup(w http.ResponseWriter, r *http.Request, status in
 		return
 	}
 	d := s.arPage("Create account", ar)
-	d.Setup = setup
+	d.Setup, d.AdminSignup = setup, adminSignup
 	d.NeedInvite = users > 0 && grant == nil && !ticket && s.Config.Signup == config.SignupInvite
 	d.Name, d.Email, d.Error = name, email, msg
 	d.Providers = links
@@ -520,7 +523,7 @@ func (s *Service) passwordLogin(w http.ResponseWriter, r *http.Request) {
 
 // passwordSignup is POST /auth/password/signup (§5.5 order: origin and CSRF; limits; the invite
 // code when signup is invite; REQHARBOR_MAX_USERS; then the email). Without SMTP (M1) the account
-// is created at once with email_trusted=0.
+// is created at once with email_trusted=0; with SMTP (S9) signupByEmail sends a code instead.
 func (s *Service) passwordSignup(w http.ResponseWriter, r *http.Request) {
 	ar := s.loadAR(w, r, r.PostForm.Get("ar"))
 	if ar == nil {
@@ -579,28 +582,48 @@ func (s *Service) passwordSignup(w http.ResponseWriter, r *http.Request) {
 		s.internal(w, r, err)
 		return
 	}
-	grant := ""
-	if ar.GrantTokenHash != nil {
-		grant = *ar.GrantTokenHash
+	if s.Mail != nil {
+		// With SMTP (§5.5): nothing is created yet; the address gets a code, or a notice when
+		// it already has an account, and the page is the same either way.
+		s.signupByEmail(w, r, ar, name, email, phc)
+		return
 	}
 	var target string
 	err = s.Store.Write(r.Context(), func(tx store.WriteTx) error {
-		created, err := accounts.Create(tx, accounts.CreateParams{
-			Email: email, Name: name, EmailTrusted: false, PHC: phc, GrantHash: grant, TicketHash: ticketOf(ar),
-			SignupMode: s.Config.Signup, AdminEmail: s.Config.AdminEmail, MaxUsers: s.Config.MaxUsers, OpenSignupFull: s.openSignupFull(), Now: s.Clock.Now(),
-		})
+		created, err := accounts.Create(tx, s.createParams(ar, email, name, phc, false))
 		if err != nil {
 			return err
 		}
 		target, err = s.issueCode(tx, ar, created.User.ID)
 		return err
 	})
+	if err != nil {
+		s.signupFailed(w, r, ar, name, email, err)
+		return
+	}
+	if s.UserCreated != nil {
+		s.UserCreated()
+	}
+	redirectSeeOther(w, target)
+}
+
+// createParams are the accounts.Create parameters of a password signup on auth request ar.
+func (s *Service) createParams(ar *store.AuthRequest, email, name, phc string, trusted bool) accounts.CreateParams {
+	grant := ""
+	if ar.GrantTokenHash != nil {
+		grant = *ar.GrantTokenHash
+	}
+	return accounts.CreateParams{
+		Email: email, Name: name, EmailTrusted: trusted, PHC: phc, GrantHash: grant, TicketHash: ticketOf(ar),
+		SignupMode: s.Config.Signup, AdminEmail: s.Config.AdminEmail, MaxUsers: s.Config.MaxUsers, OpenSignupFull: s.openSignupFull(), Now: s.Clock.Now(),
+	}
+}
+
+// signupFailed renders a refused password signup: the form again with the reason, or an error
+// page.
+func (s *Service) signupFailed(w http.ResponseWriter, r *http.Request, ar *store.AuthRequest, name, email string, err error) {
+	again := func(status int, msg string) { s.renderSignup(w, r, status, ar, name, email, msg) }
 	switch {
-	case err == nil:
-		if s.UserCreated != nil {
-			s.UserCreated()
-		}
-		redirectSeeOther(w, target)
 	case errors.Is(err, accounts.ErrEmailInUse):
 		again(http.StatusConflict, msgEmailInUse)
 	case errors.Is(err, accounts.ErrInviteInvalid):
@@ -623,11 +646,6 @@ func (s *Service) done(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, http.StatusOK, "done", s.base("Signed in"))
 }
 
-// forgot is /auth/forgot without SMTP: it takes no email (§5.7).
-func (s *Service) forgot(w http.ResponseWriter, r *http.Request) {
-	s.render(w, r, http.StatusOK, "forgot", s.base("Forgot password"))
-}
-
 func (s *Service) resetPage(w http.ResponseWriter, r *http.Request) {
 	d := s.base("Reset password")
 	d.Script = resetTag
@@ -635,7 +653,8 @@ func (s *Service) resetPage(w http.ResponseWriter, r *http.Request) {
 }
 
 // reset is POST /auth/reset: a single-use reset token sets the password, deletes every throttle
-// row of the email and revokes every session of the user. A CLI link never sets email_trusted.
+// row of the email and revokes every session of the user. A link sent by email (S9) also sets
+// email_trusted, because it proves control of the address; a CLI link never does.
 func (s *Service) reset(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimSpace(r.PostForm.Get("t"))
 	password := r.PostForm.Get("password")
@@ -644,7 +663,10 @@ func (s *Service) reset(w http.ResponseWriter, r *http.Request) {
 		d.Script, d.Token, d.Error = resetTag, token, msg
 		s.render(w, r, status, "reset", d)
 	}
-	const msgBadLink = "This reset link is invalid, was already used or has expired. Ask your server admin for a new one."
+	msgBadLink := msgBadLinkAdmin
+	if s.Mail != nil {
+		msgBadLink = msgBadLinkEmail
+	}
 	if token == "" || len(token) > 128 {
 		fail(http.StatusBadRequest, msgBadLink)
 		return
@@ -682,8 +704,17 @@ func (s *Service) reset(w http.ResponseWriter, r *http.Request) {
 	}
 	used := false
 	err = s.Store.Write(r.Context(), func(tx store.WriteTx) error {
+		// Re-read the token inside the transaction: everything below is decided on the state it
+		// commits against, not on the read made before argon2.
+		t, err := tx.OneTimeToken(hash)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		ok, err := tx.UseOneTimeToken(hash, now)
-		if err != nil || !ok {
+		if err != nil || !ok || t.UserID == nil || *t.UserID != user.ID {
 			return err
 		}
 		used = true
@@ -693,7 +724,21 @@ func (s *Service) reset(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.RevokeUserSessions(user.ID, now); err != nil {
 			return err
 		}
-		return s.Throttle.Clear(tx, user.Email)
+		// Every other reset link of the account stops working too.
+		if _, err := tx.RevokeUserTokens(user.ID, store.PurposeResetPassword, now); err != nil {
+			return err
+		}
+		if t.Email != nil {
+			// Only the flag, and only while the address the link went to is still the account's.
+			if _, err := tx.TrustUserEmail(user.ID, *t.Email, now); err != nil {
+				return err
+			}
+		}
+		cur, err := tx.UserByID(user.ID)
+		if err != nil {
+			return err
+		}
+		return s.Throttle.Clear(tx, cur.Email)
 	})
 	if err != nil {
 		s.internal(w, r, err)

@@ -11,6 +11,7 @@
 <label>{{if .Setup}}Setup code{{else}}Invite code{{end}}<input class="code" type="text" name="code" required maxlength="64" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX" autofocus></label>
 <button type="submit">Continue</button>
 </form>
-{{if .Providers}}<p class="or meta">Or, if this server's admin email is yours:</p>{{template "providers" .}}{{end}}
+{{if or .Providers .AdminSignup}}<p class="or meta">Or, if this server's admin email is yours:</p>{{template "providers" .}}{{end}}
+{{if .AdminSignup}}<div class="links"><a href="/auth/signup?ar={{.AR}}">Create the account with the admin email</a></div>{{end}}
 {{if not .Setup}}<div class="links"><a href="/auth/authorize?{{.ResumeQuery}}">Back to sign in</a></div>{{end}}
 {{end}}

@@ -9,7 +9,8 @@ What it serves:
 
 - **Accounts.** Email and password sign-in, and GitHub sign-in, through pages the server hosts
   under `/auth/*`. The desktop app always signs in through the system browser. Signup is by invite
-  by default.
+  by default. With SMTP configured, new addresses are confirmed by an emailed code and people reset
+  their own passwords.
 - **Personal sync.** Every account has a personal space that the app keeps in sync.
 - **Teams** (off by default, `REQHARBOR_TEAMS=true`). Team spaces shared by their members with
   owner, admin, editor and viewer roles, joined through invite links (`/i#…`).
@@ -18,7 +19,7 @@ What it serves:
   compatible with the retired Cloudflare Worker. **Off by default.**
 
 Contents: [Quick start](#quick-start) · [First run](#first-run) ·
-[Sign-in methods](#sign-in-methods) · [Teams](#teams) · [Behind a reverse proxy](#behind-a-reverse-proxy) ·
+[Sign-in methods](#sign-in-methods) · [Email (SMTP)](#email-smtp) · [Teams](#teams) · [Behind a reverse proxy](#behind-a-reverse-proxy) ·
 [Token sync](#token-sync-legacy-workspaces) · [Backups and restore](#backups-and-restore) ·
 [Upgrading](#upgrading) · [Configuration reference](#configuration-reference) ·
 [Operations](#operations) · [Privacy](#privacy) · [API](#api) · [Development](#development)
@@ -90,7 +91,10 @@ Other ways to create the first account:
   printf '%s\n' "$PW" | docker compose exec -T reqharbor /reqharbor-server user create --email you@example.com --password-stdin
   ```
 - `REQHARBOR_ADMIN_EMAIL`: a GitHub account whose primary verified email equals it becomes admin
-  when it signs up, as long as no admin exists yet;
+  when it signs up, as long as no admin exists yet. With [SMTP](#email-smtp) configured, so does a
+  password signup for that address once its emailed code is entered; the setup page then offers
+  "Create the account with the admin email". A password signup without SMTP never qualifies,
+  because nothing proves the address;
 - `reqharbor-server setup-code` prints a fresh code; `REQHARBOR_SETUP_CODE` fixes one for
   automation.
 
@@ -131,9 +135,10 @@ invite list ; invite revoke ID
 setup-code                                 only while no account exists
 ```
 
-There is no email in this release, so there is no self-service password reset: run
-`user reset-link --email E` and send the printed link privately. It works once, for 24 hours, and
-signs the account out on every device.
+Without [SMTP](#email-smtp) there is no self-service password reset: the Forgot password page says
+to ask the admin. Run `user reset-link --email E` and send the printed link privately. It works
+once, for 24 hours, and signs the account out on every device. With SMTP, people request a link by
+email themselves; `user reset-link` keeps working.
 
 **Passwords** are hashed with argon2id (`REQHARBOR_ARGON2_MEMORY_KIB`, default 64 MiB per hash, at
 most four at once). **Brute force:** five wrong passwords for one email from one network throttle
@@ -201,8 +206,14 @@ startup error. To register the app:
        secrets: [github_secret]
    secrets:
      github_secret:
-       file: ./github_client_secret.txt    # chmod 600
+       file: ./github_client_secret.txt
    ```
+
+   Compose mounts a file secret with its owner and mode from the host, and the server runs as
+   uid 65532, so make the file readable by that user only:
+   `sudo chown 65532 github_client_secret.txt && sudo chmod 600 github_client_secret.txt` (or
+   `chmod 640` with a group that uid 65532 is in). A file it cannot read stops the server at start
+   with "cannot read /run/secrets/github_secret: permission denied".
 5. `docker compose up -d`. The sign-in page now shows "Continue with GitHub".
 
 The server asks GitHub for `read:user user:email`, uses the account's **primary verified** email
@@ -211,8 +222,98 @@ id, never by email. GitHub's token is used once to read the profile and then dro
 apply as for passwords. An email that already belongs to another account is refused, never merged:
 each account has exactly one sign-in method.
 
-Google, a generic OpenID Connect provider and SMTP (email verification and self-service reset) come
-in a later release. Their variables are already accepted (see the reference) but have no effect yet.
+Google and a generic OpenID Connect provider come in a later release. Their variables are already
+accepted (see the reference) but have no effect yet.
+
+## Email (SMTP)
+
+Email is optional. Without it everything works, signups are not confirmed and password resets go
+through the admin (`user reset-link`). With an SMTP relay configured:
+
+- **Signup confirms the address.** After the signup form, the page always says "Check your email
+  for a 6-digit code"; nothing is created yet. The code is valid for 10 minutes (and within the
+  10-minute sign-in) and allows 5 tries; "Send a new code" sends another, at most 3 per sign-in.
+  Entering it creates the account with a **confirmed** email, which is what lets
+  `REQHARBOR_ADMIN_EMAIL` apply to password accounts.
+- **No guessing.** Codes are stored as keyed hashes (HMAC with a server secret). A code whose
+  email was not sent (a cap below, or a full queue) can never be entered. One address may receive
+  at most 10 wrong codes per day, across every sign-in and network (one more try every 2.4 hours);
+  past that even the right code is refused with "Too many wrong codes were entered for this
+  email", the same page whether or not the address has an account. This limit lives in memory, so
+  a restart clears it.
+- **No account probing.** Signing up with an address that already has an account shows exactly the
+  same page and takes the same time, but that address receives "You already have a ReqHarbor
+  account on … It signs in with GitHub" (or "with your email and password") instead of a code. The
+  sign-in method is named only in that email. Without SMTP the signup page has to say "An account
+  with this email already exists", so `REQHARBOR_SIGNUP=open` without SMTP logs a warning.
+- **Self-service reset.** Forgot password asks for an email and always answers "If an account
+  exists for that email, we sent a link". A password account gets a link valid once for 30 minutes;
+  an account that signs in with GitHub gets an email saying there is no password to reset; an
+  unknown address gets nothing. The lookup happens in the background, so the page takes the same
+  time for every address. Resetting signs the account out everywhere, makes every other reset link
+  of the account stop working, and marks its email as confirmed (only while the account still has
+  the address the link went to), which is how the real owner reclaims an address someone
+  registered before SMTP was set up. Limits: 5 requests per hour per email and 20 per hour per
+  network.
+- **Caps.** At most `REQHARBOR_RATE_EMAIL_PER_RECIPIENT_PER_HOUR` (5) emails per hour to one
+  address, all kinds together, and `REQHARBOR_RATE_EMAIL_PER_HOUR` (200) for the whole server. An
+  email over a cap is silently not sent and the page does not change; the log says
+  `email_suppressed` with the kind of email, never the address.
+- `GET /v1/server` reports `"passwordReset": "email"` and `"emailVerification": true`.
+
+**Setup.** Put the relay in the environment; use a secret file for the password:
+
+```yaml
+services:
+  reqharbor:
+    environment:
+      REQHARBOR_SMTP_HOST: smtp.example.com
+      REQHARBOR_SMTP_PORT: "587"                    # 465 with REQHARBOR_SMTP_TLS: tls
+      REQHARBOR_SMTP_USERNAME: rh@example.com
+      REQHARBOR_SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      REQHARBOR_SMTP_FROM: "ReqHarbor <rh@example.com>"
+    secrets: [smtp_password]
+secrets:
+  smtp_password:
+    file: ./smtp_password.txt    # sudo chown 65532 smtp_password.txt && sudo chmod 600 smtp_password.txt
+```
+
+As for the GitHub secret, the file keeps its host owner and mode inside the container, and the
+server runs as uid 65532: `chown 65532` it (or `chmod 640` with a matching group).
+
+`REQHARBOR_SMTP_TLS` is `starttls` (default, port 587: the server **requires** STARTTLS and refuses
+a relay that does not offer it), `tls` (TLS from the first byte, port 465, the default port in that
+mode) or `none` (only for a relay on a loopback address; see the last row below). The username and
+password go together; they are sent with AUTH PLAIN, or AUTH LOGIN when the relay offers only that,
+and only over TLS. The certificate is checked against the system roots. `REQHARBOR_SMTP_FROM` must
+be an address your relay may send as; set up SPF and DKIM for its domain, or the emails land in
+spam.
+
+| Provider | `HOST` | `PORT` / `TLS` | `USERNAME` | `PASSWORD` |
+|---|---|---|---|---|
+| Amazon SES | `email-smtp.<region>.amazonaws.com` | `587` / `starttls` | SMTP user name (IAM SMTP credentials) | SMTP password |
+| SendGrid | `smtp.sendgrid.net` | `587` / `starttls` | `apikey` | the API key |
+| Mailgun | `smtp.mailgun.org` (`smtp.eu.mailgun.org`) | `587` / `starttls` | the domain's SMTP login | its password |
+| Postmark | `smtp.postmarkapp.com` | `587` / `starttls` | server API token | the same token |
+| Brevo | `smtp-relay.brevo.com` | `587` / `starttls` | SMTP login | SMTP key |
+| Google Workspace / Gmail | `smtp.gmail.com` | `465` / `tls` (or `587`) | the full address | an app password (2-step verification on) |
+| Microsoft 365 | `smtp.office365.com` | `587` / `starttls` | the mailbox address | its password (SMTP AUTH must be enabled for the mailbox) |
+| Fastmail | `smtp.fastmail.com` | `465` / `tls` | the full address | an app password |
+| Local relay (Postfix, …) | `127.0.0.1` | `25` / `none` | unset | unset |
+
+The last row needs care in Docker: `127.0.0.1` is the **container itself**, not the host. It works
+only when the relay shares the server's network namespace: a sidecar with
+`network_mode: "service:reqharbor"`, or `network_mode: host` on the server (which drops the
+compose network and its fixed proxy address). A relay elsewhere on the network (another container,
+the host's Postfix at its bridge address) is not loopback, so `none` is refused: give that relay a
+certificate and use `starttls`.
+
+Sending happens in the background, one connection per email with a 10 s connect and 30 s overall
+timeout, so a slow relay never slows the pages. Check the log after the first signup or reset:
+`email_sent` means the relay accepted it; `email_failed` names the step and the relay's reply code
+(for example `the SMTP server refused AUTH with code 535`: wrong credentials). Neither the address,
+the password nor the code is ever logged. Emails still queued at shutdown are dropped (the log
+says how many); the person asks again.
 
 ## Behind a reverse proxy
 
@@ -314,9 +415,40 @@ docker run --rm -v reqharbor_reqharbor-data:/data:ro -v "$PWD/offsite:/out" alpi
   sh -c 'cp /data/backups/*.db /out/'
 ```
 
-Delete old files from `/data/backups` yourself; the server never prunes manual backups. For
+Delete old manual files from `/data/backups` yourself; the server never prunes them. For
 continuous replication you can run [Litestream](https://litestream.io) as a sidecar on
 `/data/reqharbor.db`; it is not shipped with the image.
+
+### Scheduled backups
+
+Set `REQHARBOR_BACKUP_INTERVAL` (for example `24h`; at least `1m`, default `0`, off) and the server
+takes the same online `VACUUM INTO` snapshot by itself, on its own database connection, so pushes
+keep going while it runs:
+
+```yaml
+    environment:
+      REQHARBOR_BACKUP_INTERVAL: 24h
+      REQHARBOR_BACKUP_KEEP: "7"
+```
+
+- Files are `/data/backups/reqharbor-YYYYMMDD-HHMMSS.db` (UTC), readable by their owner only, and
+  each is checked with `PRAGMA quick_check` after it is written; one that does not pass is deleted
+  and the failure logged.
+- After each successful backup the oldest scheduled files are deleted until
+  `REQHARBOR_BACKUP_KEEP` (default 7) remain. Only files with exactly that name are pruned: manual
+  (`manual-…`), `pre-migrate-…` and anything else you put in `backups/` are never touched, and
+  neither is the backup just written, even when the clock was ahead earlier and its name sorts
+  oldest.
+- The schedule follows the newest scheduled file, so restarts neither repeat nor delay it: the next
+  backup runs one interval after that file's time (the time the backup started, so the schedule
+  does not drift by how long backups take), at once when that is past, and at once when there is
+  none yet. A failed backup (a full disk, for example) prunes nothing and is retried after
+  an hour, or after one interval when that is shorter; the log says `scheduled backup failed`.
+- Shutting down interrupts a backup in progress; nothing is left under the final name.
+
+Scheduled backups live in the same volume as the database, so they protect against mistakes, not
+against losing the disk: still copy them elsewhere (see above). Restore one like any other backup,
+with `restore`.
 
 ### Restoring
 
@@ -428,7 +560,7 @@ cap unless stated.
 |---|---|---|
 | `REQHARBOR_SIGNUP` | `invite` | `open`, `invite` or `closed` |
 | `REQHARBOR_MAX_USERS` | `500` | Total accounts; `0` means no cap |
-| `REQHARBOR_ADMIN_EMAIL` | empty | A verified provider email that becomes admin at account creation while no admin exists |
+| `REQHARBOR_ADMIN_EMAIL` | empty | A confirmed email (a verified provider email, or with SMTP a password signup confirmed by its code) that becomes admin at account creation while no admin exists |
 | `REQHARBOR_SETUP_CODE` | random at each start | Fixed first-run setup code (at least 12 of `0-9`, `A-Z` without `U`) |
 | `REQHARBOR_PASSWORD_AUTH` | `true` | Email and password sign-in and signup |
 | `REQHARBOR_ARGON2_MEMORY_KIB` | `65536` | Memory per argon2id hash |
@@ -463,6 +595,8 @@ per share snapshot, 5 MiB per request body, 500 changes per push or pull.
 | `REQHARBOR_RATE_SYNC_PER_MIN` | `240` | `/v1/spaces/*/sync` requests per signed-in device |
 | `REQHARBOR_RATE_SHARE_CREATE_PER_HOUR` | `30` | Share creations per space or workspace |
 | `REQHARBOR_RATE_LEGACY_CREATE_PER_HOUR` | `10` | Legacy workspace creations |
+| `REQHARBOR_RATE_EMAIL_PER_RECIPIENT_PER_HOUR` | `5` | Emails to one address, every kind together (per address, not per IP) |
+| `REQHARBOR_RATE_EMAIL_PER_HOUR` | `200` | Emails from the whole server |
 
 **Teams**
 
@@ -475,12 +609,26 @@ per share snapshot, 5 MiB per request body, 500 changes per push or pull.
 | `REQHARBOR_MAX_TEAM_MEMBERS` | `100` | Members per team (at least 1) |
 | `REQHARBOR_MAX_TEAM_INVITES` | `20` | Active invite links per team; `0` means no cap |
 
+**Email (SMTP)** (see [Email (SMTP)](#email-smtp))
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REQHARBOR_SMTP_HOST` | empty | Relay host name or IP, without a port. Set: signup codes and reset links by email |
+| `REQHARBOR_SMTP_PORT` | `587`, or `465` with `REQHARBOR_SMTP_TLS=tls` | Relay port |
+| `REQHARBOR_SMTP_TLS` | `starttls` | `starttls` (required, never skipped), `tls` (implicit) or `none` (loopback host only) |
+| `REQHARBOR_SMTP_USERNAME`, `REQHARBOR_SMTP_PASSWORD` | empty | Both or neither; AUTH PLAIN (or LOGIN), only over TLS. `REQHARBOR_SMTP_PASSWORD_FILE` reads the password from a file |
+| `REQHARBOR_SMTP_FROM` | required with `SMTP_HOST` | Sender, `rh@example.com` or `ReqHarbor <rh@example.com>` |
+
+**Backups** (see [Scheduled backups](#scheduled-backups))
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REQHARBOR_BACKUP_INTERVAL` | `0` (off) | For example `24h` (at least `1m`): scheduled `VACUUM INTO` backups to `backups/reqharbor-YYYYMMDD-HHMMSS.db` |
+| `REQHARBOR_BACKUP_KEEP` | `7` | Scheduled backups to keep (at least 1); manual and pre-migrate files are never pruned |
+
 **Accepted for later releases, no effect yet:** `REQHARBOR_GOOGLE_CLIENT_ID`/`_SECRET`,
-`REQHARBOR_OIDC_ISSUER`/`_CLIENT_ID`/`_CLIENT_SECRET`/`_NAME`/`_SCOPES`/`_REQUIRE_VERIFIED_EMAIL`,
-`REQHARBOR_SMTP_HOST`/`_PORT`/`_USERNAME`/`_PASSWORD`/`_FROM`/`_TLS`,
-`REQHARBOR_RATE_EMAIL_PER_HOUR`, `REQHARBOR_RATE_EMAIL_PER_RECIPIENT_PER_HOUR`,
-`REQHARBOR_BACKUP_INTERVAL`, `REQHARBOR_BACKUP_KEEP` (scheduled backups). `REQHARBOR_DEV_AUTH`
-exists only in test builds and is refused by the image.
+`REQHARBOR_OIDC_ISSUER`/`_CLIENT_ID`/`_CLIENT_SECRET`/`_NAME`/`_SCOPES`/`_REQUIRE_VERIFIED_EMAIL`.
+`REQHARBOR_DEV_AUTH` exists only in test builds and is refused by the image.
 
 ## Operations
 
@@ -494,7 +642,9 @@ exists only in test builds and is refused by the image.
 - **Background jobs:** the storage breaker every 10 seconds; expired sign-in requests, sessions and
   codes are deleted every 10 minutes (revoked or expired ones after 7 days), as are team invite
   links 30 days after they expired or were revoked, team departure records (removal notices) after
-  31 days and expired signup tickets; `PRAGMA optimize` and `PRAGMA incremental_vacuum` once a day.
+  31 days and expired signup tickets; `PRAGMA optimize` and `PRAGMA incremental_vacuum` once a day;
+  scheduled backups when `REQHARBOR_BACKUP_INTERVAL` is set; with SMTP, one email sender that
+  delivers queued emails one at a time.
 - **Single instance:** one process per data directory (see above). Scale up, not out.
 - **Version:** `docker compose exec reqharbor /reqharbor-server version`; `GET /v1/server` reports
   it too.
@@ -504,7 +654,10 @@ exists only in test builds and is refused by the image.
 The server stores what the apps sync, with secret environment values blanked by the app before
 upload, and the share snapshots users publish, with secret variables removed. Passwords are stored
 as argon2id hashes; tokens, codes and invite codes only as SHA-256 hashes. Client IPs are not logged
-unless `REQHARBOR_LOG_CLIENT_IP=true`; the password throttle keeps keyed hashes for 24 hours.
+unless `REQHARBOR_LOG_CLIENT_IP=true`; the password throttle keeps keyed hashes for 24 hours. With
+SMTP, a signup waiting for its code keeps the address, name and password hash on the sign-in request
+until it expires (10 minutes, then deleted within the next 10), and the email limits are kept in
+memory only. Email addresses never appear in the logs.
 
 Deleting data deletes it from the live database at once, but **backups keep deleted data for as
 long as you keep the backup files**, including the automatic `pre-migrate-…` and

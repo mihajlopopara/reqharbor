@@ -290,3 +290,66 @@ func TestSetupCodeValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestSMTPSettings(t *testing.T) {
+	host := "REQHARBOR_SMTP_HOST=smtp.example.com"
+	from := "REQHARBOR_SMTP_FROM=ReqHarbor <rh@example.com>"
+	c := mustParse(t, pub, host, from).Config
+	if !c.SMTPEnabled() || c.SMTPPort != 587 || c.SMTPTLS != "starttls" {
+		t.Fatalf("defaults: %+v", c)
+	}
+	if c := mustParse(t, pub, host, from, "REQHARBOR_SMTP_TLS=tls").Config; c.SMTPPort != 465 {
+		t.Fatalf("implicit TLS default port %d, want 465", c.SMTPPort)
+	}
+	if c := mustParse(t, pub, host, from, "REQHARBOR_SMTP_TLS=TLS", "REQHARBOR_SMTP_PORT=2465").Config; c.SMTPPort != 2465 || c.SMTPTLS != "tls" {
+		t.Fatalf("explicit port: %+v", c)
+	}
+	if c := mustParse(t, pub, pub).Config; c.SMTPEnabled() {
+		t.Fatal("SMTP enabled without a host")
+	}
+	c = mustParse(t, pub, host, from, "REQHARBOR_SMTP_USERNAME=apikey", "REQHARBOR_SMTP_PASSWORD_FILE=/run/secrets/gh").Config
+	if c.SMTPUsername != "apikey" || c.SMTPPassword != "s3cret" {
+		t.Fatalf("credentials: %q %q", c.SMTPUsername, c.SMTPPassword)
+	}
+	wantErr(t, "REQHARBOR_SMTP_FROM must be an address", pub, host, "REQHARBOR_SMTP_FROM=not an address")
+	wantErr(t, "REQHARBOR_SMTP_FROM must be an address", pub, host, "REQHARBOR_SMTP_FROM=ReqHarbor")
+	wantErr(t, "needs both REQHARBOR_SMTP_USERNAME and REQHARBOR_SMTP_PASSWORD", pub, host, from, "REQHARBOR_SMTP_USERNAME=u")
+	wantErr(t, "needs both REQHARBOR_SMTP_USERNAME and REQHARBOR_SMTP_PASSWORD", pub, host, from, "REQHARBOR_SMTP_PASSWORD=p")
+	wantErr(t, "REQHARBOR_SMTP_TLS=none is allowed only for a loopback", pub, host, from, "REQHARBOR_SMTP_TLS=none")
+	mustParse(t, pub, "REQHARBOR_SMTP_HOST=127.0.0.1", from, "REQHARBOR_SMTP_TLS=none", "REQHARBOR_SMTP_PORT=25")
+	wantErr(t, "REQHARBOR_SMTP_TLS", pub, host, from, "REQHARBOR_SMTP_TLS=ssl")
+	wantErr(t, "REQHARBOR_SMTP_HOST must be a host name", pub, "REQHARBOR_SMTP_HOST=smtp.example.com:587", from)
+	wantErr(t, "REQHARBOR_SMTP_PORT", pub, host, from, "REQHARBOR_SMTP_PORT=70000")
+	// An IPv6 literal may be bracketed; it is stored bare, so the dialer and the loopback checks
+	// (here and in net/smtp's PLAIN auth) see ::1.
+	for _, h := range []string{"[::1]", "::1"} {
+		if c := mustParse(t, pub, "REQHARBOR_SMTP_HOST="+h, from, "REQHARBOR_SMTP_TLS=none").Config; c.SMTPHost != "::1" {
+			t.Fatalf("%s stored as %q", h, c.SMTPHost)
+		}
+	}
+	wantErr(t, "REQHARBOR_SMTP_TLS=none is allowed only for a loopback", pub, "REQHARBOR_SMTP_HOST=[2001:db8::1]", from, "REQHARBOR_SMTP_TLS=none")
+	res := mustParse(t, pub, from)
+	if !strings.Contains(strings.Join(res.Warnings, "\n"), "without REQHARBOR_SMTP_HOST") {
+		t.Fatalf("warnings %v", res.Warnings)
+	}
+	// Open signup with SMTP has no "emails are not verified" warning.
+	res = mustParse(t, pub, host, from, "REQHARBOR_SIGNUP=open")
+	if strings.Contains(strings.Join(res.Warnings, "\n"), "open signup without SMTP") {
+		t.Fatalf("warnings %v", res.Warnings)
+	}
+}
+
+func TestBackupSettings(t *testing.T) {
+	c := mustParse(t, pub).Config
+	if c.BackupInterval != 0 || c.BackupKeep != 7 {
+		t.Fatalf("defaults %v %d", c.BackupInterval, c.BackupKeep)
+	}
+	c = mustParse(t, pub, "REQHARBOR_BACKUP_INTERVAL=24h", "REQHARBOR_BACKUP_KEEP=3").Config
+	if c.BackupInterval != 24*time.Hour || c.BackupKeep != 3 {
+		t.Fatalf("%v %d", c.BackupInterval, c.BackupKeep)
+	}
+	mustParse(t, pub, "REQHARBOR_BACKUP_INTERVAL=0")
+	wantErr(t, "REQHARBOR_BACKUP_INTERVAL must be 0 (off) or at least 1m", pub, "REQHARBOR_BACKUP_INTERVAL=30s")
+	wantErr(t, "REQHARBOR_BACKUP_INTERVAL", pub, "REQHARBOR_BACKUP_INTERVAL=daily")
+	wantErr(t, "REQHARBOR_BACKUP_KEEP", pub, "REQHARBOR_BACKUP_KEEP=0")
+}

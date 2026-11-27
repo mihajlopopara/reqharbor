@@ -5,9 +5,11 @@
 package config
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
+	netmail "net/mail"
 	"net/netip"
 	"net/url"
 	"os"
@@ -112,7 +114,17 @@ type TestOverrides struct {
 	GitHubAuthURL  string // default https://github.com/login/oauth/authorize
 	GitHubTokenURL string // default https://github.com/login/oauth/access_token
 	GitHubAPIURL   string // default https://api.github.com
+	// SMTPTLSConfig is the base client TLS configuration of the SMTP relay (a pool that trusts
+	// the fake SMTP server's certificate); nil means the system roots.
+	SMTPTLSConfig *tls.Config
 }
+
+// SMTPEnabled reports whether REQHARBOR_SMTP_HOST is set: email codes at signup and reset links
+// by email (§5.5, §5.7).
+func (c *Config) SMTPEnabled() bool { return c.SMTPHost != "" }
+
+// MinBackupInterval is the shortest REQHARBOR_BACKUP_INTERVAL accepted.
+const MinBackupInterval = time.Minute
 
 // Error is a startup configuration error; serve exits with code 2 and its one-line message.
 type Error struct{ Msg string }
@@ -384,22 +396,47 @@ func Parse(opts Options) (*Result, error) {
 	}
 
 	c.SMTPHost = e.str("REQHARBOR_SMTP_HOST", "")
-	if c.SMTPPort, err = e.integer("REQHARBOR_SMTP_PORT", 587, 1); err != nil {
+	if c.SMTPTLS, err = e.oneOf("REQHARBOR_SMTP_TLS", "starttls", "starttls", "tls", "none"); err != nil {
 		return nil, err
+	}
+	defPort := int64(587)
+	if c.SMTPTLS == "tls" {
+		defPort = 465 // implicit TLS ("SMTPS")
+	}
+	if c.SMTPPort, err = e.integer("REQHARBOR_SMTP_PORT", defPort, 1); err != nil {
+		return nil, err
+	}
+	if c.SMTPPort > 65535 {
+		return nil, errorf("REQHARBOR_SMTP_PORT must be a port from 1 to 65535, got %d", c.SMTPPort)
 	}
 	c.SMTPUsername = e.str("REQHARBOR_SMTP_USERNAME", "")
 	if c.SMTPPassword, err = e.secret("REQHARBOR_SMTP_PASSWORD"); err != nil {
 		return nil, err
 	}
 	c.SMTPFrom = e.str("REQHARBOR_SMTP_FROM", "")
-	if c.SMTPTLS, err = e.oneOf("REQHARBOR_SMTP_TLS", "starttls", "starttls", "tls", "none"); err != nil {
-		return nil, err
-	}
-	if c.SMTPHost != "" && c.SMTPFrom == "" {
-		return nil, errorf("REQHARBOR_SMTP_FROM is required with REQHARBOR_SMTP_HOST")
-	}
-	if c.SMTPHost != "" && c.SMTPTLS == "none" && !IsLoopbackHost(c.SMTPHost) {
-		return nil, errorf("REQHARBOR_SMTP_TLS=none is allowed only for a loopback SMTP host")
+	if c.SMTPHost != "" {
+		if strings.ContainsAny(c.SMTPHost, "/@ \t") || (strings.Contains(c.SMTPHost, ":") && net.ParseIP(strings.Trim(c.SMTPHost, "[]")) == nil) {
+			return nil, errorf("REQHARBOR_SMTP_HOST must be a host name or IP address without a port, got %q", c.SMTPHost)
+		}
+		// An IPv6 literal may be written [::1]; the dialer adds the brackets itself, and the
+		// loopback checks (here and in net/smtp's PLAIN auth) compare the bare address.
+		if ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(c.SMTPHost, "["), "]")); ip != nil {
+			c.SMTPHost = ip.String()
+		}
+		if c.SMTPFrom == "" {
+			return nil, errorf("REQHARBOR_SMTP_FROM is required with REQHARBOR_SMTP_HOST, for example \"ReqHarbor <rh@example.com>\"")
+		}
+		if a, err := netmail.ParseAddress(c.SMTPFrom); err != nil || strings.ContainsAny(c.SMTPFrom, "\r\n") || !strings.Contains(a.Address, "@") {
+			return nil, errorf("REQHARBOR_SMTP_FROM must be an address such as rh@example.com or \"ReqHarbor <rh@example.com>\", got %q", c.SMTPFrom)
+		}
+		if (c.SMTPUsername == "") != (c.SMTPPassword == "") {
+			return nil, errorf("SMTP authentication needs both REQHARBOR_SMTP_USERNAME and REQHARBOR_SMTP_PASSWORD")
+		}
+		if c.SMTPTLS == "none" && !IsLoopbackHost(c.SMTPHost) {
+			return nil, errorf("REQHARBOR_SMTP_TLS=none is allowed only for a loopback SMTP host")
+		}
+	} else if c.SMTPFrom != "" || c.SMTPUsername != "" || c.SMTPPassword != "" {
+		res.Warnings = append(res.Warnings, "REQHARBOR_SMTP_* is set without REQHARBOR_SMTP_HOST: email is off")
 	}
 
 	if c.LegacyWorkspaces, err = e.oneOf("REQHARBOR_LEGACY_WORKSPACES", LegacyOff, LegacyOff, LegacyExisting, LegacyOpen); err != nil {
@@ -447,6 +484,9 @@ func Parse(opts Options) (*Result, error) {
 	}
 	if c.BackupInterval, err = e.duration("REQHARBOR_BACKUP_INTERVAL", 0); err != nil {
 		return nil, err
+	}
+	if c.BackupInterval > 0 && c.BackupInterval < MinBackupInterval {
+		return nil, errorf("REQHARBOR_BACKUP_INTERVAL must be 0 (off) or at least 1m, got %q", e.vals["REQHARBOR_BACKUP_INTERVAL"])
 	}
 	if c.ShutdownTimeout, err = e.duration("REQHARBOR_SHUTDOWN_TIMEOUT", 20*time.Second); err != nil {
 		return nil, err

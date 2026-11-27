@@ -103,7 +103,19 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger, version s
 		for _, m := range auth.Methods(cfg) {
 			methods = append(methods, m.ID)
 		}
-		logger.Info("ready", "signup", cfg.Signup, "legacy_workspaces", cfg.LegacyWorkspaces, "methods", methods, "instance_id", a.InstanceID())
+		logger.Info("ready", "signup", cfg.Signup, "legacy_workspaces", cfg.LegacyWorkspaces, "methods", methods, "instance_id", a.InstanceID(),
+			"email", cfg.SMTPEnabled(), "backup_interval", cfg.BackupInterval.String())
+		if a.Mail != nil {
+			wg.Add(1)
+			go func() { defer wg.Done(); a.Mail.Run(jobsCtx) }()
+		}
+		if cfg.BackupInterval > 0 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				jobs.RunBackups(jobsCtx, d, clk, cfg.BackupInterval, int(cfg.BackupKeep), logger)
+			}()
+		}
 		wg.Add(4)
 		go func() { defer wg.Done(); a.Breaker.Run(jobsCtx, jobs.SampleInterval) }()
 		go func() { defer wg.Done(); jobs.RunSweepers(jobsCtx, time.Minute, a.Sweepers()...) }()

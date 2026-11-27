@@ -16,7 +16,7 @@ import (
 
 var webFiles = web.Files
 
-var pageNames = []string{"authorize", "code", "signup", "done", "error", "forgot", "reset"}
+var pageNames = []string{"authorize", "code", "signup", "done", "error", "forgot", "reset", "verify"}
 
 var pages = func() map[string]*template.Template {
 	m := make(map[string]*template.Template, len(pageNames))
@@ -58,6 +58,11 @@ type pageData struct {
 	Message, Hint string
 	Token         string
 	Done          bool
+
+	// Email (S9).
+	Notice      string // a status line, such as "We sent a new code."
+	EmailReset  bool   // /auth/forgot takes an email (SMTP configured)
+	AdminSignup bool   // a fresh server offers the password signup for REQHARBOR_ADMIN_EMAIL
 
 	// External providers (S5).
 	Providers []pageLink // buttons for the enabled providers

@@ -1,5 +1,6 @@
 {{- /* GET /auth/signup and POST /auth/password/signup errors (§5.5, §5.6). */ -}}
-{{define "content"}}<h1>{{if .Setup}}Create the admin account{{else}}Create your account{{end}}</h1>
+{{define "content"}}<h1>{{if or .Setup .AdminSignup}}Create the admin account{{else}}Create your account{{end}}</h1>
+{{if .AdminSignup}}<p>Use this server's admin email. We'll email you a code to confirm it.</p>{{end}}
 <p class="meta">{{if .Device}}On {{.Device}}, started {{.Started}}.{{else}}Started {{.Started}}.{{end}} Only continue if you just clicked Sign in in ReqHarbor.</p>
 {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
 {{template "providers" .}}{{if and .Providers .PasswordAuth}}<p class="or meta">Or create an account with your email</p>{{end}}

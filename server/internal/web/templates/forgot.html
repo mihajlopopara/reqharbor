@@ -1,5 +1,15 @@
-{{- /* /auth/forgot without SMTP (M1): it takes no email, so it reveals nothing (§5.7). */ -}}
-{{define "content"}}<h1>Forgot your password?</h1>
+{{- /* /auth/forgot (§5.7). Without SMTP it takes no email, so it reveals nothing. With SMTP (S9) it takes an email and always answers the same, never naming a sign-in method. */ -}}
+{{define "content"}}{{if .EmailReset}}{{if .Done}}<h1>Check your email</h1>
+<p>If an account exists for that email, we sent a link.</p>
+<p class="meta">The link works once, for 30 minutes. Nothing arrived? Check your spam folder, or try again in a few minutes.</p>
+{{else}}<h1>Forgot your password?</h1>
+<p>Enter the email of your account. We'll send you a link to choose a new password.</p>
+{{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+<form method="post" action="/auth/forgot">
+<label>Email<input type="email" name="email" autocomplete="username" required maxlength="254" autofocus></label>
+<button type="submit">Send link</button>
+</form>{{end}}
+{{else}}<h1>Forgot your password?</h1>
 <p>Ask your server admin for a reset link.</p>
 <p class="meta">Admins create one with: reqharbor-server user reset-link --email you@example.com</p>
-{{end}}
+{{end}}{{end}}

@@ -16,6 +16,8 @@ import (
 
 	"github.com/mihajlopopara/reqharbor/server/internal/app"
 	"github.com/mihajlopopara/reqharbor/server/internal/db"
+	"github.com/mihajlopopara/reqharbor/server/internal/jobs"
+	"github.com/mihajlopopara/reqharbor/server/internal/mail"
 	tu "github.com/mihajlopopara/reqharbor/server/internal/testutil"
 )
 
@@ -186,7 +188,7 @@ func TestDiscovery_V1Server(t *testing.T) {
 		"instanceId": h.App.InstanceID(), "syncEpoch": h.App.SyncEpoch(),
 		"name": "Acme ReqHarbor", "publicUrl": "https://reqharbor.test", "minClientVersion": nil,
 		"auth": map[string]any{"methods": []any{map[string]any{"id": "password", "label": "Email and password"}},
-			"signup": "invite", "passwordReset": "admin", "setupRequired": true},
+			"signup": "invite", "passwordReset": "admin", "emailVerification": false, "setupRequired": true},
 		"features": map[string]any{"accounts": true, "teams": false, "legacyWorkspaces": "open"},
 		"sync":     map[string]any{"types": []any{"project", "collection", "folder", "request", "environment"}, "requestKinds": []any{"http"}},
 		"limits":   map[string]any{"entityBytes": 524288, "pushChanges": 500, "requestBytes": 5242880, "snapshotBytes": 1048576, "jsonDepth": 100},
@@ -202,5 +204,27 @@ func TestDiscovery_V1Server(t *testing.T) {
 	}
 	if v["instanceId"] == h.App.InstanceID() {
 		t.Fatal("two servers share an instance id")
+	}
+}
+
+func TestRun_StartsTheMailSenderAndScheduledBackups(t *testing.T) {
+	relay := tu.NewSMTPServer(t, tu.SMTPOptions{Mode: "none"}) // loopback, so TLS=none is allowed
+	dir := t.TempDir()
+	started := make(chan *app.App, 1)
+	r := startRunWith(t, dir, append(relay.Env(), "REQHARBOR_BACKUP_INTERVAL=1h", "REQHARBOR_BACKUP_KEEP=2"),
+		app.RunOptions{Started: func(a *app.App) { started <- a }})
+	a := <-started
+	waitFor(t, "ready", func() bool { code, _, _ := get(t, r.base+"/readyz"); return code == 200 })
+	// No scheduled backup exists yet, so the first one runs as soon as the server is ready.
+	waitFor(t, "the first scheduled backup", func() bool {
+		l, _ := jobs.ScheduledBackups(filepath.Join(dir, "backups"))
+		return len(l) == 1
+	})
+	if a.Mail == nil {
+		t.Fatal("no outbox with SMTP configured")
+	}
+	a.Mail.Send("test", mail.Message{To: "x@example.test", Subject: "hello", Text: "from serve"})
+	if m := relay.Wait(t, 1)[0]; m.Body != "from serve\n" || m.TLS {
+		t.Fatalf("%+v", m)
 	}
 }

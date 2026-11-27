@@ -18,6 +18,7 @@ import (
 	"github.com/mihajlopopara/reqharbor/server/internal/clock"
 	"github.com/mihajlopopara/reqharbor/server/internal/config"
 	"github.com/mihajlopopara/reqharbor/server/internal/httpx"
+	"github.com/mihajlopopara/reqharbor/server/internal/mail"
 	"github.com/mihajlopopara/reqharbor/server/internal/ratelimit"
 	"github.com/mihajlopopara/reqharbor/server/internal/store"
 )
@@ -65,6 +66,9 @@ type Deps struct {
 	UserCreated func()
 	// HTTPClient makes the outbound provider calls; nil means providers.DefaultHTTPClient.
 	HTTPClient *http.Client
+	// Mail sends the signup codes and reset links when SMTP is configured (S9); nil means no
+	// email: signups are created at once and resets go through the admin.
+	Mail *mail.Outbox
 }
 
 // Service serves the auth routes.
@@ -88,6 +92,11 @@ type Service struct {
 	CodeLimiter    *ratelimit.Limiter // invite / setup code entry per IP, 30 / h
 	TokenLimiter   *ratelimit.Limiter // POST /v1/auth/token per IP, 60 / min
 	FailedExchange *ratelimit.Limiter // failed token exchanges per IP, 30 / h
+	// Reset requests by email (S9): 20 / h per IP and 5 / h per email.
+	ForgotIPLimiter    *ratelimit.Limiter
+	ForgotEmailLimiter *ratelimit.Limiter
+	// Wrong signup codes per address across every auth request and network (S9).
+	CodeGuessLimiter *ratelimit.Limiter
 
 	warnSchemeOnce sync.Once
 }
@@ -119,6 +128,9 @@ func New(d Deps) *Service {
 	s.CodeLimiter = ratelimit.New(c, 30, time.Hour)
 	s.TokenLimiter = ratelimit.New(c, d.Config.RateTokenPerMin, time.Minute)
 	s.FailedExchange = ratelimit.New(c, 30, time.Hour)
+	s.ForgotIPLimiter = ratelimit.New(c, 20, time.Hour)
+	s.ForgotEmailLimiter = ratelimit.New(c, 5, time.Hour)
+	s.CodeGuessLimiter = ratelimit.New(c, MaxWrongCodesPerEmail, EmailCodeGuessWindow)
 	return s
 }
 
@@ -126,7 +138,8 @@ func (s *Service) openSignupFull() bool { return s.OpenSignupFull != nil && s.Op
 
 // Limiters returns every limiter, for the sweeper job.
 func (s *Service) Limiters() []*ratelimit.Limiter {
-	return []*ratelimit.Limiter{s.PagesLimiter, s.LoginLimiter, s.SignupLimiter, s.CodeLimiter, s.TokenLimiter, s.FailedExchange}
+	return []*ratelimit.Limiter{s.PagesLimiter, s.LoginLimiter, s.SignupLimiter, s.CodeLimiter, s.TokenLimiter, s.FailedExchange,
+		s.ForgotIPLimiter, s.ForgotEmailLimiter, s.CodeGuessLimiter}
 }
 
 // Methods are the enabled sign-in methods in their fixed order (§5.1): password, then each
@@ -161,6 +174,7 @@ func (s *Service) Register(mux *http.ServeMux) {
 	mux.Handle("/auth/code", page(nil, http.HandlerFunc(s.code)))
 	mux.Handle("/auth/password/login", page(nil, http.HandlerFunc(s.passwordLogin)))
 	mux.Handle("/auth/password/signup", page(nil, http.HandlerFunc(s.passwordSignup)))
+	mux.Handle("/auth/password/verify", page(nil, http.HandlerFunc(s.verify)))
 	mux.Handle("/auth/done", page(http.HandlerFunc(s.done), nil))
 	mux.Handle("/auth/forgot", page(http.HandlerFunc(s.forgot), http.HandlerFunc(s.forgot)))
 	mux.Handle("/auth/reset", page(http.HandlerFunc(s.resetPage), http.HandlerFunc(s.reset)))

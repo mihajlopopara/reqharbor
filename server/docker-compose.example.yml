@@ -22,7 +22,16 @@ services:
       # REQHARBOR_LEGACY_WORKSPACES: existing         # default off; see the README before enabling open
       # REQHARBOR_GITHUB_CLIENT_ID: Iv1.0123456789abcdef
       # REQHARBOR_GITHUB_CLIENT_SECRET_FILE: /run/secrets/github_secret
-    # secrets: [github_secret]
+      # Email (README "Email (SMTP)"): signup codes and self-service password reset.
+      # REQHARBOR_SMTP_HOST: smtp.example.com
+      # REQHARBOR_SMTP_PORT: "587"                  # 465 with REQHARBOR_SMTP_TLS: tls
+      # REQHARBOR_SMTP_USERNAME: rh@example.com
+      # REQHARBOR_SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      # REQHARBOR_SMTP_FROM: "ReqHarbor <rh@example.com>"
+      # Scheduled backups into the data volume (README "Scheduled backups"); still copy them off-site.
+      # REQHARBOR_BACKUP_INTERVAL: 24h
+      # REQHARBOR_BACKUP_KEEP: "7"
+    # secrets: [github_secret, smtp_password]
     volumes:
       - reqharbor-data:/data
     networks:
@@ -54,6 +63,8 @@ volumes:
   reqharbor-data:
   caddy-data:
 
-# secrets:
-#   github_secret:
+# secrets:                       # the server runs as uid 65532 and the files keep their host owner and mode:
+#   github_secret:                #   sudo chown 65532 github_client_secret.txt smtp_password.txt && sudo chmod 600 ...
 #     file: ./github_client_secret.txt
+#   smtp_password:
+#     file: ./smtp_password.txt

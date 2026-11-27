@@ -42,6 +42,10 @@ type Harness struct {
 	Client *http.Client
 	// ClientVersion, when set, is sent as X-ReqHarbor-Version by the token helpers.
 	ClientVersion string
+	// SMTP is the fake relay of WithSMTP, or nil.
+	SMTP *SMTPServer
+
+	noMail bool
 
 	logger     *slog.Logger
 	httpClient *http.Client
@@ -54,6 +58,8 @@ type options struct {
 	config  []func(*config.Config)
 	client  *http.Client
 	wrap    func(store.Store) store.Store
+	smtp    *SMTPServer
+	noMail  bool
 }
 
 // Option customises New.
@@ -144,7 +150,7 @@ func New(t testing.TB, opts ...Option) *Harness {
 	logs := &Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	clk := clock.NewFake(time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC))
-	h := &Harness{Clock: clk, Config: cfg, Logs: logs, logger: logger, httpClient: o.client}
+	h := &Harness{Clock: clk, Config: cfg, Logs: logs, logger: logger, httpClient: o.client, SMTP: o.smtp, noMail: o.noMail}
 
 	st := o.store
 	if st == nil {
@@ -172,6 +178,7 @@ func New(t testing.TB, opts ...Option) *Harness {
 	} else {
 		h.App.ForceReady()
 	}
+	h.runMail(t)
 	h.Server = httptest.NewServer(h.App.Handler())
 	t.Cleanup(h.Server.Close)
 	h.URL = h.Server.URL
@@ -200,9 +207,30 @@ func (h *Harness) Restart(t testing.TB) {
 	if err := h.App.Init(context.Background()); err != nil {
 		t.Fatalf("init: %v", err)
 	}
+	h.runMail(t)
 	h.Server = httptest.NewServer(h.App.Handler())
 	t.Cleanup(h.Server.Close)
 	h.URL = h.Server.URL
+}
+
+// WithoutMailSender leaves the App's email sender stopped, so a test can look at what a request
+// did before any queued job runs; RunMail starts it.
+func WithoutMailSender() Option { return func(o *options) { o.noMail = true } }
+
+// runMail runs the App's email sender (Run starts it in serve) until the test ends.
+func (h *Harness) runMail(t testing.TB) {
+	if h.App.Mail == nil || h.noMail {
+		return
+	}
+	h.RunMail(t)
+}
+
+// RunMail starts the App's email sender until the test ends.
+func (h *Harness) RunMail(t testing.TB) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); h.App.Mail.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
 }
 
 // Req describes one call.

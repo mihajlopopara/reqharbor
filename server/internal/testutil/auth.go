@@ -259,7 +259,7 @@ func (h *Harness) CreateAdmin(t testing.TB, email string) Tokens {
 	if res := b.Code(t, ar, code); res.StatusCode != http.StatusSeeOther {
 		t.Fatalf("setup code: %d %s", res.StatusCode, truncate(res.Body))
 	}
-	res := b.Signup(t, ar, "Admin", email, DefaultPassword, "")
+	res := h.confirmSignup(t, b, ar, email, b.Signup(t, ar, "Admin", email, DefaultPassword, ""))
 	return ParseTokens(t, h.Exchange(t, LoopbackCode(t, res, p), p))
 }
 
@@ -288,7 +288,7 @@ func (h *Harness) CreateUser(t testing.TB, email string) Tokens {
 	b := h.Browser()
 	p := NewPKCE()
 	ar := b.Authorize(t, p)
-	res := b.Signup(t, ar, "User", email, DefaultPassword, h.Invite(t, "", 1))
+	res := h.confirmSignup(t, b, ar, email, b.Signup(t, ar, "User", email, DefaultPassword, h.Invite(t, "", 1)))
 	return ParseTokens(t, h.Exchange(t, LoopbackCode(t, res, p), p))
 }
 

@@ -45,7 +45,10 @@ type Auth struct {
 	Methods       []Method `json:"methods"`
 	Signup        string   `json:"signup"`
 	PasswordReset string   `json:"passwordReset"`
-	SetupRequired bool     `json:"setupRequired"`
+	// EmailVerification is true when password signups are confirmed by an emailed code (SMTP
+	// configured, S9). Additive: clients that do not know it ignore it.
+	EmailVerification bool `json:"emailVerification"`
+	SetupRequired     bool `json:"setupRequired"`
 }
 
 // Features are the optional server features.
@@ -82,6 +85,10 @@ func Build(cfg *config.Config, version, instanceID, syncEpoch string, methods []
 		v := cfg.MinClientVersion
 		minClient = &v
 	}
+	reset := "admin"
+	if cfg.SMTPEnabled() {
+		reset = "email"
+	}
 	return Info{
 		Software:         Software,
 		Version:          version,
@@ -92,10 +99,11 @@ func Build(cfg *config.Config, version, instanceID, syncEpoch string, methods []
 		PublicURL:        cfg.PublicURL,
 		MinClientVersion: minClient,
 		Auth: Auth{
-			Methods:       methods,
-			Signup:        cfg.Signup,
-			PasswordReset: "admin", // "email" with SMTP (M3)
-			SetupRequired: setupRequired,
+			Methods:           methods,
+			Signup:            cfg.Signup,
+			PasswordReset:     reset, // "email" with SMTP (S9): /auth/forgot sends the link
+			EmailVerification: cfg.SMTPEnabled() && cfg.PasswordAuth,
+			SetupRequired:     setupRequired,
 		},
 		Features: Features{Accounts: true, Teams: cfg.Teams, LegacyWorkspaces: cfg.LegacyWorkspaces},
 		Sync:     Sync{Types: append([]string(nil), syncsvc.Types...), RequestKinds: []string{"http"}},
